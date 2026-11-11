@@ -1,34 +1,51 @@
 // ==============================================================================
-// 推荐流视图 (Recommend View - 默认首页)
+// 推荐流视图 (Recommend View - 经典双列瀑布流)
 //
 // 设计定位：
-// 1. 无限滚动推荐视频流列表。
-// 2. 纯净无广告、无直播强推、无带货小黄车。
+// 1. 每行容纳两个自适应宽度的视频卡片（由 HorizontalLayout 自动等分）。
+// 2. 纵向无缝平滑滚动。
 // ==============================================================================
 
-import { Theme, VideoItemData } from "../theme.slint";
+import { Theme, VideoRowPair } from "../theme.slint";
 import { VideoCard } from "../components/video_card.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export component RecommendView inherits Rectangle {
-    in property <[VideoItemData]> videos;
+    in property <[VideoRowPair]> rows;
     callback video_selected(string);
 
     background: Colors.transparent;
 
     ScrollView {
-        padding-left: 12px;
-        padding-right: 12px;
-        padding-top: 8px;
-        padding-bottom: 16px;
-
         VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 10px;
+            padding-bottom: 24px;
             spacing: 10px;
 
-            for item in root.videos: VideoCard {
-                data: item;
-                clicked => {
-                    root.video_selected(item.id);
+            for pair in root.rows: HorizontalLayout {
+                spacing: 10px;
+
+                // 左侧卡片 (平分 50% 宽度)
+                VideoCard {
+                    data: pair.left;
+                    clicked => {
+                        root.video_selected(pair.left.id);
+                    }
+                }
+
+                // 右侧卡片 (平分 50% 宽度，若无则占位透明)
+                if pair.has_right : VideoCard {
+                    data: pair.right;
+                    clicked => {
+                        root.video_selected(pair.right.id);
+                    }
+                }
+
+                // 当只有单数卡片时，补充占位防止左侧卡片拉伸
+                if !pair.has_right : Rectangle {
+                    background: Colors.transparent;
                 }
             }
         }

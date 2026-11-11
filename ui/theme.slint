@@ -1,9 +1,5 @@
 // ==============================================================================
 // BLI-RS 主题设计规范 (Material You / Monet 动态主题引擎)
-// 
-// 本文件定义了符合 Google Material Design 3 (M3) 标准的设计变量。
-// 包含色彩系统、间距规范、圆角大小、排版字阶以及物理动效曲线。
-// 后续如有更强的前端模型介入，可以直接在此调优色相和动画参数。
 // ==============================================================================
 
 /// 导航栏当前选中的 Tab 页面类型
@@ -13,7 +9,7 @@ export enum NavTabType {
     Follow      // 关注动态流页面
 }
 
-/// 视频卡片数据结构定义
+/// 单个视频卡片数据结构定义
 export struct VideoItemData {
     id: string,         // 视频唯一标识 (bvid / aid)
     title: string,      // 视频标题
@@ -24,53 +20,48 @@ export struct VideoItemData {
     danmaku: string,    // 弹幕总数 (例如: "3.2万")
 }
 
-/// 全局动态调色板单例 (后期可通过 Rust NDK 实时注入系统的 Monet 壁纸取色)
+/// 双列瀑布流每行数据包装 (一行容纳两个视频卡片)
+export struct VideoRowPair {
+    left: VideoItemData,
+    right: VideoItemData,
+    has_right: bool,
+}
+
+/// 全局动态调色板单例
 export global Theme {
-    // --------------------------------------------------------------------------
-    // 1. 色彩系统 (M3 Color Tokens) - 默认高对比度暗色系 (Dark Palette)
-    // --------------------------------------------------------------------------
-    
-    // 主色 (Primary) - 用于激活状态、主按钮、进度条高亮 (默认采用融合B站粉与M3洋红的高辨识度色彩)
+    // 主色 (Primary)
     in-out property <color> primary: #ffb1c8;
     in-out property <color> on_primary: #5e1133;
     in-out property <color> primary_container: #7b2949;
     in-out property <color> on_primary_container: #ffd9e2;
 
-    // 次色 (Secondary) - 用于次级胶囊背景、非关键指示器
+    // 次色 (Secondary)
     in-out property <color> secondary: #e5bdc6;
     in-out property <color> on_secondary: #432931;
     in-out property <color> secondary_container: #5c3f47;
     in-out property <color> on_secondary_container: #ffd9e2;
 
-    // 背景与表面层 (Surface & Background) - 多层级高度沉浸黑灰阶
-    in-out property <color> background: #1a1114;           // 最底层全局背景
-    in-out property <color> surface: #201a1c;              // 基础表面层 (卡片、顶栏底色)
-    in-out property <color> surface_variant: #352d30;      // 高亮表面层 (搜索框、悬浮输入框)
-    in-out property <color> surface_container_high: #2b2427; // 抽屉侧边栏等浮动容器底色
+    // 背景与表面层 (Surface & Background)
+    in-out property <color> background: #121011;           // 更加深邃纯净的 OLED 黑灰
+    in-out property <color> surface: #1c1819;              // 双列卡片底色
+    in-out property <color> surface_variant: #2d2628;      // 封面占位与副容器色
+    in-out property <color> surface_container_high: #262022; // 抽屉侧边栏浮动色
 
-    // 文本与图标层 (On Surface Tokens)
-    in-out property <color> on_surface: #ece0e2;          // 主标题纯白/高光色
-    in-out property <color> on_surface_variant: #d6c2c6;  // 副标题中灰度色
-    in-out property <color> outline: #9f8c90;             // 弱化边框描边色
+    // 文本与图标层
+    in-out property <color> on_surface: #ece0e2;          // 主标题纯白色
+    in-out property <color> on_surface_variant: #bfaeb2;  // UP主等副信息灰白色
+    in-out property <color> outline: #8c7b7f;             // 弱化边框
 
     // 特殊状态色
-    in-out property <color> scrim: #00000088;             // 遮罩蒙层阴影色 (抽屉弹出时的黑色半透明底)
+    in-out property <color> scrim: #00000099;             // 抽屉遮罩半透明色
 
-    // --------------------------------------------------------------------------
-    // 2. 形状与圆角规范 (M3 Shape Tokens)
-    // --------------------------------------------------------------------------
-    in-out property <length> radius_sm: 8px;   // 小圆角 (标签、视频时长角标)
-    in-out property <length> radius_md: 12px;  // 中圆角 (按钮、输入框)
-    in-out property <length> radius_lg: 20px;  // 大圆角 (视频卡片外壳)
-    in-out property <length> radius_full: 9999px; // 全圆角 (头像、Tab 选中胶囊指示条)
+    // 形状与圆角规范
+    in-out property <length> radius_sm: 8px;   // 小圆角 (时长角标)
+    in-out property <length> radius_md: 14px;  // 中圆角 (双列视频卡片 M3 规范圆角)
+    in-out property <length> radius_lg: 22px;  // 大圆角 (抽屉面板)
+    in-out property <length> radius_full: 9999px;
 
-    // --------------------------------------------------------------------------
-    // 3. 物理动力学规范 (Material Motion Tokens)
-    // --------------------------------------------------------------------------
-    // 标准减速曲线时长 (用于页面切入、抽屉滑出)
-    in-out property <duration> animation_duration_normal: 300ms;
-    in-out property <duration> animation_duration_fast: 150ms;
-    
-    // 触控交互开关
-    in-out property <bool> is_touch_device: true;
+    // 动画曲线
+    in-out property <duration> animation_duration_normal: 260ms;
+    in-out property <duration> animation_duration_fast: 140ms;
 }

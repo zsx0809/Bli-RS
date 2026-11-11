@@ -1,3 +1,5 @@
+pub use slint::ComponentHandle;
+
 slint::include_modules!();
 
 pub fn create_app() -> Result<AppWindow, slint::PlatformError> {

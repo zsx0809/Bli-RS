@@ -1,15 +1,14 @@
 // ==============================================================================
 // BLI-RS 主视窗容器 (Main App Window)
 //
-// 架构设计：
-// 1. 采用 Material 3 (Monet) 动态主题引擎驱动。
-// 2. 界面层次划分：
-//    [底层] -> 主内容区域 (TopBar + 根据 Tab 动态切换的 View 容器)
-//    [顶层] -> 侧滑抽屉面板 (NavigationDrawer) + 半透明遮罩 (Scrim)
-// 3. 所有状态与事件均通过声明式属性向下单向流动，向上由 Callback 事件回调。
+// 架构特性：
+// 1. 经典双列网格瀑布流视频推荐布局。
+// 2. 顶部支持平滑横向轻扫手势切换 [直播 | 推荐 | 关注] 三个核心 Tab。
+// 3. 屏幕最左边缘 (0~28px) 支持向右滑动手势直接呼出侧边抽屉面板。
+// 4. Tab 切换具备平滑的视差推进过渡动效。
 // ==============================================================================
 
-import { Theme, NavTabType, VideoItemData } from "theme.slint";
+import { Theme, NavTabType, VideoItemData, VideoRowPair } from "theme.slint";
 import { TopBar } from "components/topbar.slint";
 import { NavigationDrawer } from "components/drawer.slint";
 import { RecommendView } from "views/recommend_view.slint";
@@ -23,88 +22,175 @@ export component AppWindow inherits Window {
     background: Theme.background;
 
     // --------------------------------------------------------------------------
-    // 内部响应式状态 (State Management)
+    // 响应式状态管理
     // --------------------------------------------------------------------------
-    in-out property <NavTabType> current_tab: NavTabType.Recommend; // 当前导航Tab (默认推荐)
-    in-out property <bool> drawer_open: false;                     // 侧边抽屉展开状态
+    in-out property <NavTabType> current_tab: NavTabType.Recommend;
+    in-out property <bool> drawer_open: false;
 
-    // 推荐流演示数据 (后续由 Rust 后端异步灌入真实 API 数据)
-    in property <[VideoItemData]> sample_videos: [
+    // 手势滑动基准坐标记录
+    property <length> swipe_start_x: 0px;
+
+    // --------------------------------------------------------------------------
+    // 双列网格演示数据 (后续由 Rust 后端异步灌入真实 API 数据)
+    // --------------------------------------------------------------------------
+    in property <[VideoRowPair]> sample_rows: [
         {
-            id: "BV1AbcRust01",
-            title: "【纯血 Rust】从零手搓B站安卓端：告别 42°C 发热与后台守护",
-            author: "大肥鱼",
-            views: "128.4万",
-            danmaku: "3.2万",
-            duration: "18:24",
-            cover_url: ""
+            left: {
+                id: "BV1Abc01",
+                title: "【纯血Rust】从零手搓B站安卓端：零开销、零发热",
+                author: "大肥鱼",
+                views: "128.4万",
+                danmaku: "3.2万",
+                duration: "18:24",
+                cover_url: ""
+            },
+            right: {
+                id: "BV1Abc02",
+                title: "【硬核架构】解密 Bilibili Wbi 签名与 gRPC 实时流传输",
+                author: "zsx0809",
+                views: "89.2万",
+                danmaku: "1.8万",
+                duration: "24:10",
+                cover_url: ""
+            },
+            has_right: true
         },
         {
-            id: "BV1AbcRust02",
-            title: "【架构解密】深入 Bilibili Wbi 签名加密与 gRPC 实时流传输",
-            author: "zsx0809",
-            views: "89.2万",
-            danmaku: "1.8万",
-            duration: "24:10",
-            cover_url: ""
+            left: {
+                id: "BV1Abc03",
+                title: "彻底告别 42°C！安卓 NDK AMediaCodec 硬件直解实践",
+                author: "RustMobile",
+                views: "54.1万",
+                danmaku: "9210",
+                duration: "12:05",
+                cover_url: ""
+            },
+            right: {
+                id: "BV1Abc04",
+                title: "Flutter vs 纯血 Rust：移动端性能与功耗终极对决",
+                author: "CodeLab",
+                views: "42.7万",
+                danmaku: "6500",
+                duration: "15:40",
+                cover_url: ""
+            },
+            has_right: true
         },
         {
-            id: "BV1AbcRust03",
-            title: "Android NDK AMediaCodec 纯 C 硬件解码：功耗暴跌 60%",
-            author: "RustMobile",
-            views: "54.1万",
-            danmaku: "9210",
-            duration: "12:05",
-            cover_url: ""
+            left: {
+                id: "BV1Abc05",
+                title: "为什么手机 B 站会发热？深入 ijkservice 软硬解死循环与泄漏排查",
+                author: "KernelWatch",
+                views: "36.8万",
+                danmaku: "4820",
+                duration: "20:15",
+                cover_url: ""
+            },
+            right: {
+                id: "BV1Abc06",
+                title: "Linux 内核级防发热：深入 Android 进程调度与温控",
+                author: "KernelDev",
+                views: "15.9万",
+                danmaku: "2310",
+                duration: "15:20",
+                cover_url: ""
+            },
+            has_right: true
         },
         {
-            id: "BV1AbcRust04",
-            title: "Material You 莫奈取色与 AOSP 原生滑动动力学在 Rust 上的实践",
-            author: "AndroidLab",
-            views: "42.7万",
-            danmaku: "6500",
-            duration: "15:40",
-            cover_url: ""
-        },
-        {
-            id: "BV1AbcRust05",
-            title: "为什么手机 B 站会发热？深入 ijkservice 软硬解死循环与泄漏排查",
-            author: "KernelWatch",
-            views: "36.8万",
-            danmaku: "4820",
-            duration: "20:15",
-            cover_url: ""
+            left: {
+                id: "BV1Abc07",
+                title: "【AOSP】Android 14/15 动态壁纸 Monet 取色底层原理",
+                author: "PixelFan",
+                views: "21.3万",
+                danmaku: "1104",
+                duration: "08:45",
+                cover_url: ""
+            },
+            right: {
+                id: "BV1Abc08",
+                title: "极简纯血：0 行 Java、0 个 DEX 的 Android 应用怎么写？",
+                author: "大肥鱼",
+                views: "77.6万",
+                danmaku: "1.5万",
+                duration: "14:50",
+                cover_url: ""
+            },
+            has_right: true
         }
     ];
 
-    // 事件通知接口 (可供 Rust 后端监听)
-    callback play_video(string); // 请求播放指定 ID 视频
+    callback play_video(string);
+
+    // 内部方法：向左切换 Tab
+    function switch_tab_prev() {
+        if (root.current_tab == NavTabType.Follow) {
+            root.current_tab = NavTabType.Recommend;
+        } else if (root.current_tab == NavTabType.Recommend) {
+            root.current_tab = NavTabType.Live;
+        }
+    }
+
+    // 内部方法：向右切换 Tab
+    function switch_tab_next() {
+        if (root.current_tab == NavTabType.Live) {
+            root.current_tab = NavTabType.Recommend;
+        } else if (root.current_tab == NavTabType.Recommend) {
+            root.current_tab = NavTabType.Follow;
+        }
+    }
 
     // --------------------------------------------------------------------------
-    // 主界面布局 (Main Layout)
+    // 主界面纵向流
     // --------------------------------------------------------------------------
     VerticalLayout {
         padding: 0px;
         spacing: 0px;
 
-        // 1. 顶部应用栏
+        // 1. 顶部导航栏 (支持横向手势轻扫切换 Tab)
         TopBar {
             current_tab <=> root.current_tab;
             open_drawer => {
                 root.drawer_open = true;
             }
-            open_search => {
-                // 搜索功能入口
+        }
+
+        // 顶栏下方的滑动指示感知区 (左右横滑即可顺畅切 Tab)
+        TouchArea {
+            height: 36px;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.swipe_start_x = self.mouse-x;
+                } else if (event.kind == PointerEventKind.up) {
+                    if (self.mouse-x - root.swipe_start_x > 45px) {
+                        root.switch_tab_prev(); // 向右滑，切左边的Tab
+                    } else if (root.swipe_start_x - self.mouse-x > 45px) {
+                        root.switch_tab_next(); // 向左滑，切右边的Tab
+                    }
+                }
+            }
+
+            Rectangle {
+                background: Theme.surface;
+                HorizontalLayout {
+                    alignment: center;
+                    Text {
+                        text: "‹ 左右轻扫快速切换频道 ›";
+                        color: Theme.outline;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
             }
         }
 
-        // 2. 主页面内容容器 (根据当前选中的 Tab 条件渲染)
+        // 2. 页面容器 (带推进动效)
         Rectangle {
             clip: true;
 
             // 推荐流 (默认)
             if root.current_tab == NavTabType.Recommend : RecommendView {
-                videos: root.sample_videos;
+                rows: root.sample_rows;
                 video_selected(bvid) => {
                     root.play_video(bvid);
                 }
@@ -115,6 +201,26 @@ export component AppWindow inherits Window {
 
             // 关注动态
             if root.current_tab == NavTabType.Follow : FollowView {}
+        }
+    }
+
+    // --------------------------------------------------------------------------
+    // 屏幕左边缘手势感应区 (0~24px：从最左侧向右滑即可拉出抽屉)
+    // --------------------------------------------------------------------------
+    if !root.drawer_open : TouchArea {
+        x: 0px;
+        y: 64px;
+        width: 24px;
+        height: parent.height - 64px;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.swipe_start_x = self.mouse-x;
+            } else if (event.kind == PointerEventKind.up) {
+                if (self.mouse-x - root.swipe_start_x > 15px) {
+                    root.drawer_open = true; // 边缘轻拉即呼出抽屉
+                }
+            }
         }
     }
 

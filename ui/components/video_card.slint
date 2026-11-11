@@ -1,27 +1,22 @@
 // ==============================================================================
-// 视频流信息卡片组件 (Video Card with M3 Tokens)
+// 双列竖版视频卡片组件 (Vertical Grid Video Card)
 //
 // 设计定位：
-// 1. 用于推荐流、关注动态流的视频卡片呈现。
-// 2. 包含视频封面、左下角播放量/弹幕徽章、右下角时长。
-// 3. 采用 Material 3 规范的 16px 大圆角与柔和背景，触控具有瞬态反馈。
+// 1. 上下结构：上方为视频封面（含播放量/弹幕/时长徽章），下方为标题与UP主。
+// 2. 适用于双列瀑布流推荐页，最大化利用移动端横向空间。
 // ==============================================================================
 
 import { Theme, VideoItemData } from "../theme.slint";
 
 export component VideoCard inherits Rectangle {
-    // --------------------------------------------------------------------------
-    // 接口属性与事件回调
-    // --------------------------------------------------------------------------
     in property <VideoItemData> data;
-    callback clicked(); // 点击卡片跳转视频播放事件
+    callback clicked();
 
-    height: 108px;
     background: Theme.surface;
     border-radius: Theme.radius_md;
     clip: true;
 
-    // 触控交互与水波纹按压状态
+    // 触控交互水波纹
     TouchArea {
         clicked => { root.clicked(); }
 
@@ -33,20 +28,21 @@ export component VideoCard inherits Rectangle {
         }
     }
 
-    HorizontalLayout {
-        padding: 10px;
-        spacing: 12px;
+    VerticalLayout {
+        padding: 0px;
+        spacing: 6px;
 
         // ----------------------------------------------------------------------
-        // 1. 视频封面占位区域 (后续可绑定动态图片纹理)
+        // 1. 顶部视频封面区域 (16:10 沉浸比例)
         // ----------------------------------------------------------------------
         Rectangle {
-            width: 130px;
+            height: 106px;
             background: Theme.surface_variant;
-            border-radius: Theme.radius_sm;
+            border-top-left-radius: Theme.radius_md;
+            border-top-right-radius: Theme.radius_md;
             clip: true;
 
-            // 封面文字占位
+            // 封面占位标示
             Text {
                 text: "BILIBILI";
                 color: Theme.outline;
@@ -56,19 +52,47 @@ export component VideoCard inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            // 右下角时长徽章
+            // 封面底部渐变投影蒙层 (确保白色角标清晰可见)
             Rectangle {
-                x: parent.width - self.width - 4px;
-                y: parent.height - self.height - 4px;
-                width: 44px;
-                height: 18px;
-                background: #000000bb;
+                y: parent.height - 24px;
+                height: 24px;
+                background: #00000077;
+            }
+
+            // 封面左下角：播放量与弹幕数
+            HorizontalLayout {
+                x: 6px;
+                y: parent.height - 18px;
+                spacing: 6px;
+
+                Text {
+                    text: "▶ " + root.data.views;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: 500;
+                }
+
+                Text {
+                    text: "💬 " + root.data.danmaku;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: 500;
+                }
+            }
+
+            // 封面右下角：时长
+            Rectangle {
+                x: parent.width - self.width - 5px;
+                y: parent.height - self.height - 3px;
+                width: 38px;
+                height: 16px;
+                background: #00000099;
                 border-radius: 4px;
 
                 Text {
                     text: root.data.duration;
                     color: #ffffff;
-                    font-size: 10px;
+                    font-size: 9px;
                     font-weight: 600;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -77,47 +101,44 @@ export component VideoCard inherits Rectangle {
         }
 
         // ----------------------------------------------------------------------
-        // 2. 视频信息文本区域
+        // 2. 底部视频文字信息区域
         // ----------------------------------------------------------------------
         VerticalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-bottom: 8px;
+            spacing: 4px;
             alignment: space-between;
 
-            // 视频标题 (最多两行)
+            // 两行截断标题
             Text {
                 text: root.data.title;
                 color: Theme.on_surface;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
                 wrap: word-wrap;
-                max-height: 42px;
+                max-height: 38px;
                 overflow: elide;
             }
 
-            // UP主与播放数据元信息
-            VerticalLayout {
-                spacing: 2px;
+            // UP 主信息
+            HorizontalLayout {
+                spacing: 4px;
 
                 Text {
-                    text: "UP: " + root.data.author;
-                    color: Theme.on_surface_variant;
-                    font-size: 12px;
-                    overflow: elide;
+                    text: "UP";
+                    color: Theme.primary;
+                    font-size: 10px;
+                    font-weight: 700;
+                    vertical-alignment: center;
                 }
 
-                HorizontalLayout {
-                    spacing: 12px;
-
-                    Text {
-                        text: "▶ " + root.data.views;
-                        color: Theme.outline;
-                        font-size: 11px;
-                    }
-
-                    Text {
-                        text: "💬 " + root.data.danmaku;
-                        color: Theme.outline;
-                        font-size: 11px;
-                    }
+                Text {
+                    text: root.data.author;
+                    color: Theme.on_surface_variant;
+                    font-size: 11px;
+                    overflow: elide;
+                    vertical-alignment: center;
                 }
             }
         }

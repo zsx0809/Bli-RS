@@ -1,4 +1,4 @@
-use bli_rs::create_app;
+use bli_rs::{create_app, ComponentHandle};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
