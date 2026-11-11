@@ -1,0 +1,33 @@
+// ==============================================================================
+// 直播流视图 (Live Stream View)
+//
+// 设计定位：
+// 1. 直播专区推荐列表与正在开播的 UP 主。
+// ==============================================================================
+
+import { Theme } from "../theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component LiveView inherits Rectangle {
+    background: Colors.transparent;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        Text {
+            text: "📡 直播专区";
+            color: Theme.primary;
+            font-size: 20px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "正在接入 Bilibili 直播真实流媒体管道...\n杜绝官方后台音频驻留与发热";
+            color: Theme.on_surface_variant;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}

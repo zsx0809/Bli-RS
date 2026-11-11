@@ -1,0 +1,125 @@
+// ==============================================================================
+// 视频流信息卡片组件 (Video Card with M3 Tokens)
+//
+// 设计定位：
+// 1. 用于推荐流、关注动态流的视频卡片呈现。
+// 2. 包含视频封面、左下角播放量/弹幕徽章、右下角时长。
+// 3. 采用 Material 3 规范的 16px 大圆角与柔和背景，触控具有瞬态反馈。
+// ==============================================================================
+
+import { Theme, VideoItemData } from "../theme.slint";
+
+export component VideoCard inherits Rectangle {
+    // --------------------------------------------------------------------------
+    // 接口属性与事件回调
+    // --------------------------------------------------------------------------
+    in property <VideoItemData> data;
+    callback clicked(); // 点击卡片跳转视频播放事件
+
+    height: 108px;
+    background: Theme.surface;
+    border-radius: Theme.radius_md;
+    clip: true;
+
+    // 触控交互与水波纹按压状态
+    TouchArea {
+        clicked => { root.clicked(); }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: parent.pressed ? Theme.primary.transparentize(85%) : Colors.transparent;
+            animate background { duration: Theme.animation_duration_fast; }
+        }
+    }
+
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 12px;
+
+        // ----------------------------------------------------------------------
+        // 1. 视频封面占位区域 (后续可绑定动态图片纹理)
+        // ----------------------------------------------------------------------
+        Rectangle {
+            width: 130px;
+            background: Theme.surface_variant;
+            border-radius: Theme.radius_sm;
+            clip: true;
+
+            // 封面文字占位
+            Text {
+                text: "BILIBILI";
+                color: Theme.outline;
+                font-size: 11px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // 右下角时长徽章
+            Rectangle {
+                x: parent.width - self.width - 4px;
+                y: parent.height - self.height - 4px;
+                width: 44px;
+                height: 18px;
+                background: #000000bb;
+                border-radius: 4px;
+
+                Text {
+                    text: root.data.duration;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------------
+        // 2. 视频信息文本区域
+        // ----------------------------------------------------------------------
+        VerticalLayout {
+            alignment: space-between;
+
+            // 视频标题 (最多两行)
+            Text {
+                text: root.data.title;
+                color: Theme.on_surface;
+                font-size: 14px;
+                font-weight: 600;
+                wrap: word-wrap;
+                max-height: 42px;
+                overflow: elide;
+            }
+
+            // UP主与播放数据元信息
+            VerticalLayout {
+                spacing: 2px;
+
+                Text {
+                    text: "UP: " + root.data.author;
+                    color: Theme.on_surface_variant;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Text {
+                        text: "▶ " + root.data.views;
+                        color: Theme.outline;
+                        font-size: 11px;
+                    }
+
+                    Text {
+                        text: "💬 " + root.data.danmaku;
+                        color: Theme.outline;
+                        font-size: 11px;
+                    }
+                }
+            }
+        }
+    }
+}

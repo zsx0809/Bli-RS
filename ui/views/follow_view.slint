@@ -1,0 +1,32 @@
+// ==============================================================================
+// 关注动态流视图 (Follow Updates View)
+//
+// 设计定位：
+// 1. 已关注 UP 主最新发布的视频和图文动态。
+// ==============================================================================
+
+import { Theme } from "../theme.slint";
+
+export component FollowView inherits Rectangle {
+    background: Colors.transparent;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        Text {
+            text: "🔔 关注动态";
+            color: Theme.primary;
+            font-size: 20px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "关注列表动态拉取中...\n过滤一切赞助广告与商单推广";
+            color: Theme.on_surface_variant;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}

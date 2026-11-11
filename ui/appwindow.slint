@@ -1,174 +1,130 @@
-import { Button, VerticalBox, ScrollView } from "std-widgets.slint";
+// ==============================================================================
+// BLI-RS 主视窗容器 (Main App Window)
+//
+// 架构设计：
+// 1. 采用 Material 3 (Monet) 动态主题引擎驱动。
+// 2. 界面层次划分：
+//    [底层] -> 主内容区域 (TopBar + 根据 Tab 动态切换的 View 容器)
+//    [顶层] -> 侧滑抽屉面板 (NavigationDrawer) + 半透明遮罩 (Scrim)
+// 3. 所有状态与事件均通过声明式属性向下单向流动，向上由 Callback 事件回调。
+// ==============================================================================
 
-struct VideoCardData {
-    title: string,
-    author: string,
-    views: string,
-    duration: string,
-}
-
-component VideoCard inherits Rectangle {
-    in property <VideoCardData> data;
-    height: 100px;
-    background: #1e1e24;
-    border-radius: 12px;
-    drop-shadow-blur: 8px;
-    drop-shadow-color: #00000033;
-
-    HorizontalLayout {
-        padding: 10px;
-        spacing: 12px;
-
-        // 模拟视频封面
-        Rectangle {
-            width: 120px;
-            background: #2b2d42;
-            border-radius: 8px;
-
-            Text {
-                text: "COVER";
-                color: #8d99ae;
-                font-size: 12px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-
-            Rectangle {
-                x: parent.width - self.width - 4px;
-                y: parent.height - self.height - 4px;
-                width: 42px;
-                height: 18px;
-                background: #000000aa;
-                border-radius: 4px;
-
-                Text {
-                    text: root.data.duration;
-                    color: #edf2f4;
-                    font-size: 10px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        // 视频文字详情
-        VerticalLayout {
-            alignment: space-between;
-
-            Text {
-                text: root.data.title;
-                color: #edf2f4;
-                font-size: 14px;
-                font-weight: 600;
-                wrap: word-wrap;
-                max-height: 40px;
-                overflow: elide;
-            }
-
-            HorizontalLayout {
-                spacing: 8px;
-
-                Text {
-                    text: "UP: " + root.data.author;
-                    color: #8d99ae;
-                    font-size: 12px;
-                }
-
-                Text {
-                    text: "▶ " + root.data.views;
-                    color: #8d99ae;
-                    font-size: 12px;
-                }
-            }
-        }
-    }
-}
+import { Theme, NavTabType, VideoItemData } from "theme.slint";
+import { TopBar } from "components/topbar.slint";
+import { NavigationDrawer } from "components/drawer.slint";
+import { RecommendView } from "views/recommend_view.slint";
+import { LiveView } from "views/live_view.slint";
+import { FollowView } from "views/follow_view.slint";
 
 export component AppWindow inherits Window {
     title: "Bli-RS";
     preferred-width: 390px;
     preferred-height: 844px;
-    background: #121214;
+    background: Theme.background;
 
-    in property <[VideoCardData]> sample_videos: [
+    // --------------------------------------------------------------------------
+    // 内部响应式状态 (State Management)
+    // --------------------------------------------------------------------------
+    in-out property <NavTabType> current_tab: NavTabType.Recommend; // 当前导航Tab (默认推荐)
+    in-out property <bool> drawer_open: false;                     // 侧边抽屉展开状态
+
+    // 推荐流演示数据 (后续由 Rust 后端异步灌入真实 API 数据)
+    in property <[VideoItemData]> sample_videos: [
         {
-            title: "【纯血Rust】从零手搓B站安卓客户端：零开销、零发热",
+            id: "BV1AbcRust01",
+            title: "【纯血 Rust】从零手搓B站安卓端：告别 42°C 发热与后台守护",
             author: "大肥鱼",
             views: "128.4万",
-            duration: "18:24"
+            danmaku: "3.2万",
+            duration: "18:24",
+            cover_url: ""
         },
         {
-            title: "【硬核架构】解密 Bilibili Wbi 签名与 gRPC 实时流传输",
+            id: "BV1AbcRust02",
+            title: "【架构解密】深入 Bilibili Wbi 签名加密与 gRPC 实时流传输",
             author: "zsx0809",
             views: "89.2万",
-            duration: "24:10"
+            danmaku: "1.8万",
+            duration: "24:10",
+            cover_url: ""
         },
         {
-            title: "彻底告别 42°C！安卓 NDK AMediaCodec 硬件直解实践",
+            id: "BV1AbcRust03",
+            title: "Android NDK AMediaCodec 纯 C 硬件解码：功耗暴跌 60%",
             author: "RustMobile",
             views: "54.1万",
-            duration: "12:05"
+            danmaku: "9210",
+            duration: "12:05",
+            cover_url: ""
         },
         {
-            title: "Flutter vs 纯血 Rust：移动端性能与功耗终极对决",
-            author: "CodeLab",
+            id: "BV1AbcRust04",
+            title: "Material You 莫奈取色与 AOSP 原生滑动动力学在 Rust 上的实践",
+            author: "AndroidLab",
+            views: "42.7万",
+            danmaku: "6500",
+            duration: "15:40",
+            cover_url: ""
+        },
+        {
+            id: "BV1AbcRust05",
+            title: "为什么手机 B 站会发热？深入 ijkservice 软硬解死循环与泄漏排查",
+            author: "KernelWatch",
             views: "36.8万",
-            duration: "30:45"
-        },
-        {
-            title: "Linux 内核级防发热：深入 Android 进程调度与温控",
-            author: "KernelDev",
-            views: "15.9万",
-            duration: "15:20"
+            danmaku: "4820",
+            duration: "20:15",
+            cover_url: ""
         }
     ];
 
+    // 事件通知接口 (可供 Rust 后端监听)
+    callback play_video(string); // 请求播放指定 ID 视频
+
+    // --------------------------------------------------------------------------
+    // 主界面布局 (Main Layout)
+    // --------------------------------------------------------------------------
     VerticalLayout {
         padding: 0px;
         spacing: 0px;
 
-        // 顶部导航栏
-        Rectangle {
-            height: 60px;
-            background: #18181b;
-
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                alignment: space-between;
-
-                Text {
-                    text: "Bli-RS";
-                    color: #fb7299; // B 站粉
-                    font-size: 20px;
-                    font-weight: 800;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: "⚡ 极速冷血";
-                    color: #a1a1aa;
-                    font-size: 13px;
-                    vertical-alignment: center;
-                }
+        // 1. 顶部应用栏
+        TopBar {
+            current_tab <=> root.current_tab;
+            open_drawer => {
+                root.drawer_open = true;
+            }
+            open_search => {
+                // 搜索功能入口
             }
         }
 
-        // 视频长列表（带可滚动与惯性交互）
-        ScrollView {
-            viewport-y: 0px;
-            padding: 12px;
+        // 2. 主页面内容容器 (根据当前选中的 Tab 条件渲染)
+        Rectangle {
+            clip: true;
 
-            VerticalLayout {
-                spacing: 12px;
-
-                for video in root.sample_videos: VideoCard {
-                    data: video;
-                }
-                for video in root.sample_videos: VideoCard {
-                    data: video;
+            // 推荐流 (默认)
+            if root.current_tab == NavTabType.Recommend : RecommendView {
+                videos: root.sample_videos;
+                video_selected(bvid) => {
+                    root.play_video(bvid);
                 }
             }
+
+            // 直播流
+            if root.current_tab == NavTabType.Live : LiveView {}
+
+            // 关注动态
+            if root.current_tab == NavTabType.Follow : FollowView {}
+        }
+    }
+
+    // --------------------------------------------------------------------------
+    // 侧滑抽屉面板 (悬浮在主内容上方)
+    // --------------------------------------------------------------------------
+    NavigationDrawer {
+        is_open <=> root.drawer_open;
+        close_drawer => {
+            root.drawer_open = false;
         }
     }
 }

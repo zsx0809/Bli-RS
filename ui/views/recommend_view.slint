@@ -1,0 +1,36 @@
+// ==============================================================================
+// 推荐流视图 (Recommend View - 默认首页)
+//
+// 设计定位：
+// 1. 无限滚动推荐视频流列表。
+// 2. 纯净无广告、无直播强推、无带货小黄车。
+// ==============================================================================
+
+import { Theme, VideoItemData } from "../theme.slint";
+import { VideoCard } from "../components/video_card.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component RecommendView inherits Rectangle {
+    in property <[VideoItemData]> videos;
+    callback video_selected(string);
+
+    background: Colors.transparent;
+
+    ScrollView {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 8px;
+        padding-bottom: 16px;
+
+        VerticalLayout {
+            spacing: 10px;
+
+            for item in root.videos: VideoCard {
+                data: item;
+                clicked => {
+                    root.video_selected(item.id);
+                }
+            }
+        }
+    }
+}

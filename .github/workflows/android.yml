@@ -8,6 +8,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Android APK (aarch64)
@@ -24,11 +27,11 @@ jobs:
           java-version: '17'
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
-      - name: Setup Android NDK & SDK
+      - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d

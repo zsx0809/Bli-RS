@@ -1,0 +1,194 @@
+// ==============================================================================
+// 侧边抽屉面板 (Navigation Drawer - "我的" 与系统偏好设置)
+//
+// 设计定位：
+// 1. 完全通过左侧滑手势或点击顶部头像呼出，极大节约底栏垂直空间。
+// 2. 包含个人账号状态、硬币/B币、历史记录、离线缓存、以及硬解码核心设置。
+// 3. 点击半透明遮罩背景或向左推即可平滑收起。
+// ==============================================================================
+
+import { Theme } from "../theme.slint";
+
+export component NavigationDrawer inherits Rectangle {
+    // --------------------------------------------------------------------------
+    // 接口属性与事件回调
+    // --------------------------------------------------------------------------
+    in-out property <bool> is_open: false;       // 抽屉展开状态
+    callback close_drawer();                    // 关闭抽屉事件
+    callback navigate_settings();               // 跳转设置事件
+    callback navigate_history();                // 跳转历史记录事件
+
+    // 全屏覆盖 (处理遮罩)
+    width: 100%;
+    height: 100%;
+    background: Colors.transparent;
+
+    // --------------------------------------------------------------------------
+    // 1. 半透明黑色遮罩 (Scrim)
+    // --------------------------------------------------------------------------
+    if root.is_open : TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.close_drawer();
+        }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.scrim;
+            animate background { duration: Theme.animation_duration_normal; }
+        }
+    }
+
+    // --------------------------------------------------------------------------
+    // 2. 抽屉物理面板 (从左向右平滑滑出)
+    // --------------------------------------------------------------------------
+    Rectangle {
+        x: root.is_open ? 0px : -self.width;
+        animate x { duration: Theme.animation_duration_normal; easing: ease-out; }
+        
+        width: 300px;
+        height: 100%;
+        background: Theme.surface_container_high;
+        border-top-right-radius: Theme.radius_lg;
+        border-bottom-right-radius: Theme.radius_lg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 20px;
+            alignment: start;
+
+            // 头部用户信息卡片
+            Rectangle {
+                height: 110px;
+                background: Theme.surface_variant;
+                border-radius: Theme.radius_md;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+
+                        // 大头像
+                        Rectangle {
+                            width: 48px;
+                            height: 48px;
+                            border-radius: Theme.radius_full;
+                            background: Theme.primary;
+
+                            Text {
+                                text: "🐟";
+                                font-size: 24px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // 昵称与等级
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+
+                            Text {
+                                text: "大肥鱼的朋友";
+                                color: Theme.on_surface;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+
+                            Text {
+                                text: "LV6 · 纯血 Rust 极速模式";
+                                color: Theme.primary;
+                                font-size: 12px;
+                            }
+                        }
+                    }
+
+                    // 账号状态
+                    Text {
+                        text: "硬币: 1024  |  B币: 0.0  |  零发热运行中";
+                        color: Theme.on_surface_variant;
+                        font-size: 11px;
+                    }
+                }
+            }
+
+            // 分割线
+            Rectangle {
+                height: 1px;
+                background: Theme.surface_variant;
+            }
+
+            // 功能导航列表项
+            VerticalLayout {
+                spacing: 6px;
+
+                // 历史记录
+                TouchArea {
+                    height: 48px;
+                    clicked => { root.navigate_history(); }
+                    Rectangle {
+                        border-radius: Theme.radius_md;
+                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 16px;
+                            Text { text: "🕒"; font-size: 18px; vertical-alignment: center; }
+                            Text { text: "历史记录"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // 离线缓存
+                TouchArea {
+                    height: 48px;
+                    Rectangle {
+                        border-radius: Theme.radius_md;
+                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 16px;
+                            Text { text: "📥"; font-size: 18px; vertical-alignment: center; }
+                            Text { text: "离线缓存"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // 我的收藏
+                TouchArea {
+                    height: 48px;
+                    Rectangle {
+                        border-radius: Theme.radius_md;
+                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 16px;
+                            Text { text: "⭐"; font-size: 18px; vertical-alignment: center; }
+                            Text { text: "我的收藏"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // 解码与温控设置 (核心卖点)
+                TouchArea {
+                    height: 48px;
+                    clicked => { root.navigate_settings(); }
+                    Rectangle {
+                        border-radius: Theme.radius_md;
+                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 16px;
+                            Text { text: "❄️"; font-size: 18px; vertical-alignment: center; }
+                            Text { text: "NDK 硬件解码与温控设置"; color: Theme.primary; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
