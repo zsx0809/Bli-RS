@@ -1,0 +1,174 @@
+import { Button, VerticalBox, ScrollView } from "std-widgets.slint";
+
+struct VideoCardData {
+    title: string,
+    author: string,
+    views: string,
+    duration: string,
+}
+
+component VideoCard inherits Rectangle {
+    in property <VideoCardData> data;
+    height: 100px;
+    background: #1e1e24;
+    border-radius: 12px;
+    drop-shadow-blur: 8px;
+    drop-shadow-color: #00000033;
+
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 12px;
+
+        // 模拟视频封面
+        Rectangle {
+            width: 120px;
+            background: #2b2d42;
+            border-radius: 8px;
+
+            Text {
+                text: "COVER";
+                color: #8d99ae;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                x: parent.width - self.width - 4px;
+                y: parent.height - self.height - 4px;
+                width: 42px;
+                height: 18px;
+                background: #000000aa;
+                border-radius: 4px;
+
+                Text {
+                    text: root.data.duration;
+                    color: #edf2f4;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // 视频文字详情
+        VerticalLayout {
+            alignment: space-between;
+
+            Text {
+                text: root.data.title;
+                color: #edf2f4;
+                font-size: 14px;
+                font-weight: 600;
+                wrap: word-wrap;
+                max-height: 40px;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "UP: " + root.data.author;
+                    color: #8d99ae;
+                    font-size: 12px;
+                }
+
+                Text {
+                    text: "▶ " + root.data.views;
+                    color: #8d99ae;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Bli-RS";
+    preferred-width: 390px;
+    preferred-height: 844px;
+    background: #121214;
+
+    in property <[VideoCardData]> sample_videos: [
+        {
+            title: "【纯血Rust】从零手搓B站安卓客户端：零开销、零发热",
+            author: "大肥鱼",
+            views: "128.4万",
+            duration: "18:24"
+        },
+        {
+            title: "【硬核架构】解密 Bilibili Wbi 签名与 gRPC 实时流传输",
+            author: "zsx0809",
+            views: "89.2万",
+            duration: "24:10"
+        },
+        {
+            title: "彻底告别 42°C！安卓 NDK AMediaCodec 硬件直解实践",
+            author: "RustMobile",
+            views: "54.1万",
+            duration: "12:05"
+        },
+        {
+            title: "Flutter vs 纯血 Rust：移动端性能与功耗终极对决",
+            author: "CodeLab",
+            views: "36.8万",
+            duration: "30:45"
+        },
+        {
+            title: "Linux 内核级防发热：深入 Android 进程调度与温控",
+            author: "KernelDev",
+            views: "15.9万",
+            duration: "15:20"
+        }
+    ];
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // 顶部导航栏
+        Rectangle {
+            height: 60px;
+            background: #18181b;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                alignment: space-between;
+
+                Text {
+                    text: "Bli-RS";
+                    color: #fb7299; // B 站粉
+                    font-size: 20px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "⚡ 极速冷血";
+                    color: #a1a1aa;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // 视频长列表（带可滚动与惯性交互）
+        ScrollView {
+            viewport-y: 0px;
+            padding: 12px;
+
+            VerticalLayout {
+                spacing: 12px;
+
+                for video in root.sample_videos: VideoCard {
+                    data: video;
+                }
+                for video in root.sample_videos: VideoCard {
+                    data: video;
+                }
+            }
+        }
+    }
+}

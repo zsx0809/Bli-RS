@@ -1,0 +1,55 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK (aarch64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK & SDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-apk
+        run: |
+          cargo install cargo-apk --locked
+
+      - name: Build Android APK (Release)
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          cargo apk build --release --target aarch64-linux-android
+
+      - name: Find and Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bli-RS-arm64-v8a-release
+          path: target/release/apk/*.apk
+          if-no-files-found: error

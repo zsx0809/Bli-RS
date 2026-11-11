@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+*.apk
+*.aab
+*.so
+.idea/
+.vscode/
+*.iml
+*.log
+local.properties
+.DS_Store
