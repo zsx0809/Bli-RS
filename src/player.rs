@@ -26,6 +26,8 @@ static AUDIO_CLOCK: Mutex<Option<std::sync::Arc<crate::audio_out::PlayClock>>> =
 /// 这样后台期间下载的进度不会丢。
 static CURRENT_BUFFER: Mutex<Option<std::sync::Arc<crate::stream_source::SharedBuffer>>> =
     Mutex::new(None);
+/// 当前视频分辨率（宽, 高）。全屏 letterbox 计算要用。
+static VIDEO_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
 static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
 /// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
@@ -618,6 +620,14 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             vtrack.height.unwrap_or(0),
             vtrack.codecs
         ));
+
+        // 记下分辨率：全屏时按它算 letterbox，避免画面被拉伸
+        let vw = vtrack.width.unwrap_or(0) as i32;
+        let vh = vtrack.height.unwrap_or(0) as i32;
+        if let Ok(mut g) = VIDEO_SIZE.lock() {
+            *g = Some((vw, vh));
+        }
+        crate::video_surface::set_video_size(vw as u32, vh as u32);
 
         // 记录总时长（playurl 给的是秒，内部统一用微秒）。
         // UI 的手势进度是 0.0~1.0，seek 时要用它换算成 PTS。
@@ -1470,8 +1480,15 @@ pub fn seek_to(frac: f32) {
 /// （is_fullscreen 驱动 player_height / Tab 栏 / 内容区的显隐）。
 /// 两边必须一起变，否则就是"UI 全屏但视频还在顶上"。
 pub fn set_fullscreen(on: bool) {
-    crate::mxprobe::log_public(&format!("[Fullscreen] -> {on}"));
-    crate::video_surface::set_fullscreen_surface(on);
+    // 视频分辨率在全屏时用来算 letterbox，否则会拉伸变形
+    let (vw, vh) = VIDEO_SIZE
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or((0, 0));
+
+    crate::mxprobe::log_public(&format!("[Fullscreen] -> {on} (video {vw}x{vh})"));
+    crate::video_surface::set_fullscreen_surface(on, vw, vh);
 }
 
 /// 相对跳转（秒）。

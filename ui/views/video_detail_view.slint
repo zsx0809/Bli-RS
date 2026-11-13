@@ -94,9 +94,15 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
 
     // 播放器动态高度：竖屏 45% 视口（自适应高度，绝不过度压盖 UI），横屏 16:9
-    // 全屏时铺满整个窗口（横屏后 root.height 自然变成短边）
+    // 全屏时铺满整个窗口。
+    //
+    // 必须用 root.height 而不是 Math.max(height, width)：
+    //   横屏后 root.height 已经是短边（如 535），root.width 是长边（1196）。
+    //   上一版写 Math.max 会让播放区高度变成 1196，远超实际窗口高度，
+    //   结果所有浮层控件（返回键、进度条、按钮行）全被推到屏幕外，
+    //   看起来就是"全屏后 UI 消失、只剩画面"。
     out property <length> player_height: root.is_fullscreen
-        ? Math.max(root.height, root.width)
+        ? root.height
         : (root.detail.is_vertical
             ? Math.min(Math.max(220px, (root.height - root.safe_top) * 0.45), 380px)
             : (root.width * 9 / 16));
@@ -757,15 +763,6 @@ export component VideoDetailView inherits Rectangle {
                 fs_btn := GestureArea {
                     width: 64px;
                     height: 52px;
-
-                    // [临时诊断] 红底，用来确认按钮真实位置与命中区
-                    Rectangle {
-                        x: 0px;
-                        y: 0px;
-                        width: parent.width;
-                        height: parent.height;
-                        background: #ff000066;
-                    }
 
                     tap(x, y) => { root.toggle_fullscreen(); }
 

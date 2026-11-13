@@ -29,7 +29,7 @@ mod imp {
     use jni::objects::{GlobalRef, JObject, JValue};
     use jni::JavaVM;
     use std::ffi::c_void;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     use crate::android_window;
 
@@ -410,8 +410,11 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
 
     static LAST_LAYOUT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
-    /// 全屏切换：直接按屏幕物理尺寸重设 LayoutParams。
-    pub fn apply_fullscreen(fullscreen: bool) {
+    /// 全屏切换：按屏幕物理尺寸重设 LayoutParams，并保持视频宽高比。
+    ///
+    /// `video_w` / `video_h` 是视频自身的分辨率。传 0 表示未知，
+    /// 此时退化为铺满（会拉伸，但至少能看到画面）。
+    pub fn apply_fullscreen(fullscreen: bool, video_w: i32, video_h: i32) {
         let Some(vm) = android_window::java_vm() else {
             return;
         };
@@ -451,13 +454,62 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         // 高度，旋转后视频高度会是错的（比如 2400 而屏幕现在是 1240 高）。
         // 交给 MATCH_PARENT(-1) 由 View 系统自己跟随窗口尺寸，
         // 旋转完成后自动铺满，不需要我们再算一次。
-        let (h, top) = if fullscreen {
-            (-1, 0)
+        // 全屏时按**视频自身宽高比**算居中矩形，而不是 MATCH_PARENT。
+        //
+        // 为什么不能直接用 MATCH_PARENT：
+        //   MediaCodec 会把解码结果拉伸填满整个 Surface。16:9 的视频
+        //   放进 1240x2772 的竖屏 Surface 会被拉成一竖条长脸；
+        //   放进横屏窗口也会因窗口比例不同而变形。
+        //   正确做法是让 Surface 的矩形本身就是视频比例，两侧留黑。
+        //
+        // letterbox 计算：
+        //   取屏幕与视频两个比例，取"更受限"的那一维缩满，另一维留黑。
+        //   例：视频 852x480 (1.775)，屏幕横屏 2772x1240 (2.235)
+        //       → 高度受限 → 显示尺寸 = 1240*1.775 x 1240 = 2201x1240
+        //       → 左右各留 (2772-2201)/2 = 285px 黑边
+        //
+        // gravity 用 CENTER(17)，让这块矩形在窗口里居中。
+        const GRAVITY_TOP: i32 = 48;
+        const GRAVITY_CENTER: i32 = 17;
+
+        let video_ar = if video_w > 0 && video_h > 0 {
+            video_w as f32 / video_h as f32
         } else {
-            // 退出全屏：恢复成横屏 16:9 + 状态栏下移
+            0.0
+        };
+
+        let (w, h, top, gravity) = if fullscreen {
+            if video_ar > 0.0 {
+                // 横屏全屏：宽高取屏幕的较长边/较短边
+                let sw = width_px.max(height_px) as f32;
+                let sh = width_px.min(height_px) as f32;
+                let screen_ar = sw / sh;
+
+                let (dw, dh) = if video_ar > screen_ar {
+                    // 视频更宽 → 宽度受限，上下留黑
+                    (sw, sw / video_ar)
+                } else {
+                    // 视频更高（或相等）→ 高度受限，左右留黑
+                    (sh * video_ar, sh)
+                };
+
+                (
+                    dw.round() as i32,
+                    dh.round() as i32,
+                    0,
+                    GRAVITY_CENTER,
+                )
+            } else {
+                // 不知道视频分辨率：退回铺满
+                (-1, -1, 0, GRAVITY_CENTER)
+            }
+        } else {
+            // 退出全屏：恢复成 16:9 + 状态栏下移
             (
+                -1,
                 (width_px as f32 * 9.0 / 16.0) as i32,
                 crate::android_window::status_bar_height_px(),
+                GRAVITY_TOP,
             )
         };
 
@@ -469,11 +521,11 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         let Ok(lp) = env.new_object(
             "android/widget/FrameLayout$LayoutParams",
             "(II)V",
-            &[JValue::Int(-1), JValue::Int(h)],
+            &[JValue::Int(w), JValue::Int(h)],
         ) else {
             return;
         };
-        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(gravity));
         let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top));
 
         let _ = env.call_method(
@@ -484,7 +536,7 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         );
 
         crate::mxprobe::log_public(&format!(
-            "[Surface] 全屏={fullscreen} -> h={h}, top={top}"
+            "[Surface] 全屏={fullscreen} -> {w}x{h}, top={top}, video={video_w}x{video_h}"
         ));
 
         // ---- 屏幕方向 ----
@@ -747,11 +799,29 @@ pub fn update_surface_layout(height_px: i32, top_px: i32) {
 ///   全屏时 topMargin 要归 0（连状态栏区域一起占），
 ///   高度用**屏幕物理高度**而不是播放区高度 —— 后者是按 16:9 或 45%
 ///   算出来的，全屏语义完全不同。
-pub fn set_fullscreen_surface(fullscreen: bool) {
+pub fn set_fullscreen_surface(fullscreen: bool, video_w: i32, video_h: i32) {
     run_on_ui_thread(move || {
         #[cfg(target_os = "android")]
-        imp::apply_fullscreen(fullscreen);
+        imp::apply_fullscreen(fullscreen, video_w, video_h);
     });
+}
+
+/// 记录当前视频分辨率，供全屏时算 letterbox
+static VIDEO_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// 由 player 在拿到播放地址后调用
+pub fn set_video_size(w: u32, h: u32) {
+    if let Ok(mut g) = VIDEO_SIZE.lock() {
+        *g = Some((w as i32, h as i32));
+    }
+}
+
+fn current_video_size() -> (i32, i32) {
+    VIDEO_SIZE
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or((0, 0))
 }
 
 /// 自适应调整视频 Surface 尺寸 (横屏 16:9 / 竖屏 48%)

@@ -101,6 +101,12 @@ pub struct PlayClock {
     /// AAudioStream_getTimestamp 返回的是**硬件侧已播放帧数**，
     /// 这才是唯一准确的播放位置。
     hw_frames: AtomicI64,
+    /// 累计填入的**静音**帧数。
+    ///
+    /// 为什么必须扣掉：AAudio 的 frame_position 统计的是"硬件播放了多少帧"，
+    /// 包括我们因数据不足而填的静音。若不扣除，音频时钟会跑得比真实
+    /// 音频内容快 —— 表现为画面追着音频跑、整体偏快。
+    silence_frames: AtomicI64,
     /// 每帧字节数（通道数 × 每样本字节数）
     frame_bytes: AtomicU64,
     /// 采样率
@@ -119,6 +125,7 @@ impl PlayClock {
             written_bytes: AtomicU64::new(0),
             played_bytes: AtomicU64::new(0),
             hw_frames: AtomicI64::new(-1),
+            silence_frames: AtomicI64::new(0),
             frame_bytes: AtomicU64::new(4),
             sample_rate: AtomicU64::new(48000),
             paused: AtomicBool::new(false),
@@ -143,10 +150,13 @@ impl PlayClock {
         let fb = self.frame_bytes.load(Ordering::Relaxed).max(1);
         let sr = self.sample_rate.load(Ordering::Relaxed).max(1);
 
-        // ---- 首选：硬件时间戳（由回调每次刷新）----
+        // ---- 首选：硬件时间戳，但要扣掉我们填入的静音 ----
         let hw = self.hw_frames.load(Ordering::Relaxed);
         if hw >= 0 {
-            return base + (hw as f64 / sr as f64 * 1_000_000.0) as i64;
+            let silence = self.silence_frames.load(Ordering::Relaxed);
+            // 真实音频已播放帧数 = 硬件总帧数 - 静音帧数
+            let real = (hw - silence).max(0);
+            return base + (real as f64 / sr as f64 * 1_000_000.0) as i64;
         }
 
         // ---- 兜底：按已消费字节估算 ----
@@ -164,6 +174,13 @@ impl PlayClock {
     /// 回调频率通常 10~50Hz，开销可以忽略。
     fn refresh_hw_frames(&self, frames: i64) {
         self.hw_frames.store(frames, Ordering::Relaxed);
+    }
+
+    /// 回调填入静音时调用，累加被"浪费"掉的帧数
+    fn note_silence(&self, bytes: u64) {
+        let fb = self.frame_bytes.load(Ordering::Relaxed).max(1);
+        self.silence_frames
+            .fetch_add((bytes / fb) as i64, Ordering::Relaxed);
     }
 
     pub fn set_format(&self, sample_rate: u32, channel_count: u32, bytes_per_sample: u64) {
@@ -276,9 +293,11 @@ impl AudioOutput {
                         std::slice::from_raw_parts_mut(data as *mut u8, bytes)
                     };
 
-                    // 暂停：填静音但不推进时钟，避免"暂停时进度还在走"
+                    // 暂停：填静音，并把这段记进 silence_frames
+                    //（否则硬件帧数照涨，恢复播放后时钟会跳一大截）
                     if clock_cb.paused.load(Ordering::Relaxed) {
                         out.fill(0);
+                        clock_cb.note_silence(bytes as u64);
                         return AudioCallbackResult::Continue;
                     }
 
@@ -290,9 +309,12 @@ impl AudioOutput {
                     };
 
                     if got < bytes {
-                        // 缓冲不够：剩余填静音，并计一次 underrun
+                        // 缓冲不够：剩余填静音，并计一次 underrun。
+                        // 同时把静音帧数记下来 —— 这些帧会被硬件"播放"，
+                        // 但里面没有真实音频内容，不能算进播放进度。
                         out[got..].fill(0);
                         under_cb.fetch_add(1, Ordering::Relaxed);
+                        clock_cb.note_silence((bytes - got) as u64);
                     }
                     clock_cb.note_played(got as u64);
 
