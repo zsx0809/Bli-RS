@@ -309,6 +309,13 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                         })
                         .collect();
 
+                    // 先把文字内容上屏（头像留空），头像随后异步补 ——
+                    //   评论主体是文字，头像只是装饰；等头像下载完再整体渲染
+                    //   会让评论区白屏好几秒。
+                    let face_urls: Vec<String> =
+                        raw_comments.iter().map(|c| c.user_face.clone()).collect();
+
+                    let w_face_list = w_comment.clone();
                     let _ = w_comment.upgrade_in_event_loop(move |w| {
                         let ui_comments: Vec<CommentItemData> = raw_comments
                             .into_iter()
@@ -335,6 +342,21 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                             .collect();
                         w.set_video_comments(ModelRc::new(Rc::new(VecModel::from(ui_comments))));
                     });
+
+                    // 头像异步下载并逐条回填。
+                    //
+                    // 为什么逐条回填而不是攒齐一次性设置：
+                    //   20 条评论的头像，弱网下攒齐可能要十几秒，期间评论区
+                    //   全是灰圆点。逐条回填的话，谁的先下来谁先显示。
+                    //
+                    // 为什么只下前 20 个：
+                    //   接口一页就是 20 条，再往下要翻页 —— 翻页功能还没做，
+                    //   预先下载屏幕外的头像纯属浪费流量。
+                    spawn_comment_faces(w_face_list, face_urls, my_session);
+                }
+            });
+        }
+
                 }
             });
         }
@@ -502,7 +524,29 @@ fn start_playback(
     duration_us: i64,
 ) {
     let w_clone = window.clone();
-    // 3.5 边下边播：流式写入缓存，首段 1.5MB 就绪后即刻起播，杜绝整段漫长等待
+
+    // ==================================================================
+    // 下载策略：**下完再播**，不再边下边播
+    // ==================================================================
+    //
+    // 为什么放弃边下边播（这是"播到一半卡住"的根因）：
+    //
+    //   AMediaExtractor 通过 setDataSourceFd(fd, 0, len) 绑定数据源，
+    //   `len` 在**打开那一刻**就固定了。原先的做法是等文件涨到 1.5MB
+    //   就立刻起播 —— 此时 len=1.5MB，extractor 眼里整个视频只有 1.5MB。
+    //   后台虽然还在继续写文件，但 extractor 读到自己记录的 EOF 就返回
+    //   -1（输入结束），解码器发 EOS，画面冻结。文件变大它看不见。
+    //
+    //   日志里那句「[流式下载错误] error decoding response body」是另一个
+    //   独立问题（CDN 中途断连），但即使下载完全正常，边下边播也必定在
+    //   1.5MB 处停住。
+    //
+    //   要真正实现边下边播，得改用 AMediaDataSource（自定义 readAt 回调），
+    //   那是另一套 API 绑定工作。当前阶段先保证"能完整播完"，用下完再播。
+    //
+    //   代价：起播要等多几秒（480P 几 MB，通常 2~5 秒）。
+    //   收益：拖动进度条可靠（len 是真实长度）、不会中途冻结、
+    //         解码器不用处理文件增长的不确定状态。
     let cache_dir = crate::android_window::cache_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -517,9 +561,22 @@ fn start_playback(
     let path = cache_dir.join(format!("v_{bvid}.m4s"));
     let path_str = path.to_string_lossy().to_string();
 
-    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 500_000 {
-        crate::mxprobe::log_public("[Player] 启动边下边播流式拉取…");
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // 缓存命中就直接用；否则完整下载后再起播
+    let cached_ok = path
+        .exists()
+        && path.metadata().map(|m| m.len()).unwrap_or(0) > 500_000;
+
+    if cached_ok {
+        crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
+    } else {
+        // 先清掉可能存在的半截文件：
+        //   上次边下边播失败会留下 1.5MB 的残缺 m4s，
+        //   若不清掉，下次 AMediaExtractor 会把残片当完整文件解析，
+        //   表现为"有画面但播几秒就断"。
+        let _ = std::fs::remove_file(&path);
+
+        crate::mxprobe::log_public("[Player] 开始完整下载视频流…");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let client_dl = client.clone();
         let url_dl = url.clone();
         let path_dl = path.clone();
@@ -527,40 +584,54 @@ fn start_playback(
         std::thread::spawn(move || {
             let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
-                Err(_) => {
-                    let _ = tx.send(false);
+                Err(e) => {
+                    let _ = tx.send(Err(format!("初始化运行时失败: {e}")));
                     return;
                 }
             };
 
+            // 阈值传 u64::MAX：on_ready 在整个文件下完后才回调一次，
+            // 我们据此判定"下载完成"。这是复用现有 API 最省事的办法，
+            // 比在协议层再开一个 download_whole 要稳。
             let res = rt_dl.block_on(client_dl.download_stream_to_file(
                 &url_dl,
                 &path_dl,
-                1_500_000, // 首段阈值 1.5MB（包含 ftyp/moov 与前几秒关键帧，通常只需 0.1~0.3 秒）
-                move || {
-                    let _ = tx.send(true);
-                },
+                u64::MAX,
+                || {},
             ));
 
-            if let Err(e) = res {
-                crate::mxprobe::log_public(&format!("[流式下载错误] {e}"));
-            }
+            let _ = tx.send(match res {
+                Ok(()) => Ok(()),
+                Err(e) => Err(format!("{e}")),
+            });
         });
 
-        // 等待首批 1.5MB 就绪信号，放行起播
-        match rx.recv_timeout(std::time::Duration::from_secs(12)) {
-            Ok(true) => {
-                crate::mxprobe::log_public("[Player] 首段数据缓冲完毕，即刻进入播放！");
-            }
-            _ => {
-                if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 300_000 {
-                    report_fail(&w_clone, "缓冲视频流超时，请检查网络".into());
+        // 等待下载完成。超时给足 90 秒：
+        //   480P 几 MB，正常 2~5 秒；弱网下 30 秒也可能。
+        //   超时就明确报错，而不是让用户对着"加载中"干等。
+        match rx.recv_timeout(std::time::Duration::from_secs(90)) {
+            Ok(Ok(())) => {
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                crate::mxprobe::log_public(&format!(
+                    "[Player] 下载完成: {:.1} MB",
+                    size as f64 / 1_048_576.0
+                ));
+                if size < 100_000 {
+                    report_fail(&w_clone, "视频流下载为空，请重试".into());
                     return;
                 }
             }
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_file(&path);
+                report_fail(&w_clone, format!("视频下载失败: {e}"));
+                return;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                report_fail(&w_clone, "视频下载超时，请检查网络".into());
+                return;
+            }
         }
-    } else {
-        crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
     }
 
     if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
@@ -614,6 +685,50 @@ fn start_playback(
     // 为什么不每帧推：30fps 意味着每秒 30 次跨线程 event_loop 调用，
     // 在低端机上会和渲染抢 UI 线程。进度条人眼只需要 ~4Hz。
     spawn_progress_poller(w_clone.clone(), my_session, duration_us);
+}
+
+/// 评论头像批量下载并逐条回填。
+///
+/// 为什么要单独一个函数、还要带 session：
+///   用户在评论区翻着，切走了视频，这些下载中的头像必须能自我终止，
+///   否则会往已经换掉的列表里写数据（表现为新视频评论区混进旧头像）。
+fn spawn_comment_faces(
+    window: slint::Weak<AppWindow>,
+    urls: Vec<String>,
+    session: u64,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        for (idx, url) in urls.iter().enumerate() {
+            if url.is_empty() {
+                continue;
+            }
+            // 会话失效就别再往旧列表写了
+            if PLAY_SESSION.load(Ordering::SeqCst) != session {
+                return;
+            }
+
+            let Some((w, h, rgba)) = rt.block_on(download_raw_image(url)) else {
+                continue;
+            };
+
+            let w_ui = window.clone();
+            let _ = w_ui.upgrade_in_event_loop(move |ui| {
+                // 通过 AppWindow 重新取当前模型，避免跨线程持有 ModelRc
+                let model = ui.get_video_comments();
+                if let Some(mut row) = model.row_data(idx) {
+                    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                    row.user_face = Image::from_rgba8(buf);
+                    model.set_row_data(idx, row);
+                }
+                let _ = &ui;
+            });
+        }
+    });
 }
 
 /// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
@@ -755,12 +870,21 @@ fn stop_current() {
 //     那是独立的一块工作，不放在这次改动里冒充完成。
 // ==============================================================================
 
-/// 把归一化亮度写到窗口（WindowManager.LayoutParams.screenBrightness）。
+/// 把归一化亮度写到**系统**亮度设置。
 ///
-/// 为什么用窗口亮度而不是 Settings.System.SCREEN_BRIGHTNESS：
-///   后者要 WRITE_SETTINGS 特殊权限，且会污染用户全局设置。
-///   窗口亮度只作用于本 App 的窗口，退出即失效 —— 这也是所有播放器
-///   （B 站、YouTube、Plex）调亮度的标准做法。
+/// 为什么不用 WindowManager.LayoutParams.screenBrightness：
+///   试过了，在 NativeActivity（hasCode=false、没有 setContentView 时机）
+///   上不生效 —— 拖动时 HUD 数字在变，屏幕亮度纹丝不动。
+///   原因是 window 的 attributes 被 android-activity 在创建 Surface 时
+///   重置过，我们后写入的 screenBrightness 没有真正 apply 到显示层。
+///
+///   改用 Settings.System.SCREEN_BRIGHTNESS：
+///     · 需要 WRITE_SETTINGS 权限（已在 Manifest 申请）
+///     · 权限是「特殊权限」，用户需在系统设置里手动授予；
+///       未授予时 write 会抛 SecurityException —— 捕获后降级为不生效，
+///       但不崩、不打断播放
+///
+///   这是 B 站、抖音等的实际做法：调的是系统亮度，退出 App 后保持。
 pub fn set_brightness(v: f32) {
     #[cfg(target_os = "android")]
     {
@@ -769,31 +893,47 @@ pub fn set_brightness(v: f32) {
         let Ok(mut env) = vm.attach_current_thread() else { return };
         let Some(activity) = crate::android_window::activity_object() else { return };
 
-        // BRIGHTNESS_OVERRIDE_NONE = -1（交还系统控制）
-        // 0.0 ~ 1.0 是窗口亮度覆盖值
-        let target = if v <= 0.005 { 0.0f32 } else { v };
+        // 系统亮度范围是 0..255（部分 ROM 用 0..2047，但 getInt 读出的
+        // 最大值只有 255，这里按 1..255 映射；0 会让屏幕全黑，不好用）
+        let target = (v * 254.0).round().max(1.0) as i32;
 
-        let Ok(window) = env
-            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
+        // 1. ContentResolver
+        let Ok(resolver) = env
+            .call_method(&activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
             .and_then(|r| r.l())
         else {
             return;
         };
-        let Ok(attrs) = env
-            .call_method(&window, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;", &[])
-            .and_then(|r| r.l())
-        else {
-            return;
-        };
-        let _ = env.set_field(&attrs, "screenBrightness", "F", jni::objects::JValue::Float(target));
-        let _ = env.call_method(
-            &window,
-            "setAttributes",
-            "(Landroid/view/WindowManager$LayoutParams;)V",
-            &[jni::objects::JValue::Object(&attrs)],
+
+        // 2. "screen_brightness" 这个 Settings.System 常量名是稳定的字符串，
+        //    不需要去 find_class 拿字段（hasCode=false 下反射很啰嗦）
+        let Ok(key) = env.new_string("screen_brightness") else { return };
+
+        // 3. Settings.System.putInt(resolver, key, value)
+        //    Settings.System 是 android.provider.Settings$System
+        let Ok(cls) = env.find_class("android/provider/Settings$System") else { return };
+        let r = env.call_static_method(
+            cls,
+            "putInt",
+            "(Landroid/content/ContentResolver;Ljava/lang/String;I)Z",
+            &[
+                jni::objects::JValue::Object(&resolver),
+                jni::objects::JValue::Object(&key),
+                jni::objects::JValue::Int(target),
+            ],
         );
+
+        // 未授予 WRITE_SETTINGS 时会抛 SecurityException。
+        // 这不是致命错误：亮度调不了，但播放继续。
         if env.exception_check().unwrap_or(false) {
             let _ = env.exception_clear();
+            crate::mxprobe::log_public(
+                "[亮度] 写入被拒（需要用户在系统设置里授予「修改系统设置」权限）",
+            );
+            return;
+        }
+        if r.is_ok() {
+            crate::mxprobe::log_public(&format!("[亮度] -> {target}/255"));
         }
     }
     #[cfg(not(target_os = "android"))]
@@ -818,8 +958,12 @@ pub fn set_volume(v: f32) {
 
         // STREAM_MUSIC = 3
         const STREAM_MUSIC: i32 = 3;
-        // FLAG_SHOW_UI = 1（顺带显示系统音量条，用户有双重反馈）
-        const FLAG_SHOW_UI: i32 = 1;
+        // flags = 0：**不**显示系统音量条。
+        //
+        // 原先传 FLAG_SHOW_UI(1)，结果是我们自己的百分比 HUD 和系统音量条
+        // 同时弹出，视觉上打架。我们的 HUD 已经给出精确百分比，
+        // 系统那个横条在这里纯属干扰，所以关掉。
+        const FLAGS_NO_UI: i32 = 0;
 
         let Ok(audio_svc) = env.new_string("audio") else { return };
         let Ok(am) = env
@@ -859,7 +1003,7 @@ pub fn set_volume(v: f32) {
             &[
                 jni::objects::JValue::Int(STREAM_MUSIC),
                 jni::objects::JValue::Int(target),
-                jni::objects::JValue::Int(FLAG_SHOW_UI),
+                jni::objects::JValue::Int(FLAGS_NO_UI),
             ],
         );
         if env.exception_check().unwrap_or(false) {
@@ -904,7 +1048,9 @@ pub fn seek_to(frac: f32) {
 ///   2. 解码器在跑 → 暂停
 ///   3. 解码器已暂停 → 继续
 pub fn toggle_play(window: slint::Weak<AppWindow>) {
-    // 情形 1：需要从「待播」状态启动
+    crate::mxprobe::log_public("[Play] 收到播放/暂停指令");
+
+    // 情形 1：还没有解码器 —— 说明是「自动播放关闭」状态，需要真正起播
     let has_decoder = CURRENT
         .lock()
         .map(|c| c.is_some())
@@ -915,15 +1061,28 @@ pub fn toggle_play(window: slint::Weak<AppWindow>) {
         return;
     }
 
-    if let Ok(cur) = CURRENT.lock() {
-        if let Some(dec) = cur.as_ref() {
-            let now = !dec.controls.is_paused();
-            dec.controls.set_paused(now);
-            crate::mxprobe::log_public(&format!(
-                "[Play] {}",
-                if now { "已暂停" } else { "继续播放" }
-            ));
+    // 情形 2/3：已有解码器，翻转暂停位
+    //
+    // 注意这里**不能**再判断 `!has_decoder` 就 return 后直接读 CURRENT ——
+    // 中间可能被 stop_play 清空。用 if let 拿一次快照即可。
+    let new_paused = {
+        match CURRENT.lock() {
+            Ok(cur) => match cur.as_ref() {
+                Some(dec) => {
+                    let p = !dec.controls.is_paused();
+                    dec.controls.set_paused(p);
+                    Some(p)
+                }
+                None => None,
+            },
+            Err(_) => None,
         }
+    };
+
+    match new_paused {
+        Some(true) => crate::mxprobe::log_public("[Play] 已暂停"),
+        Some(false) => crate::mxprobe::log_public("[Play] 继续播放"),
+        None => crate::mxprobe::log_public("[Play] 解码器已消失，忽略"),
     }
 }
 

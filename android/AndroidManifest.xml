@@ -10,6 +10,20 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!--
+      调整屏幕亮度。
+
+      WRITE_SETTINGS 是「特殊权限」（AppOps），不是运行时权限：
+        · 不能通过 requestPermissions 申请
+        · 必须由用户到 系统设置 → 应用 → 特殊权限 → 修改系统设置 里手动授予
+        · 未授予时 Settings.System.putInt 抛 SecurityException
+
+      代码里已捕获该异常并降级（亮度不生效，但不崩溃、不中断播放）。
+      之所以仍用它：窗口亮度（LayoutParams.screenBrightness）在
+      NativeActivity 上实测不生效，只能走系统亮度。
+    -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+
+    <!--
       主题选择说明：
       之前用的是 @android:style/Theme.NoTitleBar.Fullscreen。
       Fullscreen 会让窗口铺满整屏、状态栏被内容覆盖，表现为时间/信号/电量全黑。

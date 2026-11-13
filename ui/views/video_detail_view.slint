@@ -409,7 +409,7 @@ export component VideoDetailView inherits Rectangle {
         // ==================================================================
         if root.hud_mode != "" : Rectangle {
             width: 176px;
-            height: root.hud_mode == "seek" ? 74px : 56px;
+            height: 74px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2 - 24px;
             background: #000000cc;
@@ -447,10 +447,14 @@ export component VideoDetailView inherits Rectangle {
                     }
                 }
 
-                if root.hud_mode == "seek" : Text {
-                    text: root.seek_preview >= 0.0
-                        ? Math.round(root.seek_preview * 100) + "%"
-                        : Math.round(root.progress * 100) + "%";
+                // 百分比：三种 HUD 都显示，亮度/音量也给出精确数值
+                // （没有系统音量条了，用户只能靠这个数字判断）
+                Text {
+                    text: root.hud_mode == "seek"
+                        ? (Math.round((root.seek_preview >= 0.0
+                            ? root.seek_preview
+                            : root.progress) * 100) + "%")
+                        : (Math.round(root.hud_value * 100) + "%");
                     color: #ffffff;
                     font-size: 12px;
                     font-weight: 700;
