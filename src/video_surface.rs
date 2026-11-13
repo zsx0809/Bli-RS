@@ -593,7 +593,13 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         //
         // 注意：Manifest 里 configChanges 已含 orientation，
         // Activity 不会因为旋转被重建，所以播放状态不会丢。
-        let orientation: i32 = if fullscreen { 6 } else { -1 };
+        // SCREEN_ORIENTATION_PORTRAIT = 1
+        //   —— 退出全屏时**显式**设成竖屏，不能只写 UNSPECIFIED(-1)。
+        //   写 -1 只是"交还系统"，而系统当前仍记着上一次的横屏请求，
+        //   结果退出全屏后还是横着，用户得手动转回来。
+        //
+        // SCREEN_ORIENTATION_SENSOR_LANDSCAPE = 6 —— 全屏横屏，可左右翻转。
+        let orientation: i32 = if fullscreen { 6 } else { 1 };
         let _ = env.call_method(
             &activity,
             "setRequestedOrientation",
@@ -605,9 +611,54 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         } else {
             crate::mxprobe::log_public(&format!(
                 "[Surface] 屏幕方向 -> {}",
-                if fullscreen { "横屏(SENSOR_LANDSCAPE)" } else { "交还系统" }
+                if fullscreen { "横屏(6)" } else { "竖屏(1)" }
             ));
         }
+
+        // ---- 状态栏 / 导航栏：全屏时隐藏 ----
+        //
+        // 横屏看视频时状态栏会占掉顶部一条，还会压住画面（我们播放区
+        // 是全屏的，状态栏直接叠在视频上）。用 WindowInsetsController
+        // 把系统栏藏起来，退出全屏再显示回来。
+        //
+        // 用老 API（setSystemUiVisibility + FLAG_FULLSCREEN）的实现：
+        //   Android 11+ 虽标记为 deprecated，但功能完全有效，且不需要
+        //   去 find_class 拿 WindowInsetsController 这种内部类。
+        //   对一个 minSdk 26 的项目来说这是最省事且兼容面最广的路子。
+        let flags: i32 = if fullscreen {
+            // FLAG_FULLSCREEN = 1024
+            // SYSTEM_UI_FLAG_FULLSCREEN = 4
+            // SYSTEM_UI_FLAG_HIDE_NAVIGATION = 2
+            // SYSTEM_UI_FLAG_IMMERSIVE_STICKY = 4096
+            1024
+        } else {
+            0
+        };
+        let decor = env
+            .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
+            .and_then(|v| v.l());
+        if let Ok(decor) = decor {
+            let sys_ui: i32 = if fullscreen { 4 | 2 | 4096 } else { 0 };
+            let _ = env.call_method(
+                &decor,
+                "setSystemUiVisibility",
+                "(I)V",
+                &[JValue::Int(sys_ui)],
+            );
+        }
+        let _ = env.call_method(
+            &window,
+            "setFlags",
+            "(II)V",
+            &[JValue::Int(flags), JValue::Int(1024)],
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        crate::mxprobe::log_public(&format!(
+            "[Surface] 系统栏 -> {}",
+            if fullscreen { "隐藏" } else { "显示" }
+        ));
     }
 
     /// 更新 SurfaceView 的高宽与顶部边距（在主线程运行）

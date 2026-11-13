@@ -384,6 +384,7 @@ fn decode_loop(
         // seek 后需要丢弃到目标 PTS 为止的帧（extractor 只能跳到关键帧）
         let mut seek_drop_until_us: Option<i64> = None;
         let mut avsync_tick: u32 = 0;
+        let mut aligned_once = false;
 
         while !output_done && !stop.load(Ordering::Relaxed) {
             // ---- 外部控制：暂停 ----
@@ -529,7 +530,20 @@ fn decode_loop(
                             .map(|c| c.position_us())
                             .filter(|&p| p > 0);
 
+                        // 首次拿到有效音频位置时，若偏差极大（比如刚 seek
+                        // 或全屏重建），直接丢弃这些帧快速收敛，
+                        // 而不是让它们排队慢慢追 —— 否则会有几秒的错位残留。
                         if let Some(audio_pos) = audio_pos_opt {
+                            if !aligned_once {
+                                aligned_once = true;
+                                let d = pts_us - audio_pos;
+                                if d.abs() > 500_000 {
+                                    crate::mxprobe::log_public(&format!(
+                                        "[AVSync] 初次对齐偏差 {}ms，进入追帧模式",
+                                        d / 1000
+                                    ));
+                                }
+                            }
                             // 视频 PTS 与音频位置在同一时间轴上比较。
                             // 两者都来自同一条 DASH 的时间原点，可直接相减。
                             let diff_us = pts_us - audio_pos;
