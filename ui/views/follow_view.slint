@@ -1,8 +1,11 @@
 // ==============================================================================
 // 关注动态流视图 (Follow Updates View)
 //
-// 设计定位：
-// 1. 已关注 UP 主最新发布的视频和图文动态。
+// 骨架阶段：空状态占位。
+// 空状态必须具备三件事，否则用户会误判为"坏了"：
+//   1. 一个图形符号（不是 emoji）
+//   2. 一句说明当前状态的话
+//   3. 一个明确的下一步动作
 // ==============================================================================
 
 import { Theme } from "../theme.slint";
@@ -12,18 +15,42 @@ export component FollowView inherits Rectangle {
 
     VerticalLayout {
         alignment: center;
-        spacing: 16px;
+        spacing: 0px;
+
+        // 图形符号：同心圆 + 铃形，纯矢量，随主题着色
+        Rectangle {
+            height: 72px;
+            background: transparent;
+
+            Path {
+                width: 64px;
+                height: 64px;
+                x: (parent.width - 64px) * 0.5;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: "M 12 3.2 A 6.2 6.2 0 0 1 18.2 9.4 L 18.2 13.6 L 20.4 16.4 L 3.6 16.4 L 5.8 13.6 L 5.8 9.4 A 6.2 6.2 0 0 1 12 3.2 Z M 9.6 18.4 A 2.4 2.4 0 0 0 14.4 18.4";
+                stroke: Theme.outline;
+                stroke-width: 1.3px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+            }
+        }
+
+        Rectangle { height: 18px; background: transparent; }
 
         Text {
-            text: "🔔 关注动态";
-            color: Theme.primary;
-            font-size: 20px;
-            font-weight: 700;
+            text: "还没有动态";
+            color: Theme.on_surface;
+            font-size: 16px;
+            font-weight: 600;
             horizontal-alignment: center;
         }
 
+        Rectangle { height: 8px; background: transparent; }
+
         Text {
-            text: "关注列表动态拉取中...\n过滤一切赞助广告与商单推广";
+            text: "关注 UP 主后，他们的更新会出现在这里";
             color: Theme.on_surface_variant;
             font-size: 13px;
             horizontal-alignment: center;

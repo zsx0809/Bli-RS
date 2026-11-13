@@ -1,0 +1,137 @@
+// ==============================================================================
+// 矢量图标集 (Vector Icons)
+//
+// 为什么不用 emoji：
+// 1. emoji 由系统字体渲染，风格/饱和度/描边由厂商决定，跨设备不可控。
+// 2. 无法统一着色，无法参与主题切换。
+// 3. 本组件全部基于 24x24 viewbox 的 Path，统一 1.6px 描边、currentColor 语义。
+// ==============================================================================
+
+import { Theme } from "../theme.slint";
+
+/// 图标基类：统一 24x24 viewbox、统一描边、统一颜色来源
+export component IconBase inherits Rectangle {
+    in property <string> commands;
+    in property <color> tint: Theme.on_surface_variant;
+    in property <length> stroke_w: 1.6px;
+    in property <bool> fill_mode: false;
+    in property <length> size: 24px;
+
+    width: self.size;
+    height: self.size;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.commands;
+        stroke: root.fill_mode ? transparent : root.tint;
+        stroke-width: root.stroke_w;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: root.fill_mode ? root.tint : transparent;
+    }
+}
+
+/// 放大镜 (搜索)
+export component IconSearch inherits IconBase {
+    commands: "M 10.5 4 A 6.5 6.5 0 1 1 10.5 17 A 6.5 6.5 0 1 1 10.5 4 Z M 15.2 15.2 L 20 20";
+}
+
+/// 时钟 (历史记录)
+export component IconHistory inherits IconBase {
+    commands: "M 12 3 A 9 9 0 1 1 11.99 3 Z M 12 7 L 12 12 L 15.5 14";
+}
+
+/// 下载进托盘 (离线缓存)
+export component IconDownload inherits IconBase {
+    commands: "M 12 3.5 L 12 13.5 M 8 10 L 12 14 L 16 10 M 4.5 16.5 L 4.5 19.5 L 19.5 19.5 L 19.5 16.5";
+}
+
+/// 星形 (我的收藏)
+export component IconStar inherits IconBase {
+    commands: "M 12 3.6 L 14.6 9.1 L 20.5 9.9 L 16.2 14 L 17.2 19.9 L 12 17.1 L 6.8 19.9 L 7.8 14 L 3.5 9.9 L 9.4 9.1 Z";
+}
+
+/// 温度计 (硬件解码与温控)
+export component IconThermostat inherits IconBase {
+    commands: "M 10 13.6 L 10 5.5 A 2 2 0 1 1 14 5.5 L 14 13.6 A 4.2 4.2 0 1 1 10 13.6 Z M 12 16.4 L 12 9";
+}
+
+/// 齿轮 (设置)
+export component IconSettings inherits IconBase {
+    commands: "M 12 8.6 A 3.4 3.4 0 1 1 11.99 8.6 Z M 12 2.5 L 12 4.6 M 12 19.4 L 12 21.5 M 4.3 7.9 L 6.1 9 M 17.9 15 L 19.7 16.1 M 4.3 16.1 L 6.1 15 M 17.9 9 L 19.7 7.9";
+}
+
+/// 播放三角 (封面播放量)
+export component IconPlay inherits IconBase {
+    commands: "M 7 4.5 L 18.5 12 L 7 19.5 Z";
+    fill_mode: true;
+    stroke_w: 0px;
+}
+
+/// 弹幕气泡 (封面弹幕数)
+export component IconDanmaku inherits IconBase {
+    commands: "M 3.5 5.5 L 20.5 5.5 L 20.5 16 L 12.5 16 L 8 19.5 L 8 16 L 3.5 16 Z";
+    fill_mode: true;
+    stroke_w: 0px;
+}
+
+/// 关闭 (抽屉)
+export component IconClose inherits IconBase {
+    commands: "M 6 6 L 18 18 M 18 6 L 6 18";
+}
+
+/// 消息铃铛（带可选未读点）
+export component IconBell inherits IconBase {
+    commands: "M 12 3.4 C 9.0 3.4 6.8 5.7 6.8 8.6 L 6.8 13.0 L 4.7 16.2 L 19.3 16.2 L 17.2 13.0 L 17.2 8.6 C 17.2 5.7 15.0 3.4 12 3.4 Z M 9.9 18.6 C 10.3 19.6 11.1 20.1 12 20.1 C 12.9 20.1 13.7 19.6 14.1 18.6";
+}
+
+/// 私信信封
+export component IconMail inherits IconBase {
+    commands: "M 3.4 6.2 L 20.6 6.2 L 20.6 17.8 L 3.4 17.8 Z M 3.4 6.2 L 12 12.4 L 20.6 6.2";
+}
+
+/// 返回箭头
+export component IconBack inherits IconBase {
+    commands: "M 15 19 L 8 12 L 15 5";
+}
+
+/// 点赞大拇指
+export component IconLike inherits IconBase {
+    commands: "M 7 21 L 3.5 21 L 3.5 10 L 7 10 Z M 7 10 L 11.5 2.5 C 12.8 2.5 13.8 3.8 13.3 5.2 L 12.2 9.5 L 19.5 9.5 C 20.6 9.5 21.5 10.4 21.5 11.5 L 19.8 18.5 C 19.3 20 17.8 21 16 21 L 7 21";
+}
+
+/// 不喜欢大拇指
+export component IconDislike inherits IconBase {
+    commands: "M 7 3 L 3.5 3 L 3.5 14 L 7 14 Z M 7 14 L 11.5 21.5 C 12.8 21.5 13.8 20.2 13.3 18.8 L 12.2 14.5 L 19.5 14.5 C 20.6 14.5 21.5 13.6 21.5 12.5 L 19.8 5.5 C 19.3 4 17.8 3 16 3 L 7 3";
+}
+
+/// 投币
+export component IconCoin inherits IconBase {
+    commands: "M 12 3 A 9 9 0 1 1 11.99 3 Z M 8.5 8.5 L 15.5 8.5 M 12 8.5 L 12 15.5 M 8.5 15.5 L 15.5 15.5";
+}
+
+/// 分享
+export component IconShare inherits IconBase {
+    commands: "M 14.5 7 L 19.5 12 L 14.5 17 M 19.5 12 L 9 12 C 6 12 4.5 14 4.5 17.5";
+}
+
+/// 下拉折叠指示 ∨
+export component IconChevronDown inherits IconBase {
+    commands: "M 6 9 L 12 15 L 18 9";
+}
+
+/// 向上折叠指示 ∧
+export component IconChevronUp inherits IconBase {
+    commands: "M 6 15 L 12 9 L 18 15";
+}
+
+/// 竖向三点菜单
+export component IconMoreVert inherits IconBase {
+    commands: "M 12 5.5 A 1.5 1.5 0 1 1 11.99 5.5 Z M 12 12 A 1.5 1.5 0 1 1 11.99 12 Z M 12 18.5 A 1.5 1.5 0 1 1 11.99 18.5 Z";
+    fill_mode: true;
+    stroke_w: 0px;
+}

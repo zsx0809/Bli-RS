@@ -1,176 +1,236 @@
 // ==============================================================================
-// 顶部应用栏组件 (TopBar with M3 Tabs)
+// 顶部应用栏 (TopBar) —— 对齐 B 站官方客户端的两行结构
 //
 // 布局结构：
-// [用户头像/汉堡菜单] ---------- [直播 | 推荐 | 关注] ---------- [搜索按钮]
+//   第一行：[头像]        [—— 搜索栏 ——]        [消息🔔]
+//   第二行：              [ 直播|推荐|关注 ]
 //
-// 特性：
-// 1. 完全遵循 Google Material 3 沉浸式设计，支持状态栏安全高度。
-// 2. 中间 Tab 切换带平滑胶囊指示器过渡动效，高对比度色彩反馈。
-// 3. 点击左侧头像向外抛出 open_drawer 事件，供父级窗口呼出侧边抽屉。
+// 布局原则（对齐靠柱）：
+// 1. 搜索栏与 Tab 胶囊**同宽（216px）且都水平居中**，左右边缘形成一条
+//    垂直对齐的"柱"，两行视觉上是一个整体，而不是各自浮动。
+// 2. 头像贴左边缘、消息贴右边缘，二者同为 34px，围绕中间那条柱对称。
+// 3. 中间的柱是固定宽度而非撑满 —— 只有固定宽度才能与 Tab 精确对齐；
+//    撑满会吃掉头像与铃铛之间的空间，破坏对齐关系。
 // ==============================================================================
 
-import { Theme, NavTabType } from "../theme.slint";
+import { Theme, NavTabType, Spacing } from "../theme.slint";
+import { IconSearch, IconBell } from "icons.slint";
 
-export component TopBar inherits Rectangle {
-    // --------------------------------------------------------------------------
-    // 接口属性与事件回调 (API Properties & Callbacks)
-    // --------------------------------------------------------------------------
-    in-out property <NavTabType> current_tab: NavTabType.Recommend; // 当前激活的 Tab (默认推荐)
-    
-    callback open_drawer();                      // 请求打开侧滑抽屉事件
-    callback tab_changed(NavTabType);            // Tab 切换事件通知
-    callback open_search();                      // 点击搜索按钮事件
 
-    height: 64px;
-    background: Theme.surface;
-    
-    // 底部细微边界描边 (提升层次感)
-    Rectangle {
-        y: parent.height - 1px;
-        height: 1px;
-        background: Theme.surface_variant;
+// 单个 Tab 按钮：内层圆角 = 外层 9999px - padding 3px，保持同心
+export component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active: false;
+    callback clicked();
+
+    border-radius: Theme.radius_full;
+    background: root.active ? Theme.primary : transparent;
+    animate background { duration: Theme.animation_duration_tab; }
+
+    TouchArea {
+        clicked => { root.clicked(); }
     }
 
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
-        alignment: space-between;
+    Text {
+        text: root.text;
+        color: root.active ? Theme.on_primary : (Theme.dark ? Theme.on_surface_variant : Theme.on_surface);
+        font-size: 13px;
+        font-weight: root.active ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.animation_duration_tab; }
+    }
+}
 
-        // ----------------------------------------------------------------------
-        // 1. 左侧区域：用户头像按钮 (点击呼出侧边栏)
-        // ----------------------------------------------------------------------
-        TouchArea {
-            width: 40px;
-            height: 40px;
-            clicked => {
-                root.open_drawer();
-            }
+export component TopBar inherits Rectangle {
+    in-out property <NavTabType> current_tab: NavTabType.Recommend;
+    in property <length> safe_top: 0px;
+    in property <int> unread_count: 0;
 
-            Rectangle {
-                width: 36px;
-                height: 36px;
-                border-radius: Theme.radius_full;
-                background: Theme.primary_container;
-                border-width: 1.5px;
-                border-color: Theme.primary;
+    callback open_drawer();
+    callback tab_changed(NavTabType);
+    callback open_search();
+    callback open_message();
 
-                // 占位图标/首字母
-                Text {
-                    text: "B";
-                    color: Theme.on_primary_container;
-                    font-size: 16px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
+    height: root.safe_top + Spacing.searchbar_row_height + Spacing.tabbar_row_height;
+    // 顶栏用 surface_container —— 与抽屉同一层色，两者视觉上是一整块
+    background: Theme.surface_container;
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // 状态栏安全区
+        Rectangle {
+            height: root.safe_top;
+            background: transparent;
         }
 
         // ----------------------------------------------------------------------
-        // 2. 中间区域：三段式 Tab 切换器 (直播 | 推荐 | 关注)
+        // 第一行：头像(贴左) + 搜索栏(居中，与 Tab 同宽) + 消息(贴右)
+        //
+        // 用绝对定位而非 HorizontalLayout：搜索栏必须与 Tab 胶囊严格同宽同轴，
+        // 布局的伸缩分配做不到"固定宽度 + 精确居中"。
         // ----------------------------------------------------------------------
         Rectangle {
-            width: 210px;
-            height: 38px;
-            border-radius: Theme.radius_full;
-            background: Theme.surface_variant;
+            height: Spacing.searchbar_row_height;
+            background: transparent;
+
+            // 中间柱宽度：与第二行 Tab 胶囊一致
+            property <length> column_w: 216px;
+
+            // 头像 —— 贴左边缘
+            TouchArea {
+                x: Spacing.page_margin;
+                y: (parent.height - 34px) * 0.5;
+                width: 34px;
+                height: 34px;
+                clicked => { root.open_drawer(); }
+
+                Rectangle {
+                    width: 34px;
+                    height: 34px;
+                    border-radius: Theme.radius_full;
+                    background: Theme.primary;
+
+                    Path {
+                        width: 100%;
+                        height: 100%;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        commands: "M 4 12 C 7 7.5 13 7.5 16 11 L 20.5 8.2 L 19.6 15.8 L 16 13 C 13 16.5 7 16.5 4 12 Z";
+                        fill: Theme.on_primary;
+                        stroke: transparent;
+                    }
+                }
+            }
+
+            // 搜索栏 —— 与 Tab 胶囊同宽同轴
+            TouchArea {
+                x: (parent.width - parent.column_w) * 0.5;
+                y: (parent.height - Spacing.searchbar_height) * 0.5;
+                width: parent.column_w;
+                height: Spacing.searchbar_height;
+                clicked => { root.open_search(); }
+
+                Rectangle {
+                    height: parent.height;
+                    border-radius: Theme.radius_full;
+                    // 搜索栏内部：亮色下纯白、暗色下比顶栏亮一档 —— 形成"凹槽"
+                    background: Theme.search_bg;
+                    border-width: 1px;
+                    border-color: Theme.outline_variant;
+
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 8px;
+                        alignment: start;
+
+                        IconSearch {
+                            size: 17px;
+                            tint: Theme.on_surface_variant;
+                        }
+
+                        Text {
+                            text: "搜索视频、UP 主";
+                            color: Theme.outline;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            // 消息入口 —— 贴右边缘，与头像围绕中间柱对称
+            TouchArea {
+                x: parent.width - Spacing.page_margin - 34px;
+                y: (parent.height - 34px) * 0.5;
+                width: 34px;
+                height: 34px;
+                clicked => { root.open_message(); }
+
+                IconBell {
+                    x: 5px;
+                    y: 5px;
+                    size: 24px;
+                    tint: Theme.on_surface_variant;
+                }
+
+                // 未读红点
+                if root.unread_count > 0 : Rectangle {
+                    x: 24px;
+                    y: 4px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: Theme.radius_full;
+                    background: #ff4d6a;
+                    border-width: 1.5px;
+                    border-color: Theme.background;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------------
+        // 第二行：胶囊 Tab 切换器
+        // ----------------------------------------------------------------------
+        Rectangle {
+            height: Spacing.tabbar_row_height;
+            background: transparent;
 
             HorizontalLayout {
-                spacing: 4px;
-                padding: 3px;
+                alignment: center;
 
-                // Tab 1: 直播
-                TouchArea {
-                    clicked => {
-                        root.current_tab = NavTabType.Live;
-                        root.tab_changed(NavTabType.Live);
-                    }
-                    Rectangle {
-                        border-radius: Theme.radius_full;
-                        background: root.current_tab == NavTabType.Live ? Theme.primary : Colors.transparent;
-                        animate background { duration: Theme.animation_duration_fast; }
+                // 216px —— 与第一行搜索栏同宽，两者左右边缘严格对齐。
+                // 底色与顶栏同为 surface_container，靠 1px 轮廓线划出界限，
+                // 而不是靠填色差异 —— 这样顶栏整体是一块，胶囊是嵌进去的控件。
+                Rectangle {
+                    width: 216px;
+                    height: 38px;
+                    border-radius: Theme.radius_full;
+                    background: Theme.surface_container;
+                    border-width: 1px;
+                    border-color: Theme.outline;
 
-                        Text {
+                    HorizontalLayout {
+                        spacing: 2px;
+                        padding: 3px;
+
+                        TabButton {
                             text: "直播";
-                            color: root.current_tab == NavTabType.Live ? Theme.on_primary : Theme.on_surface_variant;
-                            font-size: 14px;
-                            font-weight: root.current_tab == NavTabType.Live ? 700 : 500;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                            active: root.current_tab == NavTabType.Live;
+                            clicked => {
+                                root.current_tab = NavTabType.Live;
+                                root.tab_changed(NavTabType.Live);
+                            }
                         }
-                    }
-                }
-
-                // Tab 2: 推荐 (默认)
-                TouchArea {
-                    clicked => {
-                        root.current_tab = NavTabType.Recommend;
-                        root.tab_changed(NavTabType.Recommend);
-                    }
-                    Rectangle {
-                        border-radius: Theme.radius_full;
-                        background: root.current_tab == NavTabType.Recommend ? Theme.primary : Colors.transparent;
-                        animate background { duration: Theme.animation_duration_fast; }
-
-                        Text {
+                        TabButton {
                             text: "推荐";
-                            color: root.current_tab == NavTabType.Recommend ? Theme.on_primary : Theme.on_surface_variant;
-                            font-size: 14px;
-                            font-weight: root.current_tab == NavTabType.Recommend ? 700 : 500;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                            active: root.current_tab == NavTabType.Recommend;
+                            clicked => {
+                                root.current_tab = NavTabType.Recommend;
+                                root.tab_changed(NavTabType.Recommend);
+                            }
                         }
-                    }
-                }
-
-                // Tab 3: 关注
-                TouchArea {
-                    clicked => {
-                        root.current_tab = NavTabType.Follow;
-                        root.tab_changed(NavTabType.Follow);
-                    }
-                    Rectangle {
-                        border-radius: Theme.radius_full;
-                        background: root.current_tab == NavTabType.Follow ? Theme.primary : Colors.transparent;
-                        animate background { duration: Theme.animation_duration_fast; }
-
-                        Text {
+                        TabButton {
                             text: "关注";
-                            color: root.current_tab == NavTabType.Follow ? Theme.on_primary : Theme.on_surface_variant;
-                            font-size: 14px;
-                            font-weight: root.current_tab == NavTabType.Follow ? 700 : 500;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                            active: root.current_tab == NavTabType.Follow;
+                            clicked => {
+                                root.current_tab = NavTabType.Follow;
+                                root.tab_changed(NavTabType.Follow);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // ----------------------------------------------------------------------
-        // 3. 右侧区域：搜索入口按钮
-        // ----------------------------------------------------------------------
-        TouchArea {
-            width: 40px;
-            height: 40px;
-            clicked => {
-                root.open_search();
-            }
-
-            Rectangle {
-                width: 36px;
-                height: 36px;
-                border-radius: Theme.radius_full;
-                background: Colors.transparent;
-
-                Text {
-                    text: "🔍";
-                    font-size: 16px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
+        // 顶栏底部分割线：把它与视频区分开
+        Rectangle {
+            height: 1px;
+            background: Theme.outline_variant;
         }
     }
 }

@@ -1,0 +1,25 @@
+[package]
+name = "bli-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Bilibili 协议层：Wbi 签名、REST 客户端、数据模型。零 UI 依赖。"
+license = "GPL-3.0-only"
+
+# 这个 crate 刻意不含 Slint / UI 依赖。
+# 原因：协议层需要能独立编译、独立测试、独立在桌面跑 probe，
+# 不该被 UI 框架的桌面后端（fontconfig/gtk）拖累。
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls", "json", "gzip", "brotli", "http2", "charset",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+log = "0.4"
+# 只用 tokio 的同步原语（Mutex）来缓存 mixin_key，
+# 不启用 runtime —— 运行时由宿主（Android 入口）提供。
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

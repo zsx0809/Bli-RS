@@ -1,236 +1,358 @@
 // ==============================================================================
 // BLI-RS 主视窗容器 (Main App Window)
 //
-// 架构特性：
-// 1. 经典双列网格瀑布流视频推荐布局。
-// 2. 顶部支持平滑横向轻扫手势切换 [直播 | 推荐 | 关注] 三个核心 Tab。
-// 3. 屏幕最左边缘 (0~28px) 支持向右滑动手势直接呼出侧边抽屉面板。
-// 4. Tab 切换具备平滑的视差推进过渡动效。
+// ==============================================================================
+// 手势架构（重写版）
+// ==============================================================================
+//
+// 旧结构：在页面区盖一个全屏 TouchArea，靠坐标反推命中哪张卡。
+// 它导出了三个无法局部修补的病灶：
+//
+//   1. 全屏层拿走 press，卡片内任何 TouchArea 都收不到 down。
+//      评论 Tab 点不动、卡片直接点击失效 —— 只能 tap_at(x,y) 反推行列。
+//   2. 反推公式假设"坐标 = 内容坐标"，但列表滚动过 / 页面横移过之后
+//      这两个坐标系就不重合了，命中必然错位。
+//   3. 按压反馈、滑动取消、抬手命中是三套手工同步的状态，必然错位。
+//
+// 新结构：**没有任何覆盖层**。谁被按下谁处理，pan 沿组件树往上冒泡。
+//
+//   VideoCard.GestureArea ──tap──→ 打开视频
+//                         ──pan──→ RecommendView（只转横向）
+//                                     ↓ swipe_horizontal
+//                                  AppWindow 切频道
+//
+//   纵向滚动由 RecommendView 内部的 Flickable 直接接管，
+//   因为内容宽度 == 视口宽度，横轴"没得滚"，横向分量不会被它捕获，
+//   所以横滑能顺利冒泡上来。两条路天然互不干扰。
+//
+// Tab 切换数据流：
+//   tab_index（离散值）→ 页面位移，只在这一个地方写。
+//   手势与 Tab 点击都走 go_tab_animated。
+//
+// 二级页面（视频详情）：
+//   独立一层，盖满整屏，自己处理返回手势与滚动。
+//   **不由 AppWindow 代管** —— 两个页面的手势语义完全不同。
 // ==============================================================================
 
-import { Theme, NavTabType, VideoItemData, VideoRowPair } from "theme.slint";
+import { Theme, NavTabType, VideoItemData, VideoRowPair, VideoDetailData, RelatedVideoData, CommentItemData, Spacing } from "theme.slint";
 import { TopBar } from "components/topbar.slint";
 import { NavigationDrawer } from "components/drawer.slint";
 import { RecommendView } from "views/recommend_view.slint";
 import { LiveView } from "views/live_view.slint";
 import { FollowView } from "views/follow_view.slint";
+import { VideoDetailView } from "views/video_detail_view.slint";
 
 export component AppWindow inherits Window {
     title: "Bli-RS";
+
+    // 由 Rust 侧在启动时调用一次：把当前明暗色板写进 Theme。
+    public function apply_palette() {
+        Theme.dark = root.pal_dark;
+        Theme.background = root.pal_background;
+        Theme.surface = root.pal_surface;
+        Theme.surface_container = root.pal_surface_container;
+        Theme.surface_container_high = root.pal_surface_container_high;
+        Theme.surface_variant = root.pal_surface_variant;
+        Theme.search_bg = root.pal_search_bg;
+        Theme.on_surface = root.pal_on_surface;
+        Theme.on_surface_variant = root.pal_on_surface_variant;
+        Theme.outline = root.pal_outline;
+        Theme.outline_variant = root.pal_outline_variant;
+        Theme.primary = root.pal_primary;
+        Theme.on_primary = root.pal_on_primary;
+        Theme.primary_container = root.pal_primary_container;
+        Theme.on_primary_container = root.pal_on_primary_container;
+        Theme.secondary = root.pal_secondary;
+        Theme.secondary_container = root.pal_secondary_container;
+        Theme.scrim = root.pal_scrim.transparentize(Theme.dark ? 55% : 40%);
+    }
+
+    in-out property <color> pal_background: Theme.background;
+    in-out property <color> pal_surface: Theme.surface;
+    in-out property <color> pal_surface_container: Theme.surface_container;
+    in-out property <color> pal_surface_container_high: Theme.surface_container_high;
+    in-out property <color> pal_surface_variant: Theme.surface_variant;
+    in-out property <color> pal_search_bg: Theme.search_bg;
+    in-out property <color> pal_on_surface: Theme.on_surface;
+    in-out property <color> pal_on_surface_variant: Theme.on_surface_variant;
+    in-out property <color> pal_outline: Theme.outline;
+    in-out property <color> pal_outline_variant: Theme.outline_variant;
+    in-out property <color> pal_primary: Theme.primary;
+    in-out property <color> pal_on_primary: Theme.on_primary;
+    in-out property <color> pal_primary_container: Theme.primary_container;
+    in-out property <color> pal_on_primary_container: Theme.on_primary_container;
+    in-out property <color> pal_secondary: Theme.secondary;
+    in-out property <color> pal_secondary_container: Theme.secondary_container;
+    in-out property <color> pal_scrim: #000000;
+    in-out property <bool> pal_dark: Theme.dark;
+
     preferred-width: 390px;
     preferred-height: 844px;
     background: Theme.background;
 
     // --------------------------------------------------------------------------
-    // 响应式状态管理
+    // 状态
     // --------------------------------------------------------------------------
     in-out property <NavTabType> current_tab: NavTabType.Recommend;
     in-out property <bool> drawer_open: false;
+    callback drawer_changed();
 
-    // 手势滑动基准坐标记录
-    property <length> swipe_start_x: 0px;
+    property <length> safe_top: root.safe-area-insets.top;
+    property <length> safe_bottom: root.safe-area-insets.bottom;
+
+    property <int> tab_index:
+        (root.current_tab == NavTabType.Live) ? 0
+        : (root.current_tab == NavTabType.Recommend) ? 1 : 2;
+
+    property <int> page_count: 3;
+
+    property <length> page_base: -(root.tab_index * page_area.width);
+    property <length> swipe_dx: 0px;
+    property <bool> animating: false;
+
+    in-out property <length> g_pull: 0px;
+    in-out property <bool> g_refreshing: false;
 
     // --------------------------------------------------------------------------
-    // 双列网格演示数据 (后续由 Rust 后端异步灌入真实 API 数据)
+    // 推荐流数据
     // --------------------------------------------------------------------------
-    in property <[VideoRowPair]> sample_rows: [
-        {
-            left: {
-                id: "BV1Abc01",
-                title: "【纯血Rust】从零手搓B站安卓端：零开销、零发热",
-                author: "大肥鱼",
-                views: "128.4万",
-                danmaku: "3.2万",
-                duration: "18:24",
-                cover_url: ""
-            },
-            right: {
-                id: "BV1Abc02",
-                title: "【硬核架构】解密 Bilibili Wbi 签名与 gRPC 实时流传输",
-                author: "zsx0809",
-                views: "89.2万",
-                danmaku: "1.8万",
-                duration: "24:10",
-                cover_url: ""
-            },
-            has_right: true
-        },
-        {
-            left: {
-                id: "BV1Abc03",
-                title: "彻底告别 42°C！安卓 NDK AMediaCodec 硬件直解实践",
-                author: "RustMobile",
-                views: "54.1万",
-                danmaku: "9210",
-                duration: "12:05",
-                cover_url: ""
-            },
-            right: {
-                id: "BV1Abc04",
-                title: "Flutter vs 纯血 Rust：移动端性能与功耗终极对决",
-                author: "CodeLab",
-                views: "42.7万",
-                danmaku: "6500",
-                duration: "15:40",
-                cover_url: ""
-            },
-            has_right: true
-        },
-        {
-            left: {
-                id: "BV1Abc05",
-                title: "为什么手机 B 站会发热？深入 ijkservice 软硬解死循环与泄漏排查",
-                author: "KernelWatch",
-                views: "36.8万",
-                danmaku: "4820",
-                duration: "20:15",
-                cover_url: ""
-            },
-            right: {
-                id: "BV1Abc06",
-                title: "Linux 内核级防发热：深入 Android 进程调度与温控",
-                author: "KernelDev",
-                views: "15.9万",
-                danmaku: "2310",
-                duration: "15:20",
-                cover_url: ""
-            },
-            has_right: true
-        },
-        {
-            left: {
-                id: "BV1Abc07",
-                title: "【AOSP】Android 14/15 动态壁纸 Monet 取色底层原理",
-                author: "PixelFan",
-                views: "21.3万",
-                danmaku: "1104",
-                duration: "08:45",
-                cover_url: ""
-            },
-            right: {
-                id: "BV1Abc08",
-                title: "极简纯血：0 行 Java、0 个 DEX 的 Android 应用怎么写？",
-                author: "大肥鱼",
-                views: "77.6万",
-                danmaku: "1.5万",
-                duration: "14:50",
-                cover_url: ""
-            },
-            has_right: true
-        }
-    ];
+    in-out property <[VideoRowPair]> rows: [];
+    in-out property <int> feed_state: 0;
+    in-out property <string> feed_error: "";
+    in-out property <bool> has_more: true;
+    in-out property <bool> loading_more: false;
+    in-out property <string> more_error: "";
 
     callback play_video(string);
+    callback video_long_pressed(string);
+    callback refresh_feed();
+    callback load_more();
+    callback open_search();
+    callback open_message();
 
-    // 内部方法：向左切换 Tab
-    function switch_tab_prev() {
-        if (root.current_tab == NavTabType.Follow) {
-            root.current_tab = NavTabType.Recommend;
-        } else if (root.current_tab == NavTabType.Recommend) {
-            root.current_tab = NavTabType.Live;
+    // 0 = 推荐主页, 1 = 视频详情播放页
+    in-out property <int> app_mode: 0;
+    in-out property <VideoDetailData> current_detail;
+    in-out property <[RelatedVideoData]> related_videos: [];
+    in-out property <[CommentItemData]> video_comments: [];
+
+    callback exit_detail_view();
+    callback toggle_like();
+    callback toggle_coin();
+    callback toggle_fav();
+
+    in-out property <int> unread_count: 1;
+
+    // --------------------------------------------------------------------------
+    // 系统返回键
+    //
+    // android-activity 把 Keycode.Back 映射成 Key.Back 交给 Slint
+    // （androidwindowadapter.rs 的 map_key_code）。如果没人 accept，
+    // 它就返回 InputStatus::Unhandled → android-activity 走 fallback → finish 掉
+    // NativeActivity → App 直接退出。
+    //
+    // 所以这里必须有一个能接住它的 FocusScope，并按栈序逐层消费：
+    //   抽屉打开   → 关抽屉
+    //   详情页     → 回首页
+    //   否则       → reject，交还系统（正常退出）
+    //
+    // 注意：FocusScope 不消费指针事件（它只在 focus-on-click 时处理 press），
+    // 所以铺满全屏也不会影响下面任何手势。
+    // --------------------------------------------------------------------------
+    forward-focus: key_handler;
+
+    key_handler := FocusScope {
+        // key-pressed 的返回值是 EventResult：accept / reject。
+        // Slint 里 callback 的返回值是**最后一个表达式**，不能写 `return accept;`，
+        // 所以这里用条件表达式一次性给出结论。
+        key-pressed(event) => {
+            // 抽屉优先：ESC / 返回都先关抽屉
+            if (root.drawer_open && (event.text == Key.Escape || event.text == Key.Back)) {
+                root.drawer_open = false;
+                root.drawer_changed();
+                accept
+            } else if (root.app_mode == 1 && (event.text == Key.Escape || event.text == Key.Back)) {
+                // 详情页：返回首页
+                root.app_mode = 0;
+                root.exit_detail_view();
+                accept
+            } else {
+                // 首页的返回交给系统 —— 与前身一致，返回键退出 App
+                reject
+            }
         }
     }
 
-    // 内部方法：向右切换 Tab
-    function switch_tab_next() {
-        if (root.current_tab == NavTabType.Live) {
-            root.current_tab = NavTabType.Recommend;
-        } else if (root.current_tab == NavTabType.Recommend) {
-            root.current_tab = NavTabType.Follow;
+
+    // --------------------------------------------------------------------------
+    // Tab 切换
+    // --------------------------------------------------------------------------
+    function go_tab_animated(next: int) {
+        if (next < 0 || next > 2) { return; }
+        root.current_tab =
+            (next == 0) ? NavTabType.Live
+            : (next == 1) ? NavTabType.Recommend
+            : NavTabType.Follow;
+        root.animating = true;
+        root.page_base = -(next * page_area.width);
+        root.swipe_dx = 0px;
+        anim_reset.start();
+    }
+
+    anim_reset := Timer {
+        interval: Theme.animation_duration_tab + 40ms;
+        running: false;
+        triggered => {
+            root.animating = false;
+            root.page_base = -(root.tab_index * page_area.width);
+            root.swipe_dx = 0px;
         }
     }
 
     // --------------------------------------------------------------------------
-    // 主界面纵向流
+    // 横滑切频道
+    //
+    // 语义对齐官方：左滑下一个频道，右滑上一个频道。
+    // 已经在最左还右滑 → 40% 阻尼（"墙"），不触发抽屉。
+    // 抽屉唯一入口是左上角头像（见 ADR 4.4：系统手势区抢不走它）。
     // --------------------------------------------------------------------------
-    VerticalLayout {
+    function apply_swipe(dx: length) {
+        let at_left = (root.tab_index == 0 && dx > 0px);
+        let at_right = (root.tab_index == root.page_count - 1 && dx < 0px);
+        root.swipe_dx = (at_left || at_right) ? dx * 0.35 : dx;
+        root.animating = false;
+    }
+
+    function finish_swipe(dx: length, vx: length) {
+        // 位移过半，或甩得够快 → 切页
+        let threshold = page_area.width * 0.26;
+        let effective = dx + vx * 80px;
+
+        if (effective < -threshold && root.tab_index < root.page_count - 1) {
+            root.go_tab_animated(root.tab_index + 1);
+            return;
+        }
+        if (effective > threshold && root.tab_index > 0) {
+            root.go_tab_animated(root.tab_index - 1);
+            return;
+        }
+        // 没到阈值 → 回弹
+        root.animating = true;
+        root.swipe_dx = 0px;
+        anim_reset.start();
+    }
+
+    function cancel_swipe() {
+        root.animating = true;
+        root.swipe_dx = 0px;
+        anim_reset.start();
+    }
+
+    // --------------------------------------------------------------------------
+    // 主内容
+    // --------------------------------------------------------------------------
+    if root.app_mode == 0 : VerticalLayout {
         padding: 0px;
         spacing: 0px;
 
-        // 1. 顶部导航栏 (支持横向手势轻扫切换 Tab)
         TopBar {
+            safe_top: root.safe_top;
             current_tab <=> root.current_tab;
             open_drawer => {
                 root.drawer_open = true;
+                root.drawer_changed();
             }
-        }
-
-        // 顶栏下方的滑动指示感知区 (左右横滑即可顺畅切 Tab)
-        TouchArea {
-            height: 36px;
-            pointer-event(event) => {
-                if (event.kind == PointerEventKind.down) {
-                    root.swipe_start_x = self.mouse-x;
-                } else if (event.kind == PointerEventKind.up) {
-                    if (self.mouse-x - root.swipe_start_x > 45px) {
-                        root.switch_tab_prev(); // 向右滑，切左边的Tab
-                    } else if (root.swipe_start_x - self.mouse-x > 45px) {
-                        root.switch_tab_next(); // 向左滑，切右边的Tab
-                    }
-                }
-            }
-
-            Rectangle {
-                background: Theme.surface;
-                HorizontalLayout {
-                    alignment: center;
-                    Text {
-                        text: "‹ 左右轻扫快速切换频道 ›";
-                        color: Theme.outline;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-        }
-
-        // 2. 页面容器 (带推进动效)
-        Rectangle {
-            clip: true;
-
-            // 推荐流 (默认)
-            if root.current_tab == NavTabType.Recommend : RecommendView {
-                rows: root.sample_rows;
-                video_selected(bvid) => {
-                    root.play_video(bvid);
-                }
-            }
-
-            // 直播流
-            if root.current_tab == NavTabType.Live : LiveView {}
-
-            // 关注动态
-            if root.current_tab == NavTabType.Follow : FollowView {}
-        }
-    }
-
-    // --------------------------------------------------------------------------
-    // 屏幕左边缘手势感应区 (0~24px：从最左侧向右滑即可拉出抽屉)
-    // --------------------------------------------------------------------------
-    if !root.drawer_open : TouchArea {
-        x: 0px;
-        y: 64px;
-        width: 24px;
-        height: parent.height - 64px;
-
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.down) {
-                root.swipe_start_x = self.mouse-x;
-            } else if (event.kind == PointerEventKind.up) {
-                if (self.mouse-x - root.swipe_start_x > 15px) {
-                    root.drawer_open = true; // 边缘轻拉即呼出抽屉
-                }
+            open_search => { root.open_search(); }
+            open_message => { root.open_message(); }
+            unread_count: root.unread_count;
+            tab_changed(t) => {
+                root.go_tab_animated(
+                    (t == NavTabType.Live) ? 0
+                    : (t == NavTabType.Recommend) ? 1 : 2);
             }
         }
     }
 
     // --------------------------------------------------------------------------
-    // 侧滑抽屉面板 (悬浮在主内容上方)
+    // 页面容器：三个频道页横向排列
+    //
+    // 刻意不挂任何手势。横向拖动由卡片冒泡上来，纵向由 Flickable 自理。
+    // 容器只负责裁剪与位移。
+    // --------------------------------------------------------------------------
+    page_area := Rectangle {
+        visible: root.app_mode == 0;
+        y: root.safe_top + Spacing.searchbar_row_height + Spacing.tabbar_row_height;
+        width: root.app_mode == 0 ? 100% : 0%;
+        height: root.app_mode == 0 ? (root.height - self.y - root.safe_bottom) : 0px;
+        background: transparent;
+        clip: true;
+
+        HorizontalLayout {
+            x: root.page_base + root.swipe_dx;
+            animate x {
+                duration: root.animating ? Theme.animation_duration_tab : 0ms;
+                easing: ease-out;
+            }
+
+            LiveView {
+                width: page_area.width;
+                height: page_area.height;
+            }
+
+            recommend_page := RecommendView {
+                width: page_area.width;
+                height: page_area.height;
+                rows: root.rows;
+                feed_state: root.feed_state;
+                feed_error: root.feed_error;
+                has_more: root.has_more;
+                loading_more: root.loading_more;
+                more_error: root.more_error;
+                video_selected(bvid) => { root.play_video(bvid); }
+                video_long_pressed(bvid) => { root.video_long_pressed(bvid); }
+                load_more => { root.load_more(); }
+                swipe_horizontal(dx, dy) => { root.apply_swipe(dx); }
+                swipe_horizontal_finished(dx, vx) => { root.finish_swipe(dx, vx); }
+                swipe_horizontal_cancel => { root.cancel_swipe(); }
+            }
+
+            FollowView {
+                width: page_area.width;
+                height: page_area.height;
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------------
+    // 二级页面
+    // --------------------------------------------------------------------------
+    if root.app_mode == 1 : VideoDetailView {
+        width: 100%;
+        height: 100%;
+        safe_top: root.safe_top;
+        safe_bottom: root.safe_bottom;
+        detail: root.current_detail;
+        related_list: root.related_videos;
+        comments: root.video_comments;
+        back_clicked => {
+            root.app_mode = 0;
+            root.exit_detail_view();
+        }
+        like_clicked => { root.toggle_like(); }
+        coin_clicked => { root.toggle_coin(); }
+        fav_clicked => { root.toggle_fav(); }
+        related_selected(bvid) => { root.play_video(bvid); }
+    }
+
+    // --------------------------------------------------------------------------
+    // 抽屉（置顶）
     // --------------------------------------------------------------------------
     NavigationDrawer {
         is_open <=> root.drawer_open;
+        safe_top: root.safe_top;
         close_drawer => {
             root.drawer_open = false;
+            root.drawer_changed();
         }
     }
 }

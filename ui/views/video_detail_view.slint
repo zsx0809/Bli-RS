@@ -1,0 +1,768 @@
+// ==============================================================================
+// 视频详情与二级播放页面 (Video Detail & Player View)
+//
+// ==============================================================================
+// 交互（重写版，三条铁律）
+// ==============================================================================
+//
+// 1. 点击一律用 GestureArea，不用 TouchArea。
+//
+//    TouchArea 的 `clicked` 不判位移：input_items.rs 的 Released 分支只检查
+//    「pressed == true 且抬起坐标落在自身 geometry 内」，中间滑了多少完全不管。
+//    在相关视频列表上右滑，起点与终点都在同一张卡里 → 被翻译成点击 →
+//    「右滑切换视频」。这是机械原因，不是玄学。
+//
+//    GestureArea（ui/gesture.slint）自己判：位移 < tap_slop 才是 tap，
+//    超过就锁定主轴、此后只发 pan，永不发 tap。
+//
+// 2. 左边缘返回归 App，不归系统。
+//
+//    旧版进入二级页时调 set_exclusion(32, false)，把左边缘 32dp 交还系统。
+//    于是左边缘侧滑 = 系统返回 = finish 掉 NativeActivity = App 直接退出。
+//    这就是「左边侧滑退出 App」。
+//
+//    现在 Rust 侧不再解除排除，边缘区归 EdgeBackArea，
+//    从真正的 x=0 起手，全程跟手，超过阈值才返回。
+//
+// 3. 滚动自管，不叠 Flickable。
+//
+//    本页有两个滚动语义不同的区域（播放器固定 + 内容滚动），
+//    再嵌 Flickable 会让它的 100ms press 延迟和 grab 仲裁叠在一起，
+//    表现就是「按下有反馈延迟」。这里用 scroll_gesture 自己算，
+//    content_layer.y = -scroll_y，跟手即时。
+//
+//    scroll_gesture 声明在内容层**下面**：按在按钮/标题上时，
+//    上层的 GestureArea 先拿到事件；按在纯文字/图片上时落到它 → 滚动。
+// ==============================================================================
+
+import { Theme, Spacing, VideoDetailData, RelatedVideoData, CommentItemData } from "../theme.slint";
+import {
+    IconBack, IconLike, IconDislike, IconCoin, IconStar, IconShare,
+    IconChevronDown, IconChevronUp, IconPlay, IconDanmaku
+} from "../components/icons.slint";
+import { RelatedVideoCard } from "../components/related_card.slint";
+import { GestureArea, PanAxis } from "../gesture.slint";
+
+export component VideoDetailView inherits Rectangle {
+    in property <VideoDetailData> detail;
+    in property <[RelatedVideoData]> related_list;
+    in property <[CommentItemData]> comments: [];
+    in property <length> safe_top: 0px;
+    in property <length> safe_bottom: 0px;
+
+    in-out property <bool> desc_expanded: false;
+    in-out property <int> active_tab: 0;
+    in-out property <bool> is_following: false;
+
+    callback back_clicked();
+    callback like_clicked();
+    callback dislike_clicked();
+    callback coin_clicked();
+    callback fav_clicked();
+    callback share_clicked();
+    callback follow_clicked();
+    callback related_selected(string);
+
+    background: Theme.background;
+
+    // 播放器动态高度：竖屏 48%，横屏 16:9
+    out property <length> player_height: root.detail.is_vertical
+        ? (root.height * 0.48)
+        : (root.width * 9 / 16);
+
+    // ----------------------------------------------------------------------
+    // 滚动状态
+    // ----------------------------------------------------------------------
+    property <length> scroll_y: 0px;
+    property <length> drag_base: 0px;
+    property <length> fling_vel: 0px;
+
+    out property <length> content_h: body.preferred-height;
+    out property <length> viewport_h: root.height - root.player_height;
+    out property <length> max_scroll: Math.max(0px, root.content_h - root.viewport_h);
+
+    fling_timer := Timer {
+        interval: 8ms;
+        running: false;
+        triggered => {
+            if (Math.abs(root.fling_vel) < 0.4px) {
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            let next = root.scroll_y + root.fling_vel;
+            if (next <= 0px) {
+                root.scroll_y = 0px;
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            if (next >= root.max_scroll) {
+                root.scroll_y = root.max_scroll;
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            root.scroll_y = next;
+            root.fling_vel = root.fling_vel * 0.955;
+        }
+    }
+
+    // 边缘返回跟手位移
+    property <length> edge_dx: 0px;
+    property <bool> edge_active: false;
+
+    // ----------------------------------------------------------------------
+    // 顶部播放视口
+    // ----------------------------------------------------------------------
+    player_box := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.player_height;
+        background: #000000;
+        clip: true;
+
+        Image {
+            source: root.detail.cover;
+            width: 100%;
+            height: 100%;
+            image-fit: cover;
+            opacity: root.detail.is_ready ? 0 : 1;
+            animate opacity { duration: 240ms; }
+        }
+
+        if !root.detail.is_ready : Rectangle {
+            width: 116px;
+            height: 32px;
+            background: #00000088;
+            border-radius: 16px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+
+            Text {
+                text: "视频加载中…";
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // 返回键：48px 命中区，视觉 32px 圆
+        back_btn := GestureArea {
+            x: 4px;
+            y: Math.max(4px, root.safe_top + 2px);
+            width: 48px;
+            height: 48px;
+
+            tap(x, y) => { root.back_clicked(); }
+
+            Rectangle {
+                x: 8px;
+                y: 8px;
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                background: back_btn.pressed ? #000000AA : #00000066;
+                animate background { duration: Theme.animation_duration_fast; }
+
+                IconBack {
+                    x: 4px;
+                    y: 4px;
+                    size: 24px;
+                    tint: #ffffff;
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // 内容区
+    // ----------------------------------------------------------------------
+    scroll_clip := Rectangle {
+        x: 0px;
+        y: root.player_height;
+        width: root.width;
+        height: root.height - root.player_height;
+        clip: true;
+        background: Theme.background;
+
+        // 底层滚动手势：只接纵向
+        scroll_gesture := GestureArea {
+            width: 100%;
+            height: 100%;
+            tap_slop: 10px;
+            axis_ratio: 1.15;
+
+            pan_started(axis) => {
+                if (axis == PanAxis.Vertical) {
+                    root.drag_base = root.scroll_y;
+                    fling_timer.stop();
+                }
+            }
+            pan_moved(dx, dy) => {
+                root.scroll_y = Math.max(0px,
+                    Math.min(root.max_scroll, root.drag_base - dy));
+            }
+            pan_finished(dx, dy, vx, vy) => {
+                let v = -vy;
+                if (Math.abs(v) > 1.5px) {
+                    root.fling_vel = v * 2.0;
+                    fling_timer.start();
+                } else {
+                    root.fling_vel = 0px;
+                }
+            }
+        }
+
+        content_layer := Rectangle {
+            width: parent.width;
+            height: Math.max(parent.height, root.content_h);
+            y: -root.scroll_y;
+
+            body := VerticalLayout {
+                width: parent.width;
+                padding: 0px;
+                spacing: 0px;
+                alignment: start;
+
+                // ================= Sub-Tab 栏 =================
+                Rectangle {
+                    height: 44px;
+                    width: 100%;
+                    border-width: 1px;
+                    border-color: Theme.outline_variant.transparentize(60%);
+
+                    HorizontalLayout {
+                        padding-left: Spacing.page_margin;
+                        padding-right: Spacing.page_margin;
+                        alignment: space-between;
+
+                        HorizontalLayout {
+                            spacing: 0px;
+                            alignment: start;
+
+                            intro_tab := GestureArea {
+                                width: 56px;
+                                height: 44px;
+                                tap(x, y) => { root.active_tab = 0; }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 4px;
+
+                                    Text {
+                                        text: "简介";
+                                        font-size: 14px;
+                                        font-weight: root.active_tab == 0 ? 700 : 500;
+                                        color: root.active_tab == 0 ? Theme.primary : Theme.on_surface_variant;
+                                        horizontal-alignment: center;
+                                    }
+
+                                    Rectangle {
+                                        width: 20px;
+                                        height: 2px;
+                                        background: root.active_tab == 0 ? Theme.primary : transparent;
+                                        border-radius: 1px;
+                                    }
+                                }
+                            }
+
+                            comment_tab := GestureArea {
+                                width: 76px;
+                                height: 44px;
+                                tap(x, y) => { root.active_tab = 1; }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 4px;
+
+                                    Text {
+                                        text: root.comments.length > 0
+                                            ? "评论 " + root.comments.length
+                                            : "评论";
+                                        font-size: 14px;
+                                        font-weight: root.active_tab == 1 ? 700 : 500;
+                                        color: root.active_tab == 1 ? Theme.primary : Theme.on_surface_variant;
+                                        horizontal-alignment: center;
+                                    }
+
+                                    Rectangle {
+                                        width: 20px;
+                                        height: 2px;
+                                        background: root.active_tab == 1 ? Theme.primary : transparent;
+                                        border-radius: 1px;
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 110px;
+                            height: 28px;
+                            border-radius: 14px;
+                            background: Theme.surface_variant;
+                            y: 8px;
+
+                            Text {
+                                text: "点我发弹幕";
+                                color: Theme.on_surface_variant;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // ================= 简介 Tab =================
+                if root.active_tab == 0 : VerticalLayout {
+                    spacing: 0px;
+
+                    // ---- UP 主 ----
+                    Rectangle {
+                        height: 56px;
+                        width: 100%;
+
+                        HorizontalLayout {
+                            padding-left: Spacing.page_margin;
+                            padding-right: Spacing.page_margin;
+                            alignment: space-between;
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+
+                                Rectangle {
+                                    width: 40px;
+                                    height: 40px;
+                                    border-radius: 20px;
+                                    background: Theme.surface_variant;
+                                    clip: true;
+                                    y: 8px;
+
+                                    Image {
+                                        source: root.detail.author_face;
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: cover;
+                                    }
+
+                                    if root.detail.author_face.width == 0 : Text {
+                                        text: "UP";
+                                        color: Theme.outline;
+                                        font-size: 12px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+
+                                    Text {
+                                        text: root.detail.author;
+                                        color: Theme.on_surface;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                    }
+
+                                    Text {
+                                        text: "UP主 · 优质创作者";
+                                        color: Theme.on_surface_variant;
+                                        font-size: 10px;
+                                    }
+                                }
+                            }
+
+                            follow_btn := GestureArea {
+                                width: root.is_following ? 64px : 72px;
+                                height: 30px;
+                                y: 13px;
+
+                                tap(x, y) => {
+                                    root.is_following = !root.is_following;
+                                    root.follow_clicked();
+                                }
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    border-radius: 15px;
+                                    background: root.is_following ? Theme.surface_variant : Theme.bili_pink;
+
+                                    Text {
+                                        text: root.is_following ? "已关注" : "+ 关注";
+                                        color: root.is_following ? Theme.on_surface_variant : #ffffff;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- 标题折叠 ----
+                    VerticalLayout {
+                        padding-left: Spacing.page_margin;
+                        padding-right: Spacing.page_margin;
+                        padding-top: 6px;
+                        padding-bottom: 8px;
+                        spacing: 6px;
+
+                        title_hit := GestureArea {
+                            width: 100%;
+                            height: title_row.preferred-height;
+
+                            tap(x, y) => { root.desc_expanded = !root.desc_expanded; }
+
+                            title_row := HorizontalLayout {
+                                alignment: space-between;
+
+                                Text {
+                                    text: root.detail.title;
+                                    color: Theme.on_surface;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    wrap: word-wrap;
+                                    max-lines: root.desc_expanded ? 10 : 1;
+                                    overflow: elide;
+                                    width: root.width - 56px;
+                                }
+
+                                VerticalLayout {
+                                    alignment: start;
+                                    y: 2px;
+
+                                    if !root.desc_expanded : IconChevronDown {
+                                        size: 20px;
+                                        tint: Theme.on_surface_variant;
+                                    }
+                                    if root.desc_expanded : IconChevronUp {
+                                        size: 20px;
+                                        tint: Theme.on_surface_variant;
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            alignment: start;
+
+                            HorizontalLayout {
+                                spacing: 3px;
+                                IconPlay { size: 10px; tint: Theme.on_surface_variant; y: 2px; }
+                                Text { text: root.detail.views; color: Theme.on_surface_variant; font-size: 11px; }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 3px;
+                                IconDanmaku { size: 10px; tint: Theme.on_surface_variant; y: 2px; }
+                                Text { text: root.detail.danmaku; color: Theme.on_surface_variant; font-size: 11px; }
+                            }
+
+                            Text {
+                                text: root.detail.pubdate;
+                                color: Theme.on_surface_variant;
+                                font-size: 11px;
+                            }
+                        }
+
+                        if root.desc_expanded : Text {
+                            text: root.detail.desc != "" ? root.detail.desc : "暂无简介";
+                            color: Theme.on_surface_variant;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    // ---- 五联条 ----
+                    Rectangle {
+                        height: 60px;
+                        width: 100%;
+
+                        HorizontalLayout {
+                            padding-left: Spacing.page_margin;
+                            padding-right: Spacing.page_margin;
+                            alignment: space-around;
+
+                            like_btn := GestureArea {
+                                width: 56px;
+                                height: 60px;
+                                tap(x, y) => { root.like_clicked(); }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+
+                                    IconLike {
+                                        size: 22px;
+                                        tint: root.detail.is_liked ? Theme.bili_pink : Theme.on_surface_variant;
+                                        fill_mode: root.detail.is_liked;
+                                    }
+                                    Text {
+                                        text: root.detail.likes;
+                                        color: root.detail.is_liked ? Theme.bili_pink : Theme.on_surface_variant;
+                                        font-size: 10px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+
+                            dislike_btn := GestureArea {
+                                width: 56px;
+                                height: 60px;
+                                tap(x, y) => { root.dislike_clicked(); }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+
+                                    IconDislike { size: 22px; tint: Theme.on_surface_variant; }
+                                    Text {
+                                        text: "不喜欢";
+                                        color: Theme.on_surface_variant;
+                                        font-size: 10px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+
+                            coin_btn := GestureArea {
+                                width: 56px;
+                                height: 60px;
+                                tap(x, y) => { root.coin_clicked(); }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+
+                                    IconCoin {
+                                        size: 22px;
+                                        tint: root.detail.is_coined ? Theme.bili_coin : Theme.on_surface_variant;
+                                        fill_mode: root.detail.is_coined;
+                                    }
+                                    Text {
+                                        text: root.detail.coins;
+                                        color: root.detail.is_coined ? Theme.bili_coin : Theme.on_surface_variant;
+                                        font-size: 10px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+
+                            fav_btn := GestureArea {
+                                width: 56px;
+                                height: 60px;
+                                tap(x, y) => { root.fav_clicked(); }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+
+                                    IconStar {
+                                        size: 22px;
+                                        tint: root.detail.is_favorited ? Theme.bili_fav : Theme.on_surface_variant;
+                                        fill_mode: root.detail.is_favorited;
+                                    }
+                                    Text {
+                                        text: root.detail.favorites;
+                                        color: root.detail.is_favorited ? Theme.bili_fav : Theme.on_surface_variant;
+                                        font-size: 10px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+
+                            share_btn := GestureArea {
+                                width: 56px;
+                                height: 60px;
+                                tap(x, y) => { root.share_clicked(); }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+
+                                    IconShare { size: 22px; tint: Theme.on_surface_variant; }
+                                    Text {
+                                        text: root.detail.shares;
+                                        color: Theme.on_surface_variant;
+                                        font-size: 10px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 100%;
+                        height: 1px;
+                        background: Theme.outline_variant.transparentize(70%);
+                    }
+
+                    // ---- 相关推荐 ----
+                    VerticalLayout {
+                        padding-top: 8px;
+                        padding-bottom: 40px;
+                        spacing: 4px;
+
+                        for item in root.related_list : RelatedVideoCard {
+                            data: item;
+                            clicked => { root.related_selected(item.bvid); }
+                            pan_started(axis) => {
+                                if (axis == PanAxis.Vertical) {
+                                    root.drag_base = root.scroll_y;
+                                    fling_timer.stop();
+                                }
+                            }
+                            pan_moved(dx, dy) => {
+                                root.scroll_y = Math.max(0px,
+                                    Math.min(root.max_scroll, root.drag_base - dy));
+                            }
+                            pan_finished(dx, dy, vx, vy) => {
+                                let v = -vy;
+                                if (Math.abs(v) > 1.5px) {
+                                    root.fling_vel = v * 2.0;
+                                    fling_timer.start();
+                                } else {
+                                    root.fling_vel = 0px;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ================= 评论 Tab =================
+                if root.active_tab == 1 : VerticalLayout {
+                    padding-left: Spacing.page_margin;
+                    padding-right: Spacing.page_margin;
+                    padding-top: 12px;
+                    padding-bottom: 40px;
+                    spacing: 16px;
+
+                    if root.comments.length == 0 : Rectangle {
+                        height: 120px;
+
+                        Text {
+                            text: "评论加载中…";
+                            color: Theme.on_surface_variant;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    for comment in root.comments : HorizontalLayout {
+                        spacing: 12px;
+                        alignment: start;
+
+                        Rectangle {
+                            width: 36px;
+                            height: 36px;
+                            border-radius: 18px;
+                            background: Theme.surface_variant;
+                            clip: true;
+
+                            Image {
+                                source: comment.user_face;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: cover;
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 4px;
+
+                            Text {
+                                text: comment.user_name;
+                                color: Theme.on_surface_variant;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+
+                            Text {
+                                text: comment.content;
+                                color: Theme.on_surface;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 16px;
+                                alignment: start;
+
+                                Text {
+                                    text: comment.pubtime;
+                                    color: Theme.outline;
+                                    font-size: 10px;
+                                }
+                                Text {
+                                    text: "赞 " + comment.likes;
+                                    color: Theme.outline;
+                                    font-size: 10px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // 左边缘返回（最上层，从真正的 x=0 起手）
+    //
+    // 起点在 y = safe_top 之下 —— 让开顶部那一行返回按钮，
+    // 否则两者在左上角 48x48 的范围里重叠，谁在上面谁通吃。
+    // 官方客户端也是这样：返回按钮与边缘手势分居上下，不抢同一块。
+    //
+    // vertical_enabled = false：竖向起手被判成"放弃"，不发 pan、不发 tap，
+    // 所以从边缘起手的竖向滚动在 48px 带内无效 —— 与官方边缘返回区一致。
+    // ----------------------------------------------------------------------
+    edge_back := GestureArea {
+        x: 0px;
+        y: root.safe_top + 56px;
+        width: 48px;
+        height: Math.max(0px, root.height - root.safe_top - 56px);
+
+        tap_slop: 10px;
+        axis_ratio: 1.0;
+        vertical_enabled: false;
+
+        tap(x, y) => { }
+
+        pan_started(axis) => {
+            root.edge_active = true;
+            root.edge_dx = 0px;
+        }
+        pan_moved(dx, dy) => {
+            if (dx > 0px) { root.edge_dx = dx; }
+        }
+        pan_finished(dx, dy, vx, vy) => {
+            root.edge_active = false;
+            root.edge_dx = 0px;
+            if (dx > 32px) { root.back_clicked(); }
+        }
+    }
+
+    // 跟手提示
+    if root.edge_active && root.edge_dx > 0px : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: Math.min(root.edge_dx * 0.4, 24px);
+        height: root.height;
+        background: Theme.primary.transparentize(72%);
+    }
+}

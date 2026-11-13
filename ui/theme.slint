@@ -1,5 +1,9 @@
 // ==============================================================================
 // BLI-RS 主题设计规范 (Material You / Monet 动态主题引擎)
+//
+// 度量约定：
+// 1. 所有尺寸以 px 表达，在 Slint 中 1px == 1 逻辑像素 == 1dp。
+// 2. 网格间距统一走 Spacing 命名空间，禁止在组件内出现魔法数字。
 // ==============================================================================
 
 /// 导航栏当前选中的 Tab 页面类型
@@ -16,7 +20,8 @@ export struct VideoItemData {
     author: string,     // UP主昵称
     views: string,      // 格式化播放量 (例如: "128.4万")
     duration: string,   // 视频时长 (例如: "18:24")
-    cover_url: string,  // 封面图地址
+    cover_url: string,  // 封面图地址（原始 URL，仅调试用）
+    cover: image,       // 已解码的封面位图（Rust 侧下载并解码后填入）
     danmaku: string,    // 弹幕总数 (例如: "3.2万")
 }
 
@@ -27,11 +32,94 @@ export struct VideoRowPair {
     has_right: bool,
 }
 
+/// 视频详情页面核心数据
+export struct VideoDetailData {
+    bvid: string,
+    title: string,
+    desc: string,
+    author: string,
+    author_face: image,
+    cover: image,
+    is_ready: bool,
+    views: string,
+    danmaku: string,
+    likes: string,
+    coins: string,
+    favorites: string,
+    shares: string,
+    pubdate: string,
+    is_vertical: bool,
+    is_liked: bool,
+    is_coined: bool,
+    is_favorited: bool,
+}
+
+/// 相关推荐单列横向卡片数据
+export struct RelatedVideoData {
+    bvid: string,
+    title: string,
+    author: string,
+    views: string,
+    danmaku: string,
+    duration: string,
+    cover: image,
+    cover_url: string,
+}
+
+/// 评论区单条评论数据
+export struct CommentItemData {
+    user_name: string,
+    user_face: image,
+    content: string,
+    likes: string,
+    pubtime: string,
+}
+
+/// 全局布局度量 (Layout Metrics)
+export global Spacing {
+    // 页面边距与网格间距 —— 二者同值，保证左右边距与列间距视觉一致
+    out property <length> page_margin: 12px;
+    out property <length> grid_gap: 12px;
+
+    // 顶栏
+    out property <length> searchbar_row_height: 52px;
+    out property <length> tabbar_row_height: 46px;
+    out property <length> searchbar_height: 36px;
+
+    // 卡片内部
+    out property <length> card_padding: 8px;
+    out property <length> card_text_gap: 6px;
+
+    // 抽屉
+    out property <length> drawer_width: 300px;
+    out property <length> drawer_item_height: 48px;
+    out property <length> drawer_icon_size: 20px;
+    out property <length> drawer_icon_gap: 16px;
+
+    // 手势
+    out property <length> edge_swipe_width: 28px;   // 左边缘呼出抽屉的死区宽度
+    out property <length> tab_swipe_threshold: 56px;
+}
+
 /// 全局动态调色板单例
+///
+/// 两套完整色板：亮色 / 暗色。
+/// 默认值取暗色（OLED 纯黑），实际运行时由 Rust 侧按系统 uiMode 灌入对应套，
+/// 若设备支持 Monet（API 31+）再用壁纸派生色覆盖 primary/secondary 槽位。
+///
+/// 分层语义（Material 3 的 surface 层级）：
+///   background          页面最底层，视频流就铺在这上面
+///   surface             卡片本体
+///   surface_container   顶栏 + 抽屉 —— 两者共用同一色，视觉上是一层
+///   search_bg           搜索栏凹槽内部，与 surface_container 形成内外反差
+///   surface_variant     封面占位、次级容器
 export global Theme {
+    // 明暗标志：UI 侧据此决定状态栏图标亮度等细节
+    in-out property <bool> dark: true;
+
     // 主色 (Primary)
     in-out property <color> primary: #ffb1c8;
-    in-out property <color> on_primary: #5e1133;
+    in-out property <color> on_primary: #4a1030;
     in-out property <color> primary_container: #7b2949;
     in-out property <color> on_primary_container: #ffd9e2;
 
@@ -41,27 +129,40 @@ export global Theme {
     in-out property <color> secondary_container: #5c3f47;
     in-out property <color> on_secondary_container: #ffd9e2;
 
-    // 背景与表面层 (Surface & Background)
-    in-out property <color> background: #121011;           // 更加深邃纯净的 OLED 黑灰
-    in-out property <color> surface: #1c1819;              // 双列卡片底色
-    in-out property <color> surface_variant: #2d2628;      // 封面占位与副容器色
-    in-out property <color> surface_container_high: #262022; // 抽屉侧边栏浮动色
+    // 哔哩互动特征色
+    in-out property <color> bili_pink: #fb7299;
+    in-out property <color> bili_coin: #f29c38;
+    in-out property <color> bili_fav: #f4c430;
 
+    // ----------------------------------------------------------------------
+    // 背景与表面层
+    // ----------------------------------------------------------------------
+    in-out property <color> background: #000000;             // 页面底：暗色纯黑 / 亮色纯白
+    in-out property <color> surface: #0f0d12;                // 卡片本体
+    in-out property <color> surface_container: #1b1722;      // 顶栏 + 抽屉（同一层）
+    in-out property <color> surface_container_high: #24202d; // 抽屉内的浮起卡片
+    in-out property <color> surface_variant: #2a2535;        // 封面占位、次级容器
+    in-out property <color> search_bg: #262231;              // 搜索栏凹槽内部
+
+    // ----------------------------------------------------------------------
     // 文本与图标层
-    in-out property <color> on_surface: #ece0e2;          // 主标题纯白色
-    in-out property <color> on_surface_variant: #bfaeb2;  // UP主等副信息灰白色
-    in-out property <color> outline: #8c7b7f;             // 弱化边框
+    // ----------------------------------------------------------------------
+    in-out property <color> on_surface: #f2ecf4;         // 主标题
+    in-out property <color> on_surface_variant: #b5abc0; // UP 主、副信息
+    in-out property <color> outline: #4a4356;            // 卡片描边、tab 胶囊轮廓
+    in-out property <color> outline_variant: #2e2938;    // 分割线
 
     // 特殊状态色
-    in-out property <color> scrim: #00000099;             // 抽屉遮罩半透明色
+    in-out property <color> scrim: #00000099;            // 抽屉遮罩
 
     // 形状与圆角规范
-    in-out property <length> radius_sm: 8px;   // 小圆角 (时长角标)
-    in-out property <length> radius_md: 14px;  // 中圆角 (双列视频卡片 M3 规范圆角)
-    in-out property <length> radius_lg: 22px;  // 大圆角 (抽屉面板)
+    in-out property <length> radius_sm: 8px;
+    in-out property <length> radius_md: 14px;
+    in-out property <length> radius_lg: 22px;
     in-out property <length> radius_full: 9999px;
 
     // 动画曲线
     in-out property <duration> animation_duration_normal: 260ms;
     in-out property <duration> animation_duration_fast: 140ms;
+    in-out property <duration> animation_duration_tab: 220ms;
 }

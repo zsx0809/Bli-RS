@@ -30,16 +30,28 @@ $AAPT2 link -I "$ANDROID_JAR" \
     "$BUILD_DIR/compiled/resources.zip"
 
 echo "==> [3/5] 注入纯血 Rust 与 C++ 运行时 aarch64 动态库 (0 压缩直通)..."
-SO_PATH="$PROJECT_ROOT/target/release/libbli_rs.so"
-LIBCXX_SO="/data/data/com.termux/files/usr/lib/libc++_shared.so"
+# 优先取 chroot 交叉编译产物 (target/aarch64-linux-android/)，
+# 回退到 Termux 原生构建产物 (target/release/)。
+SO_PATH="$PROJECT_ROOT/target/aarch64-linux-android/release/libbli_rs.so"
+if [ ! -f "$SO_PATH" ]; then
+    SO_PATH="$PROJECT_ROOT/target/release/libbli_rs.so"
+fi
 if [ ! -f "$SO_PATH" ]; then
     SO_PATH="$PROJECT_ROOT/target/debug/libbli_rs.so"
 fi
+LIBCXX_SO="/data/data/com.termux/files/usr/lib/libc++_shared.so"
 
 if [ ! -f "$SO_PATH" ]; then
     echo "[-] 错误: 未找到编译产物 libbli_rs.so，请先运行 cargo build --lib"
     exit 1
 fi
+
+# 确保 DT_NEEDED 里有 libc++_shared.so（Slint 的 Skia/字体链路需要）
+if ! patchelf --print-needed "$SO_PATH" | grep -q '^libc++_shared\.so$'; then
+    echo "    patchelf: 补入 libc++_shared.so 依赖"
+    patchelf --add-needed libc++_shared.so "$SO_PATH"
+fi
+echo "    使用产物: ${SO_PATH#$PROJECT_ROOT/}"
 
 python3 -c "
 import zipfile

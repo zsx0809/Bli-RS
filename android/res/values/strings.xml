@@ -1,4 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Bli-RS</string>
+
+    <!--
+      应用主题：让状态栏正常显示，同时内容延伸到状态栏下方。
+
+      windowTranslucentStatus + windowLightStatusBar:
+        - statusBarColor 全透明，视觉上内容与状态栏连成一片；
+        - windowLightStatusBar=false → 状态栏图标为浅色（时间/信号/电量为白），
+          深色背景上清晰可读。
+
+      android:windowLayoutInDisplayCutoutMode=shortEdges:
+        允许内容进入刘海/挖孔区，配合 safe-area-insets 处理，不会遮挡信息。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.NoTitleBar">
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
 </resources>

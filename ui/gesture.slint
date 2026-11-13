@@ -1,0 +1,201 @@
+// ==============================================================================
+// 手势原语 (Gesture Primitives)
+//
+// 为什么要有这一层 —— 这是整套交互的地基，别绕过它直接用 TouchArea.clicked。
+//
+// Slint 内建 TouchArea 的 `clicked` **不判断位移**：
+//   input_items.rs 的 `MouseEvent::Released` 分支只做两件事 ——
+//   `pressed == true` 且 release 坐标落在自身 geometry 内，就回调 clicked。
+//   从按下到抬起中间滑了多少像素，它完全不看。
+//
+//   在列表上侧滑时，手指的起点和终点通常落在同一张卡片里，
+//   于是"一次侧滑"被翻译成"一次点击"，表现为侧滑直接打开了一个视频。
+//   这就是二级页面右滑会切视频的机械原因。
+//
+// TouchArea 的 `pointer-event` 拿的是原始 down / move / up，不受上面那套判定污染。
+// 所以这里把判定权收回来，规则只有三条：
+//
+//   1. 位移全程 < tap_slop            → tap
+//   2. 位移 >= tap_slop               → 锁定主轴，此后只发 pan_*，永不发 tap
+//   3. 长按计时到点且尚未锁定主轴      → long_press
+//
+// 锁定是**单次手势内不可逆**的：一旦判定成拖动，这次手势就再也不会变成点击。
+// 反过来，一旦判定方向，纵向与横向也不会互相翻转。
+//
+// 速度跟踪：
+//   用相邻两次 move 的位移做指数平滑（0.4 / 0.6）。
+//   直接取最后一帧的瞬时值会抖 —— 触摸事件的 move 间隔并不均匀，
+//   有时一帧只有一个 move，有时一帧连着来四个，
+//   抬手时可能刚好取到一个接近 0 的样本，表现为"明明甩得很快，松手却不动"。
+// ==============================================================================
+
+/// 手势锁定后的主轴方向
+export enum PanAxis {
+    None,
+    Horizontal,
+    Vertical,
+}
+
+export component GestureArea inherits TouchArea {
+    // ----------------------------------------------------------------------
+    // 参数
+    // ----------------------------------------------------------------------
+
+    /// 小于它算点击，大于等于它算拖动。8px 是 Android 的 touch slop 量级。
+    in property <length> tap_slop: 8px;
+
+    /// 主轴判定比例：横向位移必须大于纵向的这么多倍才算横滑。
+    /// 偏保守（>1）：宁可判成纵向，因为纵向滚动的使用频率远高于横滑。
+    in property <real> axis_ratio: 1.25;
+
+    /// 是否启用长按（阈值固定 500ms —— Timer.interval 不接受非常量绑定）
+    in property <bool> long_enabled: false;
+
+    /// 是否接横向拖动
+    in property <bool> horizontal_enabled: true;
+    /// 是否接纵向拖动
+    in property <bool> vertical_enabled: true;
+
+    // ----------------------------------------------------------------------
+    // 输出：给父组件判定用的起点与方向
+    // ----------------------------------------------------------------------
+
+    /// 本次手势按下的坐标（相对本组件左上角）
+    out property <length> start_x: 0px;
+    out property <length> start_y: 0px;
+    /// 本次手势锁定后的主轴
+    out property <PanAxis> axis: PanAxis.None;
+    /// 用户在这次手势里是否已经拖动过（父组件据此取消按压反馈）
+    out property <bool> dragging: false;
+
+    // ----------------------------------------------------------------------
+    // 回调
+    // ----------------------------------------------------------------------
+
+    /// 起点坐标。父组件拿去做命中测试。
+    callback tap(length, length);
+    /// 长按：起点坐标
+    callback long_press(length, length);
+
+    /// 主轴刚被锁定的瞬间（父组件在这里记录拖动基准）
+    callback pan_started(PanAxis);
+    /// 拖动中：累计位移（相对起点，不是增量）
+    callback pan_moved(length, length);
+    /// 抬手：累计位移 + 抬手瞬间速度（px / move 事件，已平滑）
+    callback pan_finished(length, length, length, length);
+
+    // ----------------------------------------------------------------------
+    // 内部状态
+    // ----------------------------------------------------------------------
+
+    property <length> last_x: 0px;
+    property <length> last_y: 0px;
+    property <bool> is_down: false;
+    property <bool> locked: false;
+    property <bool> long_fired: false;
+    property <length> vel_x: 0px;
+    property <length> vel_y: 0px;
+
+    long_timer := Timer {
+        // Timer 的 interval 必须是常量：不能绑到 root.long_press_delay。
+        // 用固定的 500ms，是否启用由 long_press_delay 布尔化控制。
+        interval: 500ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            // 已经拖动过就不再算长按
+            if (root.is_down && !root.locked && root.long_enabled) {
+                root.long_fired = true;
+                root.long_press(root.start_x, root.start_y);
+            }
+        }
+    }
+
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down) {
+            root.start_x = self.mouse-x;
+            root.start_y = self.mouse-y;
+            root.last_x = self.mouse-x;
+            root.last_y = self.mouse-y;
+            root.is_down = true;
+            root.locked = false;
+            root.long_fired = false;
+            root.dragging = false;
+            root.axis = PanAxis.None;
+            root.vel_x = 0px;
+            root.vel_y = 0px;
+
+            if (root.long_enabled) {
+                long_timer.start();
+            }
+        } else if (event.kind == PointerEventKind.move) {
+            if (!root.is_down) { return; }
+
+            let dx = self.mouse-x - root.start_x;
+            let dy = self.mouse-y - root.start_y;
+
+            if (!root.locked) {
+                let ax = Math.abs(dx);
+                let ay = Math.abs(dy);
+                if (ax < root.tap_slop && ay < root.tap_slop) { return; }
+
+                // ---- 锁定主轴 ----
+                root.locked = true;
+                root.dragging = true;
+                long_timer.stop();
+
+                let horizontal = root.horizontal_enabled
+                    && (!root.vertical_enabled
+                        || (ay / 1px) * root.axis_ratio < (ax / 1px));
+
+                if (!horizontal && !root.vertical_enabled) {
+                    // 只接横向，但用户明显在纵向拖 —— 放弃这次手势
+                    root.is_down = false;
+                    root.axis = PanAxis.None;
+                    return;
+                }
+
+                root.axis = horizontal ? PanAxis.Horizontal : PanAxis.Vertical;
+                root.pan_started(root.axis);
+            }
+
+            // ---- 速度：指数平滑 ----
+            let mvx = self.mouse-x - root.last_x;
+            let mvy = self.mouse-y - root.last_y;
+            root.vel_x = root.vel_x * 0.4 + mvx * 0.6;
+            root.vel_y = root.vel_y * 0.4 + mvy * 0.6;
+            root.last_x = self.mouse-x;
+            root.last_y = self.mouse-y;
+
+            root.pan_moved(dx, dy);
+        } else if (event.kind == PointerEventKind.up) {
+            long_timer.stop();
+            if (!root.is_down) { return; }
+            root.is_down = false;
+
+            if (!root.locked) {
+                if (!root.long_fired) {
+                    root.tap(root.start_x, root.start_y);
+                }
+            } else {
+                root.pan_finished(
+                    self.mouse-x - root.start_x,
+                    self.mouse-y - root.start_y,
+                    root.vel_x,
+                    root.vel_y,
+                );
+            }
+
+            root.locked = false;
+            root.dragging = false;
+            root.axis = PanAxis.None;
+        } else if (event.kind == PointerEventKind.cancel) {
+            // 被别的层抢走 grab，或系统打断。什么都不发，只复位。
+            long_timer.stop();
+            root.is_down = false;
+            root.locked = false;
+            root.dragging = false;
+            root.axis = PanAxis.None;
+        }
+    }
+}

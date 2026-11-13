@@ -1,4 +1,5 @@
 [workspace]
+members = ["crates/bli-protocol"]
 
 [package]
 name = "bli-rs"
@@ -18,8 +19,28 @@ path = "src/main.rs"
 
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["std", "compat-1-2", "backend-android-activity-06", "renderer-femtovg"] }
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time", "sync"] }
 log = "0.4"
+
+# 协议层独立成 crate：它不依赖 UI，可以单独跑 probe 验证接口
+bli-protocol = { path = "crates/bli-protocol" }
+
+# 封面图解码：只启用 png/jpeg/webp 三种 B 站实际会返回的格式
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# 封面下载直接用 reqwest（协议层的 client 不对外暴露底层 http 句柄）
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls", "gzip", "brotli", "http2",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# MediaCodec / MediaExtractor / AAudio 的官方 NDK 绑定。
+# Slint 自己也依赖 ndk 0.8，但 0.9 才有 media_codec 模块。
+ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
+# 需要 ndk_sys 的 ANativeWindow 原始类型来做指针转换
+ndk-sys = "0.6"
 
 [build-dependencies]
 slint-build = "1.9"

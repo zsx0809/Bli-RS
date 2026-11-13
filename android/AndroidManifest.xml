@@ -9,10 +9,23 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!--
+      主题选择说明：
+      之前用的是 @android:style/Theme.NoTitleBar.Fullscreen。
+      Fullscreen 会让窗口铺满整屏、状态栏被内容覆盖，表现为时间/信号/电量全黑。
+      同时 Slint 的 android 后端在 fullscreen 为 true 时会直接返回空的安全区
+      （androidwindowadapter.rs:168 safe_area_inset），导致 safe-area-insets.top 恒为 0，
+      顶栏于是顶到状态栏底下。
+
+      改为 NoTitleBar + windowDrawsSystemBarBackgrounds + 透明状态栏：
+        - 状态栏由系统正常绘制，图标可见；
+        - 内容仍延伸到状态栏下方（edge-to-edge），由 safe-area-insets 让出空间；
+        - windowLightStatusBar=false 让状态栏图标为浅色，适配深色背景。
+    -->
     <application
         android:label="@string/app_name"
         android:hasCode="false"
-        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        android:theme="@style/AppTheme">
 
         <activity
             android:name="android.app.NativeActivity"

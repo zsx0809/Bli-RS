@@ -1,51 +1,335 @@
 // ==============================================================================
-// 推荐流视图 (Recommend View - 经典双列瀑布流)
+// 推荐流视图 (Recommend View) —— 两列等宽网格
 //
-// 设计定位：
-// 1. 每行容纳两个自适应宽度的视频卡片（由 HorizontalLayout 自动等分）。
-// 2. 纵向无缝平滑滚动。
+// ==============================================================================
+// 交互结构（这是唯一正确的形状，别再改回覆盖层或 Flickable）
+// ==============================================================================
+//
+// 失败的两种旧结构，各自的死因：
+//
+//   【全屏覆盖层】
+//     在页面区盖一个 TouchArea 吃掉所有 press，再用 tap_at(x,y) 反推命中哪张卡。
+//     → 卡片内任何按钮都收不到 down，评论点赞、更多菜单永远点不动。
+//     → 反推公式假设坐标即内容坐标，滚动过之后命中必然错位。
+//     → 按压反馈与手势状态是两套，手工同步必然错位。
+//
+//   【Flickable】
+//     Flickable 在按下时 DelayForwarding(100ms) 才把 press 交给子元素，
+//     超过 8px 且方向可滚才改判拖动。纵向滚动很完美，但：
+//     → 100ms 窗口内的快速横滑，卡片根本收不到 down，切频道失灵。
+//     → 内容里的按钮按下反馈延迟 100ms，手感发粘。
+//
+// ==============================================================================
+// 现在的结构：分层判定 + pan 冒泡
+// ==============================================================================
+//
+//   RecommendView
+//     ├─ bg_gesture  := GestureArea（先声明 = 下层，兜住卡片之外的空隙）
+//     └─ content_layer（后声明 = 上层）
+//          └─ body
+//               └─ VideoCard × N（每张自带 GestureArea）
+//
+//   谁被按下谁判定，判定结果走同一条路：
+//     tap  → 打开视频
+//     pan  → 本组件分派：
+//              Vertical   → 自己滚 + 惯性
+//              Horizontal → swipe_horizontal 冒泡给 AppWindow 切频道
+//
+//   事件在哪一层开始，就在那一层结束，没有跨层抢 grab，没有 100ms 延迟。
+//
+// 滚动：
+//   content_layer 的 y 由 scroll_y 驱动。拖动中 duration 0ms（严格跟手），
+//   抬手后惯性由 8ms Timer 逐帧推进 —— 8ms < 90Hz 的 11.1ms，
+//   每帧最多一个新位置，不会出现"两帧同一张图"的顿感。
 // ==============================================================================
 
-import { Theme, VideoRowPair } from "../theme.slint";
+import { Theme, Spacing, VideoRowPair } from "../theme.slint";
 import { VideoCard } from "../components/video_card.slint";
-import { ScrollView } from "std-widgets.slint";
+import { GestureArea, PanAxis } from "../gesture.slint";
 
 export component RecommendView inherits Rectangle {
     in property <[VideoRowPair]> rows;
+    // 0=空闲 1=加载中 2=已加载 3=错误
+    in property <int> feed_state: 0;
+    in property <string> feed_error: "";
+
+    in property <bool> has_more: true;
+    in property <bool> loading_more: false;
+    in property <string> more_error: "";
+    in property <string> debug_text: "";
+
     callback video_selected(string);
+    callback video_long_pressed(string);
+    callback load_more();
 
-    background: Colors.transparent;
+    /// 横向拖动交给外层切频道
+    callback swipe_horizontal(length, length);
+    callback swipe_horizontal_finished(length, length);
+    callback swipe_horizontal_cancel();
 
-    ScrollView {
-        VerticalLayout {
-            padding-left: 10px;
-            padding-right: 10px;
-            padding-top: 10px;
-            padding-bottom: 24px;
-            spacing: 10px;
+    // ----------------------------------------------------------------------
+    // 滚动状态
+    // ----------------------------------------------------------------------
+    in-out property <length> scroll_y: 0px;
+    property <length> drag_base: 0px;
+    property <length> fling_vel: 0px;
+    property <bool> scroll_animating: false;
+    property <PanAxis> active_axis: PanAxis.None;
 
-            for pair in root.rows: HorizontalLayout {
-                spacing: 10px;
+    out property <length> content_h: body.preferred-height + Spacing.page_margin + 32px;
+    out property <length> max_scroll: Math.max(0px, root.content_h - root.height);
 
-                // 左侧卡片 (平分 50% 宽度)
+    // 可见行范围（封面懒加载探针，由 Rust 侧轮询）
+    out property <int> first_visible_row:
+        Math.max(0, Math.floor(((root.scroll_y / 1px) - Spacing.page_margin)
+            / ((root.row_h + Spacing.grid_gap) / 1px)) - 2);
+    out property <int> last_visible_row:
+        Math.min(root.rows.length - 1,
+            Math.ceil(((root.scroll_y / 1px) - Spacing.page_margin + (root.height / 1px))
+            / ((root.row_h + Spacing.grid_gap) / 1px)) + 2);
+
+    background: transparent;
+    clip: true;
+
+    // 列宽 = (视口宽 - 左右页边距 - 列间距) / 2
+    property <length> col_w:
+        Math.floor(((root.width - Spacing.page_margin * 2 - Spacing.grid_gap) / 2) / 1px) * 1px;
+
+    // 固定行高 = 封面(16:9) + 文字区
+    property <length> row_h: (root.col_w * 9 / 16) + 66px;
+
+    // ----------------------------------------------------------------------
+    // 统一的 pan 分派
+    // ----------------------------------------------------------------------
+    function pan_begin(axis: PanAxis) {
+        root.active_axis = axis;
+        if (axis == PanAxis.Vertical) {
+            root.drag_base = root.scroll_y;
+            root.scroll_animating = false;
+            fling_timer.stop();
+        } else if (axis == PanAxis.Horizontal) {
+            root.swipe_horizontal(0px, 0px);
+        }
+    }
+
+    function pan_move(dx: length, dy: length) {
+        if (root.active_axis == PanAxis.Vertical) {
+            // 手指上滑(dy 为负) → 内容上移 → scroll_y 增加
+            let target = root.drag_base - dy;
+            root.scroll_y = Math.max(0px, Math.min(root.max_scroll, target));
+        } else if (root.active_axis == PanAxis.Horizontal) {
+            root.swipe_horizontal(dx, dy);
+        }
+    }
+
+    function pan_end(dx: length, dy: length, vx: length, vy: length) {
+        if (root.active_axis == PanAxis.Vertical) {
+            let v = -vy;
+            if (Math.abs(v) > 1.5px) {
+                root.fling_vel = v * 2.0;
+                fling_timer.start();
+            } else {
+                root.fling_vel = 0px;
+            }
+            // 内容不足一屏时贴回顶部
+            if (root.max_scroll <= 0px) { root.scroll_y = 0px; }
+        } else if (root.active_axis == PanAxis.Horizontal) {
+            root.swipe_horizontal_finished(dx, vx);
+        }
+        root.active_axis = PanAxis.None;
+    }
+
+    function pan_cancel() {
+        if (root.active_axis == PanAxis.Horizontal) {
+            root.swipe_horizontal_cancel();
+        }
+        root.fling_vel = 0px;
+        root.active_axis = PanAxis.None;
+    }
+
+    // 惯性滑行。8ms 对齐高刷，撞边界立即停。
+    fling_timer := Timer {
+        interval: 8ms;
+        running: false;
+        triggered => {
+            if (Math.abs(root.fling_vel) < 0.4px) {
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            let next = root.scroll_y + root.fling_vel;
+            if (next <= 0px) {
+                root.scroll_y = 0px;
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            if (next >= root.max_scroll) {
+                root.scroll_y = root.max_scroll;
+                root.fling_vel = 0px;
+                self.running = false;
+                return;
+            }
+            root.scroll_y = next;
+            root.fling_vel = root.fling_vel * 0.955;
+        }
+    }
+
+    // 触底加载下一页
+    changed scroll_y => {
+        if (root.has_more && !root.loading_more && root.more_error == ""
+            && root.max_scroll > 0px
+            && root.scroll_y > root.max_scroll - root.height) {
+            root.load_more();
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // 底层手势：兜住卡片之外的空隙（页边距、卡片间距、底部状态条）
+    //
+    // 先声明 → 在下层。卡片在上层，按在卡片上时优先给卡片。
+    // 两者回调的是同一套 pan_* 函数，行为完全一致。
+    // ----------------------------------------------------------------------
+    bg_gesture := GestureArea {
+        width: 100%;
+        height: 100%;
+
+        tap(x, y) => { }
+        pan_started(axis) => { root.pan_begin(axis); }
+        pan_moved(dx, dy) => { root.pan_move(dx, dy); }
+        pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+    }
+
+    // ----------------------------------------------------------------------
+    // 内容层
+    // ----------------------------------------------------------------------
+    content_layer := Rectangle {
+        width: parent.width;
+        height: Math.max(parent.height, root.content_h);
+        y: -root.scroll_y;
+
+        animate y {
+            duration: root.scroll_animating ? Theme.animation_duration_normal : 0ms;
+            easing: ease-out;
+        }
+
+        body := VerticalLayout {
+            width: parent.width;
+            padding-left: Spacing.page_margin;
+            padding-right: Spacing.page_margin;
+            padding-top: Spacing.page_margin;
+            padding-bottom: 32px;
+            spacing: Spacing.grid_gap;
+
+            // ---------------- 首屏加载骨架 ----------------
+            if root.feed_state == 1 && root.rows.length == 0 : HorizontalLayout {
+                spacing: Spacing.grid_gap;
+                alignment: start;
+                for i in 2: Rectangle {
+                    width: root.col_w;
+                    height: root.row_h;
+                    background: Theme.surface;
+                    border-radius: Theme.radius_md;
+                    border-width: 1px;
+                    border-color: Theme.outline_variant;
+                    opacity: 0.6;
+                }
+            }
+
+            // ---------------- 首屏错误 ----------------
+            if root.feed_state == 3 : VerticalLayout {
+                padding-top: 80px;
+                spacing: 12px;
+                alignment: center;
+
+                Text {
+                    text: "加载失败";
+                    color: Theme.on_surface;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.feed_error;
+                    color: Theme.on_surface_variant;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                    max-lines: 3;
+                    overflow: elide;
+                }
+            }
+
+            // ---------------- 真数据 ----------------
+            for pair[idx] in root.rows: HorizontalLayout {
+                spacing: Spacing.grid_gap;
+                alignment: start;
+
                 VideoCard {
+                    col_w: root.col_w;
                     data: pair.left;
-                    clicked => {
-                        root.video_selected(pair.left.id);
-                    }
+                    clicked => { root.video_selected(pair.left.id); }
+                    long_pressed => { root.video_long_pressed(pair.left.id); }
+                    pan_started(axis) => { root.pan_begin(axis); }
+                    pan_moved(dx, dy) => { root.pan_move(dx, dy); }
+                    pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
                 }
 
-                // 右侧卡片 (平分 50% 宽度，若无则占位透明)
                 if pair.has_right : VideoCard {
+                    col_w: root.col_w;
                     data: pair.right;
-                    clicked => {
-                        root.video_selected(pair.right.id);
-                    }
+                    clicked => { root.video_selected(pair.right.id); }
+                    long_pressed => { root.video_long_pressed(pair.right.id); }
+                    pan_started(axis) => { root.pan_begin(axis); }
+                    pan_moved(dx, dy) => { root.pan_move(dx, dy); }
+                    pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
                 }
-
-                // 当只有单数卡片时，补充占位防止左侧卡片拉伸
                 if !pair.has_right : Rectangle {
-                    background: Colors.transparent;
+                    width: root.col_w;
+                    height: 1px;
+                    background: transparent;
+                }
+            }
+
+            // ---------------- 底部状态 ----------------
+            if root.rows.length > 0 && root.loading_more : Rectangle {
+                height: 48px;
+                Text {
+                    text: "加载中…";
+                    color: Theme.on_surface_variant;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.rows.length > 0 && !root.loading_more && root.more_error != "" : Rectangle {
+                height: 48px;
+                Text {
+                    text: "加载失败，上滑重试";
+                    color: Theme.on_surface_variant;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.debug_text != "" : Rectangle {
+                height: 20px;
+                Text {
+                    text: root.debug_text;
+                    color: Theme.primary;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.rows.length > 0 && !root.has_more && !root.loading_more : Rectangle {
+                height: 48px;
+                Text {
+                    text: "— 没有更多了 —";
+                    color: Theme.outline;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

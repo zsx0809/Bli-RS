@@ -1,146 +1,204 @@
 // ==============================================================================
-// 双列竖版视频卡片组件 (Vertical Grid Video Card)
+// 双列视频卡片组件 (Video Card)
 //
-// 设计定位：
-// 1. 上下结构：上方为视频封面（含播放量/弹幕/时长徽章），下方为标题与UP主。
-// 2. 适用于双列瀑布流推荐页，最大化利用移动端横向空间。
+// 关键约束（修复"卡片大小不对称"）：
+// 1. 卡片宽度由父级显式传入 (col_w)，绝不允许内容撑开。
+// 2. 封面高度由宽度派生 (16:9)，文字区高度固定，因此卡片天然等高。
+// 3. 标题固定 2 行高度，1 行时也占满，避免行内高度抖动。
+//
+// 手势（重写后，别再改回 TouchArea.clicked）：
+//   卡片内是 GestureArea，不是 TouchArea。
+//   TouchArea 的 `clicked` 只看"按下点与抬起点是否都在自己范围内"，
+//   中间滑了多远完全不管 —— 在卡片上侧滑会被翻译成点击，直接进视频。
+//   GestureArea 自己判位移：小于 slop 才是 tap，超过就只发 pan。
+//
+//   卡片自己不消费 pan，全部往上冒泡给 RecommendView：
+//   纵向 → 列表滚动，横向 → 切换频道。
 // ==============================================================================
 
-import { Theme, VideoItemData } from "../theme.slint";
+import { Theme, Spacing, VideoItemData } from "../theme.slint";
+import { IconPlay, IconDanmaku } from "icons.slint";
+import { GestureArea, PanAxis } from "../gesture.slint";
 
 export component VideoCard inherits Rectangle {
     in property <VideoItemData> data;
-    callback clicked();
+    // 由父级显式传入的列宽，禁止内容驱动
+    in property <length> col_w: 160px;
+    // 按压状态：由外层状态机或自身触摸驱动
+    in property <bool> is_pressed: false;
 
+    callback clicked();
+    callback long_pressed();
+    callback pan_started(PanAxis);
+    callback pan_moved(length, length);
+    callback pan_finished(length, length, length, length);
+
+    property <bool> is_active: root.is_pressed || touch_layer.pressed;
+
+    width: root.col_w;
     background: Theme.surface;
     border-radius: Theme.radius_md;
+    border-width: 1px;
+    border-color: root.is_active ? Theme.primary : root.card_outline;
+    animate border-color { duration: Theme.animation_duration_fast; }
     clip: true;
 
-    // 触控交互水波纹
-    TouchArea {
-        clicked => { root.clicked(); }
+    property <color> card_outline: Theme.outline_variant;
 
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            background: parent.pressed ? Theme.primary.transparentize(85%) : Colors.transparent;
-            animate background { duration: Theme.animation_duration_fast; }
+    // 封面按 16:9 从宽度派生
+    property <length> cover_h: root.col_w * 9 / 16;
+    // 文字区固定高度 = 上下 padding + 标题 2 行 + 间距 + 作者行
+    property <length> info_h: 8px + 46px + 2px + 14px + 4px;
+    height: root.cover_h + root.info_h;
+
+    // 封面区（绝对定位，避开 layout 覆盖显式高度）
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.col_w;
+        height: root.cover_h;
+        background: Theme.surface_variant;
+        clip: true;
+
+        Image {
+            source: root.data.cover;
+            width: parent.width;
+            height: parent.height;
+            image-fit: cover;
         }
-    }
 
-    VerticalLayout {
-        padding: 0px;
-        spacing: 6px;
+        // 占位文字：只在封面尚未到位时可见。
+        if root.data.cover.width == 0 : Text {
+            text: "BILIBILI";
+            color: Theme.outline_variant;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
 
-        // ----------------------------------------------------------------------
-        // 1. 顶部视频封面区域 (16:10 沉浸比例)
-        // ----------------------------------------------------------------------
+        // 底部渐变压暗
         Rectangle {
-            height: 106px;
-            background: Theme.surface_variant;
-            border-top-left-radius: Theme.radius_md;
-            border-top-right-radius: Theme.radius_md;
-            clip: true;
+            y: parent.height - 30px;
+            height: 30px;
+            background: @linear-gradient(180deg, #00000000, #00000099);
+        }
 
-            // 封面占位标示
-            Text {
-                text: "BILIBILI";
-                color: Theme.outline;
-                font-size: 11px;
-                font-weight: 700;
+        // 左下：播放量 / 弹幕
+        HorizontalLayout {
+            x: 6px;
+            y: parent.height - 20px;
+            width: self.preferred-width;
+            height: 14px;
+            spacing: 9px;
+            alignment: start;
+
+            HorizontalLayout {
+                width: self.preferred-width;
+                height: 14px;
+                spacing: 3px;
+                alignment: start;
+                IconPlay {
+                    y: 3px;
+                    size: 8px;
+                    tint: #ffffff;
+                }
+                Text {
+                    text: root.data.views;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                width: self.preferred-width;
+                height: 14px;
+                spacing: 3px;
+                alignment: start;
+                IconDanmaku {
+                    y: 3px;
+                    size: 8px;
+                    tint: #ffffff;
+                }
+                Text {
+                    text: root.data.danmaku;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // 右下：时长
+        Rectangle {
+            x: parent.width - self.width - 5px;
+            y: parent.height - 19px;
+            width: duration_label.preferred-width + 10px;
+            height: 15px;
+            background: #00000099;
+            border-radius: 4px;
+
+            duration_label := Text {
+                text: root.data.duration;
+                color: #ffffff;
+                font-size: 9px;
+                font-weight: 600;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-
-            // 封面底部渐变投影蒙层 (确保白色角标清晰可见)
-            Rectangle {
-                y: parent.height - 24px;
-                height: 24px;
-                background: #00000077;
-            }
-
-            // 封面左下角：播放量与弹幕数
-            HorizontalLayout {
-                x: 6px;
-                y: parent.height - 18px;
-                spacing: 6px;
-
-                Text {
-                    text: "▶ " + root.data.views;
-                    color: #ffffff;
-                    font-size: 10px;
-                    font-weight: 500;
-                }
-
-                Text {
-                    text: "💬 " + root.data.danmaku;
-                    color: #ffffff;
-                    font-size: 10px;
-                    font-weight: 500;
-                }
-            }
-
-            // 封面右下角：时长
-            Rectangle {
-                x: parent.width - self.width - 5px;
-                y: parent.height - self.height - 3px;
-                width: 38px;
-                height: 16px;
-                background: #00000099;
-                border-radius: 4px;
-
-                Text {
-                    text: root.data.duration;
-                    color: #ffffff;
-                    font-size: 9px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
         }
+    }
 
-        // ----------------------------------------------------------------------
-        // 2. 底部视频文字信息区域
-        // ----------------------------------------------------------------------
-        VerticalLayout {
-            padding-left: 8px;
-            padding-right: 8px;
-            padding-bottom: 8px;
-            spacing: 4px;
-            alignment: space-between;
+    // 标题：固定两行高度，绝对定位
+    Text {
+        x: Spacing.card_padding;
+        y: root.cover_h + 8px;
+        width: root.col_w - Spacing.card_padding * 2;
+        height: 46px;
+        text: root.data.title;
+        color: Theme.on_surface;
+        font-size: 13px;
+        font-weight: 600;
+        wrap: word-wrap;
+        max-lines: 2;
+        overflow: elide;
+        vertical-alignment: center;
+    }
 
-            // 两行截断标题
-            Text {
-                text: root.data.title;
-                color: Theme.on_surface;
-                font-size: 13px;
-                font-weight: 600;
-                wrap: word-wrap;
-                max-height: 38px;
-                overflow: elide;
-            }
+    // UP 主
+    Text {
+        x: Spacing.card_padding;
+        y: root.cover_h + 8px + 46px + 2px;
+        width: root.col_w - Spacing.card_padding * 2;
+        height: 14px;
+        text: root.data.author;
+        color: Theme.on_surface_variant;
+        font-size: 11px;
+        overflow: elide;
+        vertical-alignment: center;
+    }
 
-            // UP 主信息
-            HorizontalLayout {
-                spacing: 4px;
+    // 统一按压反馈遮罩层
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.is_active ? Theme.on_surface.transparentize(88%) : transparent;
+        animate background { duration: Theme.animation_duration_fast; }
+    }
 
-                Text {
-                    text: "UP";
-                    color: Theme.primary;
-                    font-size: 10px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
+    // 手势层：tap 与 pan 由它区分，pan 全部冒泡给列表
+    touch_layer := GestureArea {
+        // 长按 500ms 且未拖动 → 长按（为三连/不感兴趣预留）
+        long_enabled: true;
+        long_press(x, y) => { root.long_pressed(); }
 
-                Text {
-                    text: root.data.author;
-                    color: Theme.on_surface_variant;
-                    font-size: 11px;
-                    overflow: elide;
-                    vertical-alignment: center;
-                }
-            }
-        }
+        tap(x, y) => { root.clicked(); }
+        pan_started(axis) => { root.pan_started(axis); }
+        pan_moved(dx, dy) => { root.pan_moved(dx, dy); }
+        pan_finished(dx, dy, vx, vy) => { root.pan_finished(dx, dy, vx, vy); }
     }
 }

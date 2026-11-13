@@ -1,0 +1,190 @@
+// ==============================================================================
+// 相关推荐视频单列横向卡片 (Related Video Horizontal Card)
+// ==============================================================================
+
+import { Theme, Spacing, RelatedVideoData } from "../theme.slint";
+import { IconPlay, IconDanmaku, IconMoreVert } from "icons.slint";
+import { GestureArea, PanAxis } from "../gesture.slint";
+
+export component RelatedVideoCard inherits Rectangle {
+    in property <RelatedVideoData> data;
+    in property <bool> is_pressed: false;
+    callback clicked();
+    // 纵向拖动往上冒泡给详情页滚动 ——
+    // 这张卡铺满整行，若不自带 pan 转发，压在卡上的竖向滚动会被吞掉。
+    callback pan_started(PanAxis);
+    callback pan_moved(length, length);
+    callback pan_finished(length, length, length, length);
+
+    height: 96px;
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: Spacing.page_margin;
+        padding-right: Spacing.page_margin;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 10px;
+
+        // 左侧封面 (16:9 比例)
+        Rectangle {
+            width: 140px;
+            height: 100%;
+            background: Theme.surface_variant;
+            border-radius: Theme.radius_sm;
+            clip: true;
+
+            Image {
+                source: root.data.cover;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+
+            if root.data.cover.width == 0 : Text {
+                text: "BILIBILI";
+                color: Theme.outline_variant;
+                font-size: 9px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // 右下角时长胶囊
+            Rectangle {
+                x: parent.width - self.width - 4px;
+                y: parent.height - self.height - 4px;
+                width: dur_txt.preferred-width + 8px;
+                height: 16px;
+                background: #000000aa;
+                border-radius: 4px;
+
+                dur_txt := Text {
+                    text: root.data.duration;
+                    color: #ffffff;
+                    font-size: 9px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // 右侧信息
+        VerticalLayout {
+            alignment: space-between;
+
+            // 标题 (最多2行)
+            Text {
+                text: root.data.title;
+                color: Theme.on_surface;
+                font-size: 13px;
+                font-weight: 600;
+                wrap: word-wrap;
+                max-lines: 2;
+                overflow: elide;
+            }
+
+            // 底部 UP 与播放统计
+            VerticalLayout {
+                spacing: 3px;
+
+                // UP 主
+                HorizontalLayout {
+                    spacing: 4px;
+                    alignment: start;
+
+                    Rectangle {
+                        width: 16px;
+                        height: 12px;
+                        background: Theme.surface_variant;
+                        border-radius: 2px;
+                        y: 1px;
+                        Text {
+                            text: "UP";
+                            color: Theme.on_surface_variant;
+                            font-size: 8px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: root.data.author;
+                        color: Theme.on_surface_variant;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+
+                // 播放量与弹幕量
+                HorizontalLayout {
+                    alignment: space-between;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: start;
+
+                        HorizontalLayout {
+                            spacing: 3px;
+                            alignment: start;
+                            IconPlay {
+                                y: 2px;
+                                size: 8px;
+                                tint: Theme.on_surface_variant;
+                            }
+                            Text {
+                                text: root.data.views;
+                                color: Theme.on_surface_variant;
+                                font-size: 10px;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 3px;
+                            alignment: start;
+                            IconDanmaku {
+                                y: 2px;
+                                size: 8px;
+                                tint: Theme.on_surface_variant;
+                            }
+                            Text {
+                                text: root.data.danmaku;
+                                color: Theme.on_surface_variant;
+                                font-size: 10px;
+                            }
+                        }
+                    }
+
+                    IconMoreVert {
+                        size: 14px;
+                        tint: Theme.outline;
+                    }
+                }
+            }
+        }
+    }
+
+    // 按压高亮
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: (root.is_pressed || touch.pressed) ? Theme.on_surface.transparentize(90%) : transparent;
+        animate background { duration: Theme.animation_duration_fast; }
+    }
+
+    // 用 GestureArea 而不是 TouchArea。
+    //
+    // TouchArea 的 clicked 不判位移：按下与抬起只要都在卡内就回调。
+    // 在相关视频列表上右滑 → 起点终点都落在同一张卡 → 被判成点击
+    // → 直接切到那个视频。这就是「右滑切换视频」。
+    //
+    // GestureArea 位移超过 slop 就锁定主轴、只发 pan，永不发 tap。
+    touch := GestureArea {
+        tap(x, y) => { root.clicked(); }
+        pan_started(axis) => { root.pan_started(axis); }
+        pan_moved(dx, dy) => { root.pan_moved(dx, dy); }
+        pan_finished(dx, dy, vx, vy) => { root.pan_finished(dx, dy, vx, vy); }
+    }
+}

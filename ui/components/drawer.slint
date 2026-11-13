@@ -1,194 +1,268 @@
 // ==============================================================================
-// 侧边抽屉面板 (Navigation Drawer - "我的" 与系统偏好设置)
+// 侧边抽屉面板 (Navigation Drawer)
 //
-// 设计定位：
-// 1. 完全通过左侧滑手势或点击顶部头像呼出，极大节约底栏垂直空间。
-// 2. 包含个人账号状态、硬币/B币、历史记录、离线缓存、以及硬解码核心设置。
-// 3. 点击半透明遮罩背景或向左推即可平滑收起。
+// 结构：我 → 内容 → 设置 三段，用 1px 分割线分组。
+// 图标全部走矢量 Path，颜色随主题，不用 emoji。
+// 顶部撑到状态栏下方，避免露出一条色带。
 // ==============================================================================
 
-import { Theme } from "../theme.slint";
+import { Theme, Spacing } from "../theme.slint";
+import { IconHistory, IconDownload, IconStar, IconThermostat, IconSettings, IconClose } from "icons.slint";
+
+// 抽屉内的单个条目：图标与文字自然排列，间距 16px
+export component DrawerItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> highlighted: false;
+    callback clicked();
+
+    height: Spacing.drawer_item_height;
+    border-radius: Theme.radius_sm;
+    background: touch.pressed ? Theme.surface_container_high
+             : touch.has-hover ? Theme.surface_container_high
+             : transparent;
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: Spacing.drawer_icon_gap;
+        alignment: start;
+
+        // 图标插槽：固定 20px，宽度由子元素填满
+        Rectangle {
+            width: Spacing.drawer_icon_size;
+            height: Spacing.drawer_icon_size;
+            background: transparent;
+
+            @children
+        }
+
+        Text {
+            text: root.label;
+            color: root.highlighted ? Theme.primary : Theme.on_surface;
+            font-size: 14px;
+            font-weight: root.highlighted ? 600 : 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
 
 export component NavigationDrawer inherits Rectangle {
-    // --------------------------------------------------------------------------
-    // 接口属性与事件回调
-    // --------------------------------------------------------------------------
-    in-out property <bool> is_open: false;       // 抽屉展开状态
-    callback close_drawer();                    // 关闭抽屉事件
-    callback navigate_settings();               // 跳转设置事件
-    callback navigate_history();                // 跳转历史记录事件
+    in-out property <bool> is_open: false;
+    in property <length> safe_top: 0px;
 
-    // 全屏覆盖 (处理遮罩)
+    callback close_drawer();
+    callback navigate_settings();
+    callback navigate_history();
+
     width: 100%;
     height: 100%;
-    background: Colors.transparent;
+    background: transparent;
 
     // --------------------------------------------------------------------------
-    // 1. 半透明黑色遮罩 (Scrim)
+    // 遮罩：点击关闭，随抽屉同步淡入淡出
     // --------------------------------------------------------------------------
-    if root.is_open : TouchArea {
+    scrim_layer := Rectangle {
         width: 100%;
         height: 100%;
-        clicked => {
-            root.close_drawer();
-        }
+        background: root.is_open ? Theme.scrim : transparent;
+        animate background { duration: Theme.animation_duration_normal; }
+    }
 
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            background: Theme.scrim;
-            animate background { duration: Theme.animation_duration_normal; }
-        }
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.is_open;
+        clicked => { root.close_drawer(); }
     }
 
     // --------------------------------------------------------------------------
-    // 2. 抽屉物理面板 (从左向右平滑滑出)
+    // 抽屉本体
     // --------------------------------------------------------------------------
-    Rectangle {
-        x: root.is_open ? 0px : -self.width;
+    panel := Rectangle {
+        x: root.is_open ? 0px : -self.width - 24px;
         animate x { duration: Theme.animation_duration_normal; easing: ease-out; }
-        
-        width: 300px;
+
+        width: Spacing.drawer_width;
         height: 100%;
-        background: Theme.surface_container_high;
+        background: Theme.surface_container;
         border-top-right-radius: Theme.radius_lg;
         border-bottom-right-radius: Theme.radius_lg;
         clip: true;
 
+        // 注意：不能写 alignment: start —— 那会让所有元素堆在顶部，
+        // 弹性留白（vertical-stretch）失效，底部区永远压不到底。
+        // 默认的 stretch 对齐才会把剩余空间分给带 stretch 的元素。
         VerticalLayout {
-            padding: 24px;
-            spacing: 20px;
-            alignment: start;
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: root.safe_top + 16px;
+            padding-bottom: 16px;
+            spacing: 0px;
 
-            // 头部用户信息卡片
+            // --------------------------------------------------------------
+            // 第一段：用户卡片
+            // --------------------------------------------------------------
             Rectangle {
-                height: 110px;
-                background: Theme.surface_variant;
+                height: 104px;
+                background: Theme.surface_container_high;
                 border-radius: Theme.radius_md;
 
                 VerticalLayout {
-                    padding: 16px;
-                    spacing: 8px;
+                    padding: 14px;
+                    spacing: 10px;
+                    alignment: start;
 
                     HorizontalLayout {
                         spacing: 12px;
+                        alignment: start;
 
-                        // 大头像
+                        // 头像：与顶栏同一抽象鱼形，保持身份一致
                         Rectangle {
-                            width: 48px;
-                            height: 48px;
+                            width: 44px;
+                            height: 44px;
                             border-radius: Theme.radius_full;
                             background: Theme.primary;
 
-                            Text {
-                                text: "🐟";
-                                font-size: 24px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                            Path {
+                                width: 100%;
+                                height: 100%;
+                                viewbox-width: 24;
+                                viewbox-height: 24;
+                                commands: "M 4 12 C 7 7.5 13 7.5 16 11 L 20.5 8.2 L 19.6 15.8 L 16 13 C 13 16.5 7 16.5 4 12 Z";
+                                fill: Theme.on_primary;
+                                stroke: transparent;
                             }
                         }
 
-                        // 昵称与等级
                         VerticalLayout {
                             alignment: center;
-                            spacing: 4px;
+                            spacing: 3px;
+                            vertical-stretch: 1;
 
                             Text {
                                 text: "大肥鱼的朋友";
                                 color: Theme.on_surface;
-                                font-size: 16px;
+                                font-size: 15px;
                                 font-weight: 700;
+                                overflow: elide;
                             }
 
                             Text {
                                 text: "LV6 · 纯血 Rust 极速模式";
                                 color: Theme.primary;
-                                font-size: 12px;
+                                font-size: 11px;
+                                overflow: elide;
+                            }
+                        }
+
+                        // 关闭按钮：抽屉内也要有显式退出入口
+                        TouchArea {
+                            width: 28px;
+                            height: 28px;
+                            clicked => { root.close_drawer(); }
+                            IconClose {
+                                size: 16px;
+                                tint: Theme.on_surface_variant;
+                                x: 6px;
+                                y: 6px;
                             }
                         }
                     }
 
-                    // 账号状态
                     Text {
-                        text: "硬币: 1024  |  B币: 0.0  |  零发热运行中";
+                        text: "硬币 1024  ·  B币 0.0  ·  零发热运行中";
                         color: Theme.on_surface_variant;
                         font-size: 11px;
                     }
                 }
             }
 
-            // 分割线
+            Rectangle { height: 16px; background: transparent; }
+
+            // --------------------------------------------------------------
+            // 第二段：内容入口 (历史 / 缓存 / 收藏)
+            // --------------------------------------------------------------
+            DrawerItem {
+                label: "历史记录";
+                clicked => { root.navigate_history(); }
+                IconHistory { }
+            }
+            DrawerItem {
+                label: "离线缓存";
+                IconDownload { }
+            }
+            DrawerItem {
+                label: "我的收藏";
+                IconStar { }
+            }
+
+            Rectangle { height: 12px; background: transparent; }
+
+            // 分组分割线
             Rectangle {
                 height: 1px;
-                background: Theme.surface_variant;
+                background: Theme.outline_variant;
+            }
+            Rectangle { height: 12px; background: transparent; }
+
+            // --------------------------------------------------------------
+            // 第三段：功能入口（硬件解码设置，仍在列表内）
+            // --------------------------------------------------------------
+            DrawerItem {
+                label: "硬件解码与温控";
+                highlighted: true;
+                clicked => { root.navigate_settings(); }
+                IconThermostat { }
             }
 
-            // 功能导航列表项
-            VerticalLayout {
-                spacing: 6px;
+            // 弹性留白：把「设置 + 版本号」压到抽屉底部
+            Rectangle {
+                vertical-stretch: 1;
+                background: transparent;
+            }
 
-                // 历史记录
-                TouchArea {
-                    height: 48px;
-                    clicked => { root.navigate_history(); }
-                    Rectangle {
-                        border-radius: Theme.radius_md;
-                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            spacing: 16px;
-                            Text { text: "🕒"; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "历史记录"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
-                        }
-                    }
-                }
+            // --------------------------------------------------------------
+            // 底部固定区：设置 + 版本号
+            //
+            // 与上面"内容列表"不同类：
+            //   上面是"去某处"（历史/缓存/收藏），这里是"改配置 / 关于"。
+            //   沉到左下角符合抽屉的常规心智模型，也把大片留白收了口。
+            // --------------------------------------------------------------
+            Rectangle {
+                height: 1px;
+                background: Theme.outline_variant;
+            }
+            Rectangle { height: 6px; background: transparent; }
 
-                // 离线缓存
-                TouchArea {
-                    height: 48px;
-                    Rectangle {
-                        border-radius: Theme.radius_md;
-                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            spacing: 16px;
-                            Text { text: "📥"; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "离线缓存"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
-                        }
-                    }
-                }
+            DrawerItem {
+                label: "设置";
+                IconSettings { }
+            }
 
-                // 我的收藏
-                TouchArea {
-                    height: 48px;
-                    Rectangle {
-                        border-radius: Theme.radius_md;
-                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            spacing: 16px;
-                            Text { text: "⭐"; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "我的收藏"; color: Theme.on_surface; font-size: 14px; vertical-alignment: center; }
-                        }
-                    }
-                }
+            // 版本号：紧贴设置下方，字号最小、颜色最弱
+            Rectangle {
+                height: 26px;
+                background: transparent;
 
-                // 解码与温控设置 (核心卖点)
-                TouchArea {
-                    height: 48px;
-                    clicked => { root.navigate_settings(); }
-                    Rectangle {
-                        border-radius: Theme.radius_md;
-                        background: parent.has-hover ? Theme.surface_variant : Colors.transparent;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            spacing: 16px;
-                            Text { text: "❄️"; font-size: 18px; vertical-alignment: center; }
-                            Text { text: "NDK 硬件解码与温控设置"; color: Theme.primary; font-size: 14px; font-weight: 600; vertical-alignment: center; }
-                        }
-                    }
+                Text {
+                    x: 10px;
+                    y: (parent.height - self.height) * 0.5;
+                    text: "Bli-RS 0.1.0 · 0 行 Java · 0 个 DEX";
+                    color: Theme.on_surface_variant;
+                    font-size: 10px;
+                    height: 13px;
+                    vertical-alignment: center;
                 }
             }
+
         }
     }
 }
+
+

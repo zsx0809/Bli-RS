@@ -1,30 +1,52 @@
 // ==============================================================================
 // 直播流视图 (Live Stream View)
 //
-// 设计定位：
-// 1. 直播专区推荐列表与正在开播的 UP 主。
+// 骨架阶段：空状态占位，结构与 FollowView 一致。
 // ==============================================================================
 
 import { Theme } from "../theme.slint";
-import { ScrollView } from "std-widgets.slint";
 
 export component LiveView inherits Rectangle {
     background: Colors.transparent;
 
     VerticalLayout {
         alignment: center;
-        spacing: 16px;
+        spacing: 0px;
+
+        // 图形符号：屏幕 + 播放三角
+        Rectangle {
+            height: 72px;
+            background: transparent;
+
+            Path {
+                width: 64px;
+                height: 64px;
+                x: (parent.width - 64px) * 0.5;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: "M 3.4 5.4 L 20.6 5.4 L 20.6 16.6 L 3.4 16.6 Z M 8 18.6 L 16 18.6 M 10.4 16.6 L 10.4 18.6 M 13.6 16.6 L 13.6 18.6";
+                stroke: Theme.outline;
+                stroke-width: 1.3px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+            }
+        }
+
+        Rectangle { height: 18px; background: transparent; }
 
         Text {
-            text: "📡 直播专区";
-            color: Theme.primary;
-            font-size: 20px;
-            font-weight: 700;
+            text: "直播还没接进来";
+            color: Theme.on_surface;
+            font-size: 16px;
+            font-weight: 600;
             horizontal-alignment: center;
         }
 
+        Rectangle { height: 8px; background: transparent; }
+
         Text {
-            text: "正在接入 Bilibili 直播真实流媒体管道...\n杜绝官方后台音频驻留与发热";
+            text: "协议层完成后，这里会显示正在开播的 UP 主";
             color: Theme.on_surface_variant;
             font-size: 13px;
             horizontal-alignment: center;

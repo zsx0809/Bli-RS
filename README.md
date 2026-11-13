@@ -1,91 +1,326 @@
 # Bli-RS
 
-> 纯血 Rust 实现的高性能、零发热、极简无臃肿 Bilibili Android 客户端。
+> 纯血 Rust 实现的高性能、零发热、零 JVM 的 Bilibili Android 客户端。
 
 ---
 
-## 🌟 核心架构亮点
+## 当前进度
 
-1. **零 JVM / ART 依赖（纯血 Native）**：
-   - 全栈由 Rust 驱动，基于 Android 原生 `NativeActivity`（`android:hasCode="false"`）。
-   - **0 行 Java 代码，0 个 DEX 文件**，由 Linux 内核在启动时直接 `dlopen` 加载 ARM64 动态库，冷启动 Displayed 时间仅 **133 毫秒**。
-2. **根除发热与后台常驻**：
-   - 彻底告别官方客户端吃满大核的 `ijkservice` 后台软解死循环与臃肿遥测进程（实测手机温度从 42°C 降至室温）。
-   - 采用保留模式（Retained Mode）UI 渲染，屏幕静止时 GPU 与 CPU 完全静默休眠。
-3. **Material 3 原生设计语言**：
-   - 首页精炼为 **`[ 直播 ]  [ 推荐 ]  [ 关注 ]`** 三段式 Tab，砍掉底部导航栏以最大化可视空间。
-   - 经典 **双列瀑布流视频网格**（16:10 沉浸封面 + 播放量/弹幕徽章 + 标题与 UP 主）。
-   - 完整支持 **左右轻扫切 Tab** 与 **屏幕左边缘右滑呼出抽屉面板**。
+| 模块 | 状态 | 说明 |
+|---|---|---|
+| UI 骨架（Slint + Material 3 + Monet） | ✅ 完成 | 双列网格、胶囊 Tab、抽屉、手势 |
+| 推荐流真实数据 | ✅ 完成 | Wbi 签名 + 分页加载 + 封面懒加载 |
+| 视频播放（画面） | ✅ 跑通 | 真实 B 站视频出画面，零拷贝硬解 |
+| 视频播放（音频） | ⬜ 未做 | 需要 AAudio + 音频轨解码 |
+| 播放器控制 | ⬜ 未做 | 暂停 / 进度 / seek / 倍速 / 横屏 |
+| 搜索 | ⬜ 未做 | 顶栏搜索框目前是摆设 |
+| 直播 / 关注 | ⬜ 未做 | 两个 Tab 是空态占位 |
+| 登录 | ⬜ 未做 | 匿名访问，未登录只能拿 480P |
 
 ---
 
-## 📂 源码与目录结构
+## 技术栈
 
-```text
-BLI-RS/
-├── android/                   # Android 原生清单与资源
-│   ├── AndroidManifest.xml   # 声明 NativeActivity (hasCode=false)
-│   └── res/values/           # 基础资源与标题配置
-├── dist/                      # 最终打包产物目录 (存放可安装 APK)
-├── docs/                      # 架构设计与技术文档
-│   └── adr/
-│       └── ADR-0001-architecture-design.md # 核心架构决策记录
-├── fake_libs/                 # 本地链接器静态桩目录
-├── scripts/                   # 原生编译与打包脚本
-│   └── package_apk.sh         # 极速打包签名器 (aapt2 + zipalign + apksigner)
-├── src/                       # Rust 核心源代码
-│   ├── lib.rs                 # 导出库与 Android android_main 入口
-│   └── main.rs                # 桌面开发与测试入口
-└── ui/                        # Slint 声明式 UI 表现层 (带保姆级 M3 注释)
-    ├── components/
-    │   ├── drawer.slint       # 侧滑抽屉 (个人中心、UID、硬件解码设置)
-    │   ├── topbar.slint       # 顶栏三 Tab 切换器
-    │   └── video_card.slint   # 双列竖版视频卡片
-    ├── views/
-    │   ├── follow_view.slint  # 关注动态视图
-    │   ├── live_view.slint    # 直播专区视图
-    │   └── recommend_view.slint # 经典双列瀑布流推荐页
-    ├── appwindow.slint        # 主视窗容器与手势状态机
-    └── theme.slint            # Monet 动态调色板与动力学设计变量
+- **UI**：Slint 1.18（实际渲染后端是 **Skia**，不是 femtovg）
+- **网络**：reqwest 0.12 + rustls（纯 Rust TLS，交叉编译不需要 OpenSSL）
+- **媒体**：Android NDK 原生 —— `AMediaExtractor` / `AMediaCodec` / `SurfaceView`
+- **异步**：tokio（每个后台任务自建 current_thread runtime）
+- **构建**：`aapt2` + `zipalign` + `apksigner`，无 Gradle，无 DEX，0 行 Java
+
+---
+
+## 架构
+
+```
+                    ┌─────────────────────────────────┐
+                    │  Slint UI（Skia 渲染，NativeActivity）│
+                    └──────────────┬──────────────────┘
+                                   │ 回调 / 属性
+                    ┌──────────────▼──────────────────┐
+                    │           src/feed.rs            │  推荐流桥接
+                    │         src/cover.rs             │  封面下载解码
+                    │         src/player.rs            │  播放编排
+                    └──────────────┬──────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────┐
+                    │      crates/bli-protocol         │  协议层（无 UI 依赖）
+                    │  Wbi 签名 / playurl / 推荐流      │
+                    └──────────────┬──────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────┐
+                    │   NDK 原生（MediaExtractor/Codec） │
+                    └─────────────────────────────────┘
 ```
 
----
-
-## 🔍 上游协议参考
-
-- **本地参考源码路径**：`/data/data/com.termux/files/home/projects/PiliPlus`
-- **GitHub 上游项目**：[PiliPlus (Flutter 开源客户端)](https://github.com/bggRGjQaUbCoE/PiliPlus)
-- **协议移植映射表**：
-  - Wbi 签名逆向逻辑：参考 `PiliPlus/lib/utils/wbi_sign.dart`
-  - 推荐流与视频详情接口：参考 `PiliPlus/lib/http/`
-  - 动态与 gRPC 编解码：参考 `PiliPlus/lib/grpc/`
+**关键设计：协议层是独立 crate。**
+它不依赖 Slint，可以在 chroot 里单独跑测试和 probe 验证接口，
+不必为了测一个 HTTP 请求去链接 fontconfig。
 
 ---
 
-## 🛠 本地编译与打包指南 (Termux 原生环境)
+## 播放链路（已跑通）
 
-项目已配置闭环的原生编译链，无需 Android Studio，无需 Gradle，直接在手机本地 10 秒打出 APK：
+```
+点击卡片
+  → BiliClient::video_cid(bvid)      拿 cid
+  → BiliClient::play_url(bvid, cid)  拿 DASH 轨道（6 视频 + 3 音频）
+  → BiliClient::download_bytes(url)  下载 fMP4（77MB，约 70 秒）
+  → AMediaExtractor_setDataSourceFd  解封装（fd 模式）
+  → MediaCodec::configure(→Surface)  硬解
+  → releaseOutputBuffer(render=true) 送显
+  → SurfaceFlinger 合成上屏
+```
 
-### 1. 编译纯血动态库
+全程 CPU 只搬运压缩码流，像素数据从解码器直接进 GPU 纹理，**零回读**。
+
+---
+
+## 踩过的坑（改代码前必读）
+
+这些都是实测得出的结论，不是推测。改回去会立刻出问题。
+
+### 1. `AMediaExtractor` 只能用 fd，不能用路径
+
+```rust
+// ❌ 永远返回 -10002（UNKNOWN_ERROR），与权限/格式无关
+AMediaExtractor_setDataSource(extractor, "/path/to/file.m4s");
+
+// ✅
+AMediaExtractor_setDataSourceFd(extractor, fd, 0, len);
+```
+
+字符串路径版本内部依赖 JNI 做路径解析，纯 native 线程没有 `JNIEnv`。
+实测连系统自带的普通 mp4 都打不开。
+
+### 2. 视频 CDN 必须用 Range 请求
+
+```
+无 cookie    → 567
+带 buvid3    → 567
+带 Range     → 206  ✓
+```
+
+整文件请求被 CDN 当成爬虫拒绝。
+
+### 3. 视频下载不能自动解压
+
+CDN 在 Range 响应上带 `Content-Encoding` 头，但 body 是裸字节。
+reqwest 自动解压会报 `error decoding response body`。
+
+必须：
+- 发送 `Accept-Encoding: identity`
+- 不要调用 `.gzip()` / `.brotli()`
+
+### 4. buvid 必须全程一致
+
+`playurl` 返回的 URL 里嵌了当时的 buvid，CDN 会校验。
+**整个播放流程必须复用同一个 `BiliClient` 实例**，
+中途新建 client 会生成新 buvid，签名对不上直接 567。
+
+### 5. SurfaceView 只有 `VISIBLE` 能拿到 Surface
+
+```
+GONE(8)       → 不参与布局，Surface 永不创建
+INVISIBLE(4)  → Surface 对象存在，但 isValid() 永远 false
+VISIBLE(0)    → 正常  ✓
+```
+
+但它一旦 `VISIBLE` 就会盖住 Slint UI（后加的 View 在上层），
+所以**只能在播放时创建**，不能启动时创建。
+
+### 6. View 操作必须在 Java 主线程
+
+后台线程调 `addView` 会抛 `CalledFromWrongThreadException`
+并**直接杀进程**（不可捕获）。
+
+用 `AndroidApp::run_on_java_main_thread` 调度。
+
+### 7. Slint 的类型大多不是 Send
+
+```rust
+Send      : Weak<AppWindow>, String, i64, Vec<纯数据>
+NOT Send  : AppWindow, Image, ModelRc, VecModel, Rc<...>
+```
+
+最隐蔽的是 `Image`——它是 `VRc<OpaqueImageVTable>`。
+所以含 `cover: image` 字段的 `VideoItemData` 整体也不能跨线程。
+
+数据流被拆成两段：
+```
+后台线程 --(Vec<RawItem> 纯字符串)--> UI 线程构建 VideoItemData
+后台线程 --(bvid, w, h, rgba 字节)--> UI 线程构建 Image 并回填
+```
+
+### 8. 封面回填必须持有同一个模型实例
+
+对 `in-out property <[...]>` 这种值类型属性，
+每次 `get_rows()` 可能拿到新的包装，对它 `set_row_data` 不反映到 UI。
+
+必须把 `Rc<VecModel>` 存下来，属性指向的就是这个实例。
+
+### 9. `slint::Timer` 必须在事件循环启动后创建
+
+在 `main_window.run()` 之前建 Timer 不会触发。
+现在的做法：在第一次 `set_rows` 的 `upgrade_in_event_loop` 闭包里启动。
+
+### 10. 滚动不能用 Flickable
+
+`Flickable` 在触摸滚动路径里会调 `content_y.remove_binding()`
+抢走绑定（`flickable.rs:514`），外部双向绑定被拆掉。
+表现为「下拉能刷新、上滑完全不动」。
+
+现在的做法：`Flickable` 换成普通 `Rectangle` 只做裁剪，
+纵向位移由 `scroll_y` 完全自管。
+
+### 11. 手势层会吞掉卡片点击
+
+手势层的 `TouchArea` 盖在最上层，`press` 先到它手里，
+卡片上的 `TouchArea` 收不到。
+
+现在的做法：手势层判定「无位移 = 点击」，转发给 `RecommendView`
+做坐标命中测试。
+
+**这是个权宜之计**——以后卡片内如果有独立按钮（点赞、更多），
+这套方案会很别扭，需要重新设计。
+
+### 12. 帧率必须按真实刷新率对齐
+
+这台设备支持 60/90/120Hz，系统会动态切换。
+手动逐帧累加惯性时，`Timer(16ms)` 在 90Hz 下会让 1/3 的帧没有新内容，
+肉眼就是「一顿一顿」。
+
+现在的做法：抬手后算出目标位置，交给 `animate y` 由渲染引擎插值，
+刷新率是多少就滑多少次。
+
+---
+
+## 编译与打包
+
+### chroot / 交叉编译（推荐）
+
+```bash
+bash scripts/build.sh          # 编译 + 打包
+bash scripts/build.sh --lib    # 只编译 .so
+```
+
+**为什么这样搭：**
+
+1. Google 官方 NDK 只有 `linux-x86_64` 版本，没有 aarch64 host。
+2. Termux 自带的 clang 二进制本身就是 `Target: aarch64-unknown-linux-android24`，
+   天然面向 Android 的 bionic，且能在 chroot 内直接执行。
+3. Rust 侧用 rustup 的 `aarch64-linux-android` std（`rustup target add aarch64-linux-android`）。
+4. Skia 的 build.rs 硬编码 `host_tag = "linux-x86_64"`，
+   需要一个 NDK 目录桩骗过它（脚本会自动创建 `/tmp/ndk-shim-r29`）。
+
+Skia 的预编译包缓存在 `target/*/build/skia-bindings-*/out/skia/`（25M），
+会被自动复用，不需要重新下载。
+
+### Termux 原生编译（备选）
+
 ```bash
 export PATH=/data/data/com.termux/files/usr/bin:$PATH
+export ANDROID_HOME=/data/data/com.termux/files/home/Android/Sdk
+export ANDROID_JAR=$ANDROID_HOME/platforms/android-35/android.jar
 export RUSTFLAGS="-L ./fake_libs"
 cargo build --lib --release
-```
-
-### 2. 打包与自动签名
-```bash
-patchelf --add-needed libc++_shared.so target/release/libbli_rs.so
 bash scripts/package_apk.sh
 ```
 
-### 3. 一键安装并运行
+### 安装
+
 ```bash
-su -c "pm install -r dist/Bli-RS-arm64-v8a.apk && am start -n com.bli.rs/android.app.NativeActivity"
+su -c "pm uninstall com.bli.rs"   # 签名变化时需要先卸载
+su -c "pm install -r dist/Bli-RS-arm64-v8a.apk"
+su -c "am start -n com.bli.rs/android.app.NativeActivity"
+```
+
+### 协议层单独验证
+
+协议层可以脱离 UI 单独跑：
+
+```bash
+cargo test -p bli-protocol                              # 14 个单元测试
+cargo run -p bli-protocol --example probe               # 推荐流探针
+cargo run -p bli-protocol --example playurl_probe       # 播放地址探针
 ```
 
 ---
 
-## 📑 架构决策记录 (ADR)
-详细技术选型、手势与渲染机制详见：  
+## 目录结构
+
+```text
+BLI-RS/
+├── crates/bli-protocol/       # 协议层（零 UI 依赖，可独立测试）
+│   ├── src/api.rs             # 接口常量
+│   ├── src/client.rs          # HTTP 客户端（含 download_bytes）
+│   ├── src/wbi.rs             # Wbi 签名
+│   ├── src/recommend.rs       # 推荐流 + av/bv 转换
+│   ├── src/playurl.rs         # DASH 播放地址 + 轨道选择
+│   └── examples/              # 可在 chroot 里直接跑的探针
+├── src/
+│   ├── lib.rs                 # android_main 入口，各回调接线
+│   ├── feed.rs                # 推荐流桥接（线程模型最复杂的地方）
+│   ├── cover.rs               # 封面下载 + LRU 缓存
+│   ├── player.rs              # 播放编排（cid → playurl → 下载 → 解码）
+│   ├── video_decoder.rs       # MediaExtractor + MediaCodec
+│   ├── video_surface.rs       # JNI 创建 SurfaceView，拿 ANativeWindow
+│   ├── video_layer.rs         # ASurfaceControl 封装（暂未使用，见下）
+│   ├── android_window.rs      # JNI 上下文 + Monet 取色 + 手势排除区
+│   └── mxprobe.rs             # 日志出口（__android_log_write）
+├── ui/
+│   ├── theme.slint            # Monet 调色板 + 布局常量
+│   ├── appwindow.slint        # 主容器 + 统一手势层
+│   ├── components/            # topbar / drawer / video_card / icons
+│   └── views/                 # recommend / live / follow
+├── scripts/
+│   ├── build.sh               # 完整构建（推荐入口）
+│   └── package_apk.sh         # aapt2 + zipalign + apksigner
+├── android/                   # AndroidManifest + res（hasCode=false）
+├── fake_libs/                 # 链接器静态桩（绕开 libc++ 静态库）
+├── dist/                      # 输出 APK
+└── docs/adr/                  # 架构决策记录
+```
+
+---
+
+## 已知的未完成 / 待改进
+
+**`src/video_layer.rs` 目前是死代码。**
+它封装了 `ASurfaceControl`（可以在窗口下挂独立合成层，理论性能更好），
+但 `AMediaCodec` 没有 `getOutputImage`，拿不到 `AHardwareBuffer`，
+所以没法把解码结果喂给它。现在的方案是 `SurfaceView` + `setOutputSurface`，
+一样是零拷贝，够用。保留这个文件是给以后留条路。
+
+**点击命中测试是算出来的，不是 Slint 给的。**
+`RecommendView::tap_at()` 用行列公式反推点中了哪张卡。
+卡片布局改了（比如加入更多元素、不同行高）就要同步改这个函数。
+
+**下载是整段拉，不是流式。**
+77MB 一个视频要下 70 秒才能开始播。真正的做法是自己解析 `moof`
+并按 Range 分段请求，边下边解。这是下一步该优化的点。
+
+**音频还没接。**
+现在只有画面没声音。
+
+---
+
+## 上游参考
+
+- **本地源码**：`/data/data/com.termux/files/home/projects/PiliPlus`
+- **GitHub**：[PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus)（Flutter 实现）
+- **协议参考**：[bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)
+
+映射关系：
+
+| 我们 | 上游 |
+|---|---|
+| `crates/bli-protocol/src/wbi.rs` | `lib/utils/wbi_sign.dart` |
+| `crates/bli-protocol/src/recommend.rs` | `lib/http/video.dart` + `lib/models/home/rcmd/result.dart` |
+| `crates/bli-protocol/src/playurl.rs` | `lib/http/video.dart` + `lib/models/video/play/url.dart` |
+| `src/player.rs` 播放编排 | `lib/pages/video/controller.dart` |
+
+---
+
+## 架构决策记录
+
 👉 [ADR-0001: 架构设计决策记录](docs/adr/ADR-0001-architecture-design.md)
