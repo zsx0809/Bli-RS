@@ -642,7 +642,7 @@ fn start_playback(
                 ready_sent = ready_sent || start_size > 0;
 
                 match res {
-                    Ok(()) => {
+                    Ok(_written) => {
                         let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
                         crate::mxprobe::log_public(&format!(
                             "[下载] 完成 {:.1} MB",
