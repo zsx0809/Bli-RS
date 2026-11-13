@@ -338,6 +338,7 @@ export component AppWindow inherits Window {
                 has_more: root.has_more;
                 loading_more: root.loading_more;
                 more_error: root.more_error;
+                refresh => { root.refresh_feed(); }
                 video_selected(bvid) => { root.play_video(bvid); }
                 video_long_pressed(bvid) => { root.video_long_pressed(bvid); }
                 load_more => { root.load_more(); }

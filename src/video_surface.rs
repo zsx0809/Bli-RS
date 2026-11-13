@@ -174,57 +174,56 @@ mod imp {
         }
         let holder = holder.ok()?;
 
-        // SurfaceHolder.getSurface() 是**接口方法**。
-        // jni crate 的 call_method 用对象实际类（SurfaceView$1）去 GetMethodID，
-        // 而 GetMethodID 不会往接口里找 → NoSuchMethodError。
-        //
-        // 解决办法：用 CallObjectMethod 的等价物 —— 先拿到接口的 Class，
-        // 在接口类上 GetMethodID，再对实现类实例调用。
-        // jni 0.21 没有直接暴露"在指定类上查方法"的便利函数，
-        // 所以走反射：SurfaceHolder.class.getMethod("getSurface").invoke(holder)
+        // 尝试从 SurfaceHolder 拿到 Surface：
+        // 优先标准 JNI 接口方法直接调用（微秒级），反射作为兜底
         let surface = (|| -> Option<JObject> {
-            let holder_cls = env
-                .find_class("android/view/SurfaceHolder")
-                .ok()?;
+            // 路径 A: 标准 JNI 接口虚方法派发
+            if let Ok(holder_cls) = env.find_class("android/view/SurfaceHolder") {
+                if let Ok(mid) = env.get_method_id(&holder_cls, "getSurface", "()Landroid/view/Surface;") {
+                    unsafe {
+                        let res = env.call_method_unchecked(&holder, mid, jni::signature::ReturnType::Object, &[]);
+                        if let Ok(val) = res {
+                            if let Ok(obj) = val.l() {
+                                if !obj.is_null() {
+                                    return Some(obj);
+                                }
+                            }
+                        }
+                    }
+                    let _ = env.exception_clear();
+                }
+            }
 
-            // Class.getMethod(String, Class[])
+            // 路径 B: Java 反射兜底
+            let holder_cls = env.find_class("android/view/SurfaceHolder").ok()?;
             let name = env.new_string("getSurface").ok()?;
-            let empty = env
-                .new_object_array(0, "java/lang/Class", JObject::null())
-                .ok()?;
-
             let method = env
                 .call_method(
                     &holder_cls,
                     "getMethod",
                     "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-                    &[JValue::Object(&name), JValue::Object(&empty)],
+                    &[JValue::Object(&name), JValue::Object(&JObject::null())],
                 )
                 .and_then(|v| v.l())
-                .ok()?;
-
-            let args = env
-                .new_object_array(0, "java/lang/Object", JObject::null())
                 .ok()?;
 
             env.call_method(
                 &method,
                 "invoke",
                 "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
-                &[JValue::Object(&holder), JValue::Object(&args)],
+                &[JValue::Object(&holder), JValue::Object(&JObject::null())],
             )
             .and_then(|v| v.l())
             .ok()
         })();
 
         if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_describe();
             let _ = env.exception_clear();
-            crate::mxprobe::log_public("getSurface 反射调用失败");
+            crate::mxprobe::log_public("getSurface 获取失败");
             return None;
         }
         let Some(surface) = surface else {
-            crate::mxprobe::log_public("getSurface 反射返回 None");
+            crate::mxprobe::log_public("getSurface 返回 None");
             return None;
         };
         if surface.is_null() {
@@ -427,9 +426,11 @@ pub fn run_on_ui_thread<F: FnOnce() + Send + 'static>(f: F) {
 pub fn setup_on_main_thread() -> bool {
     #[cfg(target_os = "android")]
     {
-        // 防重复创建
+        // 若已存在，恢复可见性并设置默认 16:9 尺寸，确保 Surface 能被窗口系统及时创建
         if imp::surface_view_exists() {
-            crate::mxprobe::log_public("SurfaceView 已存在，跳过");
+            crate::mxprobe::log_public("SurfaceView 已存在，重置可见与布局");
+            imp::set_visible(true);
+            imp::update_adaptive_layout(false);
             return true;
         }
 
@@ -441,6 +442,9 @@ pub fn setup_on_main_thread() -> bool {
         let raw = vm.get_java_vm_pointer();
         let ok = create(raw.cast(), std::ptr::null_mut());
         crate::mxprobe::log_public(&format!("create -> {ok}"));
+        if ok {
+            imp::set_visible(true);
+        }
         ok
     }
     #[cfg(not(target_os = "android"))]

@@ -58,6 +58,7 @@ export component RecommendView inherits Rectangle {
     callback video_selected(string);
     callback video_long_pressed(string);
     callback load_more();
+    callback refresh();
 
     /// 横向拖动交给外层切频道
     callback swipe_horizontal(length, length);
@@ -73,6 +74,17 @@ export component RecommendView inherits Rectangle {
     property <PanAxis> active_axis: PanAxis.None;
     // 触底加载的节流标志 —— 避免每个像素都往 Rust 侧抛一次 load_more
     property <bool> more_requested: false;
+
+    // 下拉刷新状态
+    property <length> pull_distance: 0px;
+    property <length> refresh_threshold: 54px;
+    property <bool> is_refreshing: false;
+
+    changed feed_state => {
+        if (root.feed_state != 1) {
+            root.is_refreshing = false;
+        }
+    }
 
     out property <length> content_h: body.preferred-height + Spacing.page_margin + 32px;
     out property <length> max_scroll: Math.max(0px, root.content_h - root.height);
@@ -105,9 +117,16 @@ export component RecommendView inherits Rectangle {
 
     function pan_move(dx: length, dy: length) {
         if (root.active_axis == PanAxis.Vertical) {
-            // 手指上滑(dy 为负) → 内容上移 → scroll_y 增加
+            // 手指上滑(dy 为负) → 内容上移 → scroll_y 增加；手指下滑(dy 为正) → 下拉刷新
             let target = root.drag_base - dy;
-            root.scroll_y = Math.max(0px, Math.min(root.max_scroll, target));
+            if (target < 0px) {
+                let overscroll = -target;
+                root.pull_distance = Math.min(96px, overscroll * 0.45);
+                root.scroll_y = 0px;
+            } else {
+                root.pull_distance = 0px;
+                root.scroll_y = Math.max(0px, Math.min(root.max_scroll, target));
+            }
         } else if (root.active_axis == PanAxis.Horizontal) {
             root.swipe_horizontal(dx, dy);
         }
@@ -115,6 +134,12 @@ export component RecommendView inherits Rectangle {
 
     function pan_end(dx: length, dy: length, vx: length, vy: length) {
         if (root.active_axis == PanAxis.Vertical) {
+            if (root.pull_distance >= root.refresh_threshold) {
+                root.is_refreshing = true;
+                root.refresh();
+            }
+            root.pull_distance = 0px;
+
             // 针对 120Hz 高刷新率屏幕调优：高刷下 move 采样频率翻倍，单个采样 vy 较小
             let v = -vy;
             let scaled_v = v * 1.6;
@@ -139,6 +164,7 @@ export component RecommendView inherits Rectangle {
         if (root.active_axis == PanAxis.Horizontal) {
             root.swipe_horizontal_cancel();
         }
+        root.pull_distance = 0px;
         root.fling_vel = 0px;
         root.active_axis = PanAxis.None;
     }
@@ -210,7 +236,11 @@ export component RecommendView inherits Rectangle {
     content_layer := Rectangle {
         width: parent.width;
         height: Math.max(parent.height, root.content_h);
-        y: -root.scroll_y;
+        y: root.pull_distance - root.scroll_y;
+        animate y {
+            duration: (root.active_axis == PanAxis.None) ? 200ms : 0ms;
+            easing: ease-out;
+        }
 
         body := VerticalLayout {
             width: parent.width;
@@ -322,6 +352,37 @@ export component RecommendView inherits Rectangle {
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
+            }
+        }
+    }
+
+    // 下拉刷新指示器胶囊
+    pull_indicator := Rectangle {
+        y: root.pull_distance > 0px ? (root.pull_distance - 42px) : -60px;
+        x: (parent.width - self.width) / 2;
+        width: 130px;
+        height: 32px;
+        border-radius: 16px;
+        background: Theme.surface_container_high;
+        opacity: (root.pull_distance > 12px || root.is_refreshing) ? 1.0 : 0.0;
+        animate y {
+            duration: (root.active_axis == PanAxis.None) ? 200ms : 0ms;
+            easing: ease-out;
+        }
+        animate opacity { duration: 150ms; }
+
+        HorizontalLayout {
+            alignment: center;
+
+            Text {
+                text: root.is_refreshing
+                    ? "正在刷新…"
+                    : (root.pull_distance >= root.refresh_threshold ? "释放立即刷新" : "下拉刷新");
+                color: Theme.primary;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-alignment: center;
             }
         }
     }

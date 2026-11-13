@@ -101,9 +101,11 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         w.set_video_comments(ModelRc::new(Rc::new(VecModel::default())));
     });
 
-    // 2. 准备 SurfaceView
+    // 2. 准备 SurfaceView 并立即确保其可见且具备有效尺寸（杜绝 Surface 未分配与 isValid=false）
     crate::video_surface::run_on_ui_thread(|| {
         crate::video_surface::setup_on_main_thread();
+        crate::video_surface::set_visible(true);
+        crate::video_surface::set_adaptive_layout(false);
     });
 
     // 3. 后台请求与播放编排
@@ -450,11 +452,14 @@ async fn download_raw_image(url: &str) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 fn wait_surface() -> Option<*mut std::ffi::c_void> {
-    for _ in 0..30 {
+    for i in 0..50 {
         if let Some(s) = crate::video_surface::acquire_native_window() {
             return Some(s);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if i == 5 || i == 15 || i == 25 {
+            crate::video_surface::set_visible(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
     None
 }
