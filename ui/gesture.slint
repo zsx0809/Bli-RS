@@ -46,7 +46,7 @@ export component GestureArea inherits TouchArea {
 
     /// 主轴判定比例：横向位移必须大于纵向的这么多倍才算横滑。
     /// 偏保守（>1）：宁可判成纵向，因为纵向滚动的使用频率远高于横滑。
-    in property <real> axis_ratio: 1.25;
+    in property <float> axis_ratio: 1.25;
 
     /// 是否启用长按（阈值固定 500ms —— Timer.interval 不接受非常量绑定）
     in property <bool> long_enabled: false;

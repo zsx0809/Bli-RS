@@ -224,9 +224,13 @@ export component AppWindow inherits Window {
     }
 
     function finish_swipe(dx: length, vx: length) {
-        // 位移过半，或甩得够快 → 切页
+        // 位移过半，或甩得够快 → 切页。
+        //
+        // vx 是「每帧位移」，不能直接乘一个 length（会变成 px²）。
+        // 这里当成一个倍数：一帧位移 ≈ 一屏的 15% 就当甩到位。
         let threshold = page_area.width * 0.26;
-        let effective = dx + vx * 80px;
+        let fling_boost = (vx / 1px) * (page_area.width / 1px) * 0.15px;
+        let effective = dx + fling_boost;
 
         if (effective < -threshold && root.tab_index < root.page_count - 1) {
             root.go_tab_animated(root.tab_index + 1);
