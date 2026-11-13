@@ -104,20 +104,57 @@ def watch(owner, repo, token, run_id, timeout=1800):
     sys.exit("[!] 等待超时")
 
 
+def _download_follow(url, token, timeout=180):
+    """下载会 302 到预签名 URL 的资源。
+
+    关键点：预签名地址（objects.githubusercontent.com / S3）**不能**带
+    Authorization 头，多带会被判签名不匹配返回 401 InvalidAuthenticationInfo。
+    urllib 默认会把自定义头带到重定向目标，所以这里手动跟跳转，
+    只在 api.github.com 那一跳带 token。
+    """
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    for _ in range(6):
+        req = urllib.request.Request(url)
+        if "api.github.com" in url:
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Accept", "application/vnd.github+json")
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                url = e.headers["Location"]
+                continue
+            raise
+    raise RuntimeError("重定向次数过多")
+
+
 def fetch_logs(owner, repo, token, run_id):
     """拉取失败日志并打屏 tail"""
     jobs = api(f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", token)
     log_all = []
     for job in jobs.get("jobs", []):
-        if job.get("conclusion") not in ("failure", "cancelled"):
+        # 只要这一步/整个 job 有失败就拉，不限于 conclusion == failure，
+        # 因为有时候 job 因 step 失败而中断，conclusion 不是 "failure"。
+        failed_steps = [s["name"] for s in job.get("steps", [])
+                        if s.get("conclusion") == "failure"]
+        if job.get("conclusion") != "failure" and not failed_steps:
             continue
         try:
-            raw = api(f"/repos/{owner}/{repo}/actions/jobs/{job['id']}/logs",
-                      token, raw=True)
-            text = raw.decode("utf-8", "replace")
-        except SystemExit:
+            text = _download_follow(
+                f"{API}/repos/{owner}/{repo}/actions/jobs/{job['id']}/logs",
+                token).decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] 拉取 job {job['id']} 日志失败: {e}")
             continue
-        log_all.append(f"===== JOB: {job['name']} ({job['conclusion']}) =====")
+        log_all.append(f"===== JOB: {job['name']} ({job.get('conclusion')}) =====")
+        if failed_steps:
+            log_all.append(f"失败步骤: {', '.join(failed_steps)}")
         log_all.append(text)
 
     if not log_all:
@@ -163,29 +200,11 @@ def download_apk(owner, repo, token, run_id):
     # 多带一个头反而被 S3 判为签名不匹配返回 401。
     # urllib 默认会把自定义头原样带到重定向目标，所以这里自己跟跳转，
     # 只在第一跳（api.github.com）带 token。
-    url = art["archive_download_url"]
-    for _ in range(5):
-        req = urllib.request.Request(url)
-        if "api.github.com" in url:
-            req.add_header("Authorization", f"Bearer {token}")
-            req.add_header("Accept", "application/vnd.github+json")
-
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **kw):
-                return None
-
-        opener = urllib.request.build_opener(NoRedirect)
-        try:
-            with opener.open(req, timeout=300) as r:
-                zip_path.write_bytes(r.read())
-                break
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                url = e.headers["Location"]
-                continue
-            sys.exit(f"[!] 下载 artifact 失败: {e.code} {e.reason}")
-    else:
-        sys.exit("[!] artifact 下载重定向次数过多")
+    try:
+        zip_path.write_bytes(
+            _download_follow(art["archive_download_url"], token, timeout=300))
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"[!] 下载 artifact 失败: {e}")
 
     apk_path = DIST / "Bli-RS-arm64-v8a.apk"
     with zipfile.ZipFile(zip_path) as z:

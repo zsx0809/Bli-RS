@@ -19,7 +19,7 @@
 // ==============================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ndk::media::media_codec::{
