@@ -246,6 +246,52 @@ mod imp {
         .unwrap_or(2.0)
     }
 
+    /// 让 Activity 的窗口表面带 alpha 通道（TRANSLUCENT）。
+    ///
+    /// 为什么必须在运行时做，而不是只靠 XML 主题：
+    ///   `android:windowIsTranslucent` 是**创建窗口时**读取的属性。
+    ///   我们用的是 `android.app.NativeActivity`（hasCode=false，没有
+    ///   setContentView 的时机），主题属性在 android-activity 把
+    ///   Surface 交给我们之前就已经定型，改 XML 只在全新 task 启动时才生效，
+    ///   热重启 / 从最近任务恢复时经常拿到不透明的那套配置。
+    ///
+    ///   直接调 Window.setFormat(PixelFormat.TRANSLUCENT) 是可靠的那一条：
+    ///   它在窗口已存在时仍会让 SurfaceFlinger 把该层标记为半透明，
+    ///   EGL 侧随之选到带 ALPHA_SIZE 的 config。
+    ///
+    /// 注意顺序：必须在 EGL surface 创建**之前**调用。
+    ///   Slint 的 android 后端在收到 InitWindow 事件时才 set_window_handle，
+    ///   而 android_main 一进来就在它之前，所以放在 init() 里正合适。
+    pub fn set_translucent_window() -> bool {
+        with_env(|env, activity| {
+            let Ok(window) = env
+                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])
+                .and_then(|v| v.l())
+            else {
+                return false;
+            };
+
+            // PixelFormat.TRANSLUCENT = -3
+            //   （TRANSPARENT=-1 是全透明不合成，TRANSLUCENT=-3 才是
+            //     "有 alpha、要正常参与合成"，我们要的是后者。）
+            const PIXEL_FORMAT_TRANSLUCENT: i32 = -3;
+            let r = env.call_method(
+                &window,
+                "setFormat",
+                "(I)V",
+                &[JValue::Int(PIXEL_FORMAT_TRANSLUCENT)],
+            );
+
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+                return false;
+            }
+            r.is_ok()
+        })
+        .unwrap_or(false)
+    }
+
     /// 设置排除区：左右两侧各 width_dp 宽、全高的竖带（同时拦截左右边缘侧滑返回给 App）
     pub fn set_exclusion(width_dp: i32, enable: bool) -> bool {
         with_env(|env, activity| {
@@ -368,7 +414,7 @@ mod imp {
 }
 
 #[cfg(target_os = "android")]
-pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, status_bar_height_px};
+pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, set_translucent_window, status_bar_height_px};
 
 /// 非 Android 平台（桌面调试）为空实现
 #[cfg(not(target_os = "android"))]
@@ -381,6 +427,11 @@ pub fn cache_dir() -> Option<String> {
 
 #[cfg(not(target_os = "android"))]
 pub fn set_exclusion(_width_dp: i32, _enable: bool) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_translucent_window() -> bool {
     false
 }
 

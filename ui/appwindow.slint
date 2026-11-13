@@ -89,7 +89,20 @@ export component AppWindow inherits Window {
 
     preferred-width: 390px;
     preferred-height: 844px;
-    background: Theme.background;
+
+    // 根背景：二级详情页必须是 transparent，其余保持不透明。
+    //
+    // 为什么（会直接影响能不能看见视频）：
+    //   视频是原生 SurfaceView，位于 Slint 窗口表面**下方**（z=-2）。
+    //   Slint 的窗口表面是 TRANSLUCENT 的，只要它画出来的像素在这块区域
+    //   是透明的，就会直接透出下层视频。
+    //   而 AppWindow 的根 background 铺满整屏 —— 若二级页也填
+    //   Theme.background（不透明），视频会被这层纯色彻底盖死，
+    //   表现正是"解码成功、首帧已送显、屏幕全黑"。
+    //
+    //   详情页里除播放区以外的部分（Tab 栏、内容区）各自都有不透明背景，
+    //   所以把根放开透明只会露出播放区的视频，不会漏底。
+    background: root.app_mode == 1 ? transparent : Theme.background;
 
     // --------------------------------------------------------------------------
     // 状态
@@ -162,6 +175,10 @@ export component AppWindow inherits Window {
     callback clear_log();
 
     callback exit_detail_view();
+    callback player_seek(float);
+    callback player_brightness(float);
+    callback player_volume(float);
+    callback player_toggle_play();
     callback toggle_like();
     callback toggle_coin();
     callback toggle_fav();
@@ -380,6 +397,12 @@ export component AppWindow inherits Window {
         coin_clicked => { root.toggle_coin(); }
         fav_clicked => { root.toggle_fav(); }
         related_selected(bvid) => { root.play_video(bvid); }
+
+        // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
+        seek_to(frac) => { root.player_seek(frac); }
+        set_brightness(v) => { root.player_brightness(v); }
+        set_volume(v) => { root.player_volume(v); }
+        toggle_play => { root.player_toggle_play(); }
     }
 
     // --------------------------------------------------------------------------

@@ -68,7 +68,26 @@ export component VideoDetailView inherits Rectangle {
     callback follow_clicked();
     callback related_selected(string);
 
-    background: Theme.background;
+    // 详情页根背景必须透明：整个组件是 100% 铺满 AppWindow 的，
+    // 如果这里填不透明色，播放区的视频（下层 SurfaceView）就看不见了。
+    // 需要实底的部分（Tab 栏 / 内容区 / 状态栏占位）各自单独填色。
+    background: transparent;
+
+    // ----------------------------------------------------------------------
+    // 播放区几何
+    //
+    // 上一版曾把返回键/日志按钮挪到视频**上方**单独一条控制条，理由是
+    // "视频层盖住一切，浮层画不出来"。那个理由在当时的实现下成立，但
+    // 那个实现本身是错的 —— 它把 SurfaceView 顶到 z=0 去了。
+    //
+    // 现在架构反过来了（见 src/video_surface.rs 的长注释）：
+    //   · 视频 SurfaceView 留在下层 z=-2
+    //   · Slint 窗口表面是 TRANSLUCENT，整层透明地盖在最上面
+    // 于是播放区里可以**正常画任何东西**，透明处直接透出视频。
+    //
+    // 所以播放区恢复成"从头到底一整块"，浮层控件全都叠在里面，
+    // 和 PiliPlus / B 站客户端的视觉一致。
+    // ----------------------------------------------------------------------
 
     // 播放器动态高度：竖屏 45% 视口（自适应高度，绝不过度压盖 UI），横屏 16:9
     out property <length> player_height: root.detail.is_vertical
@@ -76,6 +95,51 @@ export component VideoDetailView inherits Rectangle {
         : (root.width * 9 / 16);
 
     property <length> tabbar_h: 46px;
+
+    // ----------------------------------------------------------------------
+    // 播放器交互状态（浮层控制条 + 手势反馈）
+    //
+    // 全部是纯 UI 状态，先让交互跑通、可看、可测；
+    // 真正的 seek / 调亮度 / 调音量由 Rust 侧接回调实现（见文件底部 callback）。
+    // ----------------------------------------------------------------------
+    in-out property <bool> controls_visible: true;
+
+    /// 手势中的浮层提示：none / brightness / volume / seek
+    in-out property <string> hud_mode: "";
+
+    /// 0.0 ~ 1.0
+    in-out property <float> brightness: 1.0;
+    /// 0.0 ~ 1.0
+    in-out property <float> volume: 0.6;
+
+    /// 进度：0.0 ~ 1.0
+    in-out property <float> progress: 0.0;
+    /// 拖动进度时的预览值（负数表示不在拖动）
+    in-out property <float> seek_preview: -1.0;
+
+    /// 时长文案
+    in property <string> time_total: "00:00";
+    in property <string> time_current: "00:00";
+
+    property <float> hud_value: root.hud_mode == "brightness" ? root.brightness
+        : root.hud_mode == "volume" ? root.volume
+        : 0.0;
+
+    callback seek_to(float);
+    callback set_brightness(float);
+    callback set_volume(float);
+    callback toggle_play();
+
+    // 手势起点快照（避免累积误差）
+    property <float> gesture_base_value: 0.0;
+    property <float> gesture_base_progress: 0.0;
+
+    // 控制条自动隐藏
+    controls_timer := Timer {
+        interval: 4s;
+        running: root.controls_visible && root.hud_mode == "" && root.detail.is_ready;
+        triggered => { root.controls_visible = false; }
+    }
 
     // ----------------------------------------------------------------------
     // 滚动状态
@@ -216,14 +280,26 @@ export component VideoDetailView inherits Rectangle {
     }
 
     // ----------------------------------------------------------------------
-    // 顶部播放视口
+    // 顶部播放视口（浮层容器）
+    //
+    // 图层顺序（关键，别改乱）：
+    //   下面 = SurfaceView（MediaCodec 零拷贝输出，z=-2）
+    //   上面 = 这一个 Rectangle 及其全部子元素（Slint 透明窗口层）
+    //
+    // 所以这里的 background 必须是 **transparent**：
+    //   填黑色会把视频整个挡住，表现就是"解码成功、首帧已送显，屏幕全黑"。
+    //   需要黑底时由下层 windowBackground（@android:color/black）提供。
+    //
+    // 因为 UI 在最上层，播放区内可以自由绘制：
+    //   封面占位、加载态、错误态、返回键、日志、以及后续的控制条 /
+    //   亮度音量指示 / 快进快退反馈 / 全屏按钮。
     // ----------------------------------------------------------------------
     player_box := Rectangle {
         x: 0px;
         y: root.safe_top;
         width: root.width;
         height: root.player_height;
-        background: #000000;
+        background: transparent;
         clip: true;
 
         Image {
@@ -233,6 +309,262 @@ export component VideoDetailView inherits Rectangle {
             image-fit: cover;
             opacity: root.detail.is_ready ? 0 : 1;
             animate opacity { duration: 240ms; }
+        }
+
+        // ==================================================================
+        // 播放手势层
+        //
+        // 整块播放区都能起手，判定规则（与 B 站 / PiliPlus 一致）：
+        //   轻触          → 切换控制条显隐
+        //   左半屏纵滑    → 亮度（向上增亮）
+        //   右半屏纵滑    → 音量（向上增大）
+        //   任意横向滑    → 快进 / 快退
+        //
+        // 之所以能这么做，是因为 Slint 的 UI 层现在**在视频之上**：
+        // SurfaceView 默认不消费触摸事件，事件照常落到这一层。
+        // ==================================================================
+        player_gesture := GestureArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            tap_slop: 6px;
+            axis_ratio: 1.0;
+            // 播放区不是列表，底部保护会让下缘手势失效，这里关掉
+            respect_system_gesture: false;
+
+            tap(x, y) => {
+                root.controls_visible = !root.controls_visible;
+                if (root.controls_visible) {
+                    controls_timer.restart();
+                }
+            }
+
+            pan_started(axis) => {
+                root.gesture_base_value = 0.0;
+                root.gesture_base_progress = root.progress;
+            }
+
+            pan_moved(dx, dy) => {
+                let vw = parent.width / 1px;
+                let vh = parent.height / 1px;
+
+                if (self.current_axis == PanAxis.Horizontal) {
+                    // 横向：快进快退，整条播放区宽度 = 全片时长
+                    if (root.hud_mode != "seek") {
+                        root.hud_mode = "seek";
+                        root.controls_visible = true;
+                    }
+                    let delta = (dx / 1px) / vw;
+                    let np = Math.max(0.0, Math.min(1.0, root.gesture_base_progress + delta));
+                    root.seek_preview = np;
+                } else if (self.current_axis == PanAxis.Vertical) {
+                    // 纵向：左半边亮度，右半边音量。改动量按高度归一化
+                    let is_left = (self.origin_x / 1px) < vw / 2;
+                    if (root.hud_mode == "" || root.hud_mode == "seek") {
+                        root.hud_mode = is_left ? "brightness" : "volume";
+                        root.gesture_base_value = is_left ? root.brightness : root.volume;
+                    }
+                    // 向上为增加：dy 为负 → 增值
+                    let delta = -(dy / 1px) / vh * 1.4;
+                    let base = root.gesture_base_value;
+                    let nv = Math.max(0.0, Math.min(1.0, base + delta));
+                    if (root.hud_mode == "brightness") {
+                        root.brightness = nv;
+                        root.set_brightness(nv);
+                    } else {
+                        root.volume = nv;
+                        root.set_volume(nv);
+                    }
+                }
+            }
+
+            pan_finished(dx, dy, vx, vy) => {
+                if (root.hud_mode == "seek" && root.seek_preview >= 0.0) {
+                    root.progress = root.seek_preview;
+                    root.seek_to(root.seek_preview);
+                }
+                root.seek_preview = -1.0;
+                root.hud_mode = "";
+                controls_timer.restart();
+            }
+
+            pan_cancelled => {
+                root.seek_preview = -1.0;
+                root.hud_mode = "";
+            }
+        }
+
+        // ==================================================================
+        // 手势 HUD：亮度 / 音量 / 进度
+        //
+        // 画在正中偏上，半透明圆角块，1.2 秒后随 hud_mode 清空自动消失。
+        // ==================================================================
+        if root.hud_mode != "" : Rectangle {
+            width: 176px;
+            height: root.hud_mode == "seek" ? 74px : 56px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2 - 24px;
+            background: #000000cc;
+            border-radius: 14px;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    text: root.hud_mode == "brightness" ? "亮度"
+                        : root.hud_mode == "volume" ? "音量"
+                        : "进度";
+                    color: #ffffffcc;
+                    font-size: 11px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                // 进度条 / 竖直指示
+                Rectangle {
+                    width: parent.width;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: #ffffff33;
+
+                    Rectangle {
+                        width: parent.width * (root.hud_mode == "seek"
+                            ? (root.seek_preview >= 0.0 ? root.seek_preview : root.progress)
+                            : root.hud_value);
+                        height: parent.height;
+                        border-radius: 2px;
+                        background: Theme.primary;
+                    }
+                }
+
+                if root.hud_mode == "seek" : Text {
+                    text: root.seek_preview >= 0.0
+                        ? Math.round(root.seek_preview * 100) + "%"
+                        : Math.round(root.progress * 100) + "%";
+                    color: #ffffff;
+                    font-size: 12px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // ==================================================================
+        // 浮层控制条（点击播放区显隐）
+        // ==================================================================
+        if root.controls_visible && root.detail.load_error == "" : Rectangle {
+            x: 0px;
+            y: parent.height - self.height;
+            width: parent.width;
+            height: 78px;
+            background: #000000a8;
+
+            // 进度条
+            progress_bar := GestureArea {
+                property <float> bar_frac: root.seek_preview >= 0.0 ? root.seek_preview : root.progress;
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                height: 22px;
+                tap_slop: 4px;
+                axis_ratio: 2.0;
+                vertical_enabled: false;
+                respect_system_gesture: false;
+
+                tap(px, py) => {
+                    let frac = Math.max(0.0, Math.min(1.0, (px / 1px) / (self.width / 1px)));
+                    root.progress = frac;
+                    root.seek_to(frac);
+                }
+
+                pan_started(axis) => {
+                    root.gesture_base_progress = root.progress;
+                    root.hud_mode = "seek";
+                }
+                pan_moved(dx, dy) => {
+                    let base = Math.max(0.0, Math.min(1.0,
+                        root.gesture_base_progress + (dx / 1px) / (self.width / 1px)));
+                    root.seek_preview = base;
+                }
+                pan_finished(dx, dy, vx, vy) => {
+                    if (root.seek_preview >= 0.0) {
+                        root.progress = root.seek_preview;
+                        root.seek_to(root.seek_preview);
+                    }
+                    root.seek_preview = -1.0;
+                    root.hud_mode = "";
+                }
+                pan_cancelled => {
+                    root.seek_preview = -1.0;
+                    root.hud_mode = "";
+                }
+
+                // 轨道
+                Rectangle {
+                    y: (parent.height - 3px) / 2;
+                    width: parent.width;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: #ffffff40;
+
+                    // 已播放
+                    Rectangle {
+                        width: parent.width * progress_bar.bar_frac;
+                        height: parent.height;
+                        border-radius: 1.5px;
+                        background: Theme.primary;
+                    }
+                }
+
+                // 拖动手柄
+                Rectangle {
+                    x: parent.width * progress_bar.bar_frac - self.width / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: Theme.primary;
+                }
+            }
+
+            // 底部一行：播放/暂停 + 时间
+            HorizontalLayout {
+                x: 12px;
+                y: parent.height - 40px;
+                width: parent.width - 24px;
+                height: 32px;
+                spacing: 10px;
+                alignment: start;
+
+                play_btn := GestureArea {
+                    width: 32px;
+                    height: 32px;
+                    tap(x, y) => { root.toggle_play(); }
+                    Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+                        border-radius: 16px;
+                        background: play_btn.pressed ? #ffffff33 : #ffffff1a;
+                        Text {
+                            text: "▶";
+                            color: #ffffff;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.time_current + " / " + root.time_total;
+                    color: #ffffffcc;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
         }
 
         // 加载中 / 失败。
@@ -313,38 +645,12 @@ export component VideoDetailView inherits Rectangle {
             }
         }
 
-        // 常驻日志入口：右上角半透明胶囊按钮
-        log_btn := Rectangle {
-            x: parent.width - self.width - 12px;
-            y: 12px;
-            width: 72px;
-            height: 30px;
-            border-radius: 15px;
-            background: #00000088;
-
-            HorizontalLayout {
-                alignment: center;
-                Text {
-                    text: "📋 日志";
-                    color: #ffffff;
-                    font-size: 12px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-
-            TouchArea {
-                clicked => {
-                    root.show_log_dialog = !root.show_log_dialog;
-                    if (root.show_log_dialog) {
-                        root.refresh_log_clicked();
-                    }
-                }
-            }
-        }
-
-        // 返回键：48px 命中区，视觉 32px 圆，位于播放视口左上角
+        // ------------------------------------------------------------------
+        // 常驻浮层：返回键（左上）+ 日志（右上）
+        //
+        // 这两个曾经被挪出去过，因为当时视频层压在窗口上面（z=0）。
+        // 现在图层反过来了，浮层恢复正常工作。
+        // ------------------------------------------------------------------
         back_btn := GestureArea {
             x: 6px;
             y: 6px;
@@ -367,6 +673,36 @@ export component VideoDetailView inherits Rectangle {
                     y: 4px;
                     size: 24px;
                     tint: #ffffff;
+                }
+            }
+        }
+
+        log_btn := GestureArea {
+            x: parent.width - self.width - 12px;
+            y: 12px;
+            width: 72px;
+            height: 30px;
+
+            tap(x, y) => {
+                root.show_log_dialog = !root.show_log_dialog;
+                if (root.show_log_dialog) {
+                    root.refresh_log_clicked();
+                }
+            }
+
+            Rectangle {
+                width: parent.width;
+                height: parent.height;
+                border-radius: 15px;
+                background: log_btn.pressed ? #000000AA : #00000088;
+
+                Text {
+                    text: "日志";
+                    color: #ffffff;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

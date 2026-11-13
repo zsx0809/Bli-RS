@@ -70,6 +70,10 @@ struct RawComment {
 /// 唯一出路是手动返回，体感就是"点了一下没反应，然后自己跳了下一个视频"。
 fn report_fail(window: &slint::Weak<AppWindow>, msg: String) {
     crate::mxprobe::log_public(&format!("[播放失败] {msg}"));
+    // 视频层是窗口表面之上的独立图层，盖着的时候播放区里什么都看不见。
+    // 失败时把它调全透明，否则用户只会看到一块黑，读不到下面这段错误文案。
+    // （set_visible(false) 走的是 alpha=0，不是 INVISIBLE —— Surface 不会被销毁。）
+    crate::video_surface::set_visible(false);
     let _ = window.upgrade_in_event_loop(move |w| {
         let mut d = w.get_current_detail();
         d.is_ready = false;
@@ -82,6 +86,13 @@ fn report_fail(window: &slint::Weak<AppWindow>, msg: String) {
 pub fn stop_play() {
     PLAY_SESSION.fetch_add(1, Ordering::SeqCst);
     stop_current();
+    // 用 alpha=0 隐藏，不销毁 Surface。
+    // 曾经这里走 INVISIBLE，结果返回后再进下一个视频 Surface 再也 attach
+    // 不回来（isValid 恒 false），一路刷到「等待渲染表面超时」。
+    //
+    // 也不要在这里把 View 高度改成 0 来"收起"—— 高度归零同样会让系统
+    // 销毁 Surface，是和 INVISIBLE 一模一样的坑。
+    // 保持原有尺寸、只调 alpha，是唯一能留住 Surface 的做法。
     crate::video_surface::hide_surface();
 }
 
@@ -565,6 +576,161 @@ fn stop_current() {
     if let Ok(mut cur) = CURRENT.lock() {
         if let Some(mut d) = cur.take() {
             d.stop();
+        }
+    }
+}
+
+// ==============================================================================
+// 播放交互：进度 / 亮度 / 音量 / 播放暂停
+//
+// 参数统一是 0.0~1.0 的归一化值，由 UI 手势层算好后回调进来。
+//
+// 当前实现状态（诚实标注，避免下一个人误以为全通）：
+//   · set_brightness / set_volume —— 已完整落地，走系统服务。
+//   · seek_to / toggle_play       —— 只记录并打日志，尚未驱动解码器。
+//     原因：解码循环目前是一次性顺序消费 extractor，没有暂停/跳转状态机。
+//     要做真的 seek，需要在 video_decoder 里引入
+//     「pause 标志 + AMediaExtractor_seekTo + 丢弃到目标 PTS」三件事，
+//     那是独立的一块工作，不放在这次改动里冒充完成。
+// ==============================================================================
+
+/// 把归一化亮度写到窗口（WindowManager.LayoutParams.screenBrightness）。
+///
+/// 为什么用窗口亮度而不是 Settings.System.SCREEN_BRIGHTNESS：
+///   后者要 WRITE_SETTINGS 特殊权限，且会污染用户全局设置。
+///   窗口亮度只作用于本 App 的窗口，退出即失效 —— 这也是所有播放器
+///   （B 站、YouTube、Plex）调亮度的标准做法。
+pub fn set_brightness(v: f32) {
+    #[cfg(target_os = "android")]
+    {
+        let v = v.clamp(0.0, 1.0);
+        let Some(vm) = crate::android_window::java_vm() else { return };
+        let Ok(mut env) = vm.attach_current_thread() else { return };
+        let Some(activity) = crate::android_window::activity_object() else { return };
+
+        // BRIGHTNESS_OVERRIDE_NONE = -1（交还系统控制）
+        // 0.0 ~ 1.0 是窗口亮度覆盖值
+        let target = if v <= 0.005 { 0.0f32 } else { v };
+
+        let Ok(window) = env
+            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
+            .and_then(|r| r.l())
+        else {
+            return;
+        };
+        let Ok(attrs) = env
+            .call_method(&window, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;", &[])
+            .and_then(|r| r.l())
+        else {
+            return;
+        };
+        let _ = env.set_field(&attrs, "screenBrightness", "F", jni::objects::JValue::Float(target));
+        let _ = env.call_method(
+            &window,
+            "setAttributes",
+            "(Landroid/view/WindowManager$LayoutParams;)V",
+            &[jni::objects::JValue::Object(&attrs)],
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = v;
+    }
+}
+
+/// 把归一化音量写到媒体流。
+///
+/// 为什么调 STREAM_MUSIC 而不是 AudioManager 的全局音量索引：
+///   直接用 setStreamVolume 需要 MODIFY_AUDIO_SETTINGS 之外还会干扰
+///   "勿扰模式"下的静音策略。这里把 0~1 映射到该流的 min~max 索引，
+///   交给系统自己处理掩码与静音，行为与用户按音量键一致。
+pub fn set_volume(v: f32) {
+    #[cfg(target_os = "android")]
+    {
+        let v = v.clamp(0.0, 1.0);
+        let Some(vm) = crate::android_window::java_vm() else { return };
+        let Ok(mut env) = vm.attach_current_thread() else { return };
+        let Some(activity) = crate::android_window::activity_object() else { return };
+
+        // STREAM_MUSIC = 3
+        const STREAM_MUSIC: i32 = 3;
+        // FLAG_SHOW_UI = 1（顺带显示系统音量条，用户有双重反馈）
+        const FLAG_SHOW_UI: i32 = 1;
+
+        let Ok(audio_svc) = env.new_string("audio") else { return };
+        let Ok(am) = env
+            .call_method(
+                &activity,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[jni::objects::JValue::Object(&audio_svc)],
+            )
+            .and_then(|r| r.l())
+        else {
+            return;
+        };
+
+        let Ok(max) = env
+            .call_method(&am, "getStreamMaxVolume", "(I)I", &[jni::objects::JValue::Int(STREAM_MUSIC)])
+            .and_then(|r| r.i())
+        else {
+            return;
+        };
+        // getStreamMinVolume 是 API 28+。低版本没有这个方法，
+        // 调用会抛 NoSuchMethodError —— 捕获后按 0 处理即可
+        // （API 26/27 的音乐流最小值本来就是 0）。
+        let min = env
+            .call_method(&am, "getStreamMinVolume", "(I)I", &[jni::objects::JValue::Int(STREAM_MUSIC)])
+            .and_then(|r| r.i())
+            .unwrap_or(0);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+
+        let target = min + ((max - min) as f32 * v).round() as i32;
+        let _ = env.call_method(
+            &am,
+            "setStreamVolume",
+            "(III)V",
+            &[
+                jni::objects::JValue::Int(STREAM_MUSIC),
+                jni::objects::JValue::Int(target),
+                jni::objects::JValue::Int(FLAG_SHOW_UI),
+            ],
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = v;
+    }
+}
+
+/// 跳转到进度（0.0~1.0）。当前仅记录，见文件末尾的说明。
+pub fn seek_to(frac: f32) {
+    crate::mxprobe::log_public(&format!("[Seek] 请求进度 {:.1}%", frac * 100.0));
+    if let Ok(cur) = CURRENT.lock() {
+        if cur.is_some() {
+            // TODO: 需要 video_decoder 暴露 seek(pts_us) 并在解码循环里
+            //       用 AMediaExtractor_seekTo + 丢帧到目标 PTS 实现。
+            crate::mxprobe::log_public("[Seek] 解码器暂不支持跳转（待实现状态机）");
+        }
+    }
+}
+
+/// 播放 / 暂停切换。当前仅记录，见文件末尾的说明。
+pub fn toggle_play() {
+    if let Ok(cur) = CURRENT.lock() {
+        if let Some(dec) = cur.as_ref() {
+            let _ = dec;
+            crate::mxprobe::log_public("[Play] 暂停/继续 —— 解码器尚未暴露该控制");
+        } else {
+            crate::mxprobe::log_public("[Play] 当前没有解码器实例");
         }
     }
 }

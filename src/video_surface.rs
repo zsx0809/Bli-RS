@@ -36,6 +36,8 @@ mod imp {
     /// 我们的 SurfaceView 的全局引用，避免被 Java GC 回收
     static SURFACE_VIEW: OnceLock<GlobalRef> = OnceLock::new();
 
+
+
     /// 创建 SurfaceView 并加进 Activity 的视图树。
     ///
     /// 必须在 UI 线程调用 —— Android 要求 View 的层级操作在主线程。
@@ -78,7 +80,8 @@ mod imp {
             return false;
         };
 
-        // 从 Activity 获取真实 DisplayMetrics 物理像素与状态栏高度，初始限定在 16:9 且让出顶部状态栏空间
+        // 播放区上沿：只让出状态栏。浮层 UI 现在盖在视频上（同一几何区域），
+        // 不再需要额外的控制条留白。
         let status_top = crate::android_window::status_bar_height_px();
         let default_h = (|| {
             let res = env.call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[]).ok()?.l().ok()?;
@@ -114,8 +117,39 @@ mod imp {
             return false;
         }
 
-        // 保持 VISIBLE(0)，但严格局限于顶部 16:9 播放区域，绝不遮盖下方 UI
-        let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
+        // ====================================================================
+        // 图层关系：视频留在**下层**（默认 APPLICATION_MEDIA_SUBLAYER, z=-2）
+        // ====================================================================
+        //
+        // 这里刻意**不**调用 setZOrderOnTop(true)。实测两种极端都不能用：
+        //
+        //   z = -2（默认，当前选择）
+        //     视频在窗口表面下方。只要 Slint 那一层是**不透明**的，视频就
+        //     被整个盖住 —— 这就是"首帧已送显却全黑"的直接原因
+        //     （dumpsys SurfaceFlinger 实测：SurfaceView z=-2，
+        //       window surface 不透明且铺满全屏）。
+        //     解法不是抬 z 序，而是让上层透明，见 android/res/values/strings.xml
+        //     的 AppTheme.Translucent 与下面的 set_translucent_window()。
+        //
+        //   z = 0（setZOrderOnTop）
+        //     视频翻到窗口表面**上方**，于是播放区里画不了任何东西：
+        //     返回键、日志、控制条、亮度/音量指示、手势反馈全部被盖住。
+        //     而这一层后面要承载整套播放 UI 与手势可视化，所以这条路走死。
+        //
+        // 最终架构（"玻璃盖在电视上"）：
+        //
+        //   ┌─ Slint window surface (TRANSLUCENT, 有 alpha) ─┐  ← UI / 手势 / 浮层
+        //   ├─ SurfaceView  (z=-2, MediaCodec 零拷贝输出) ────┤  ← 视频画面
+        //   └─ Activity window (透明背景) ───────────────────┘
+        //
+        //   上层像素透明处 → 直接看到下层视频，不需要 punchHole。
+        //   手势事件照常走 View 树命中测试，SurfaceView 默认不消费触摸，
+        //   所以 Slint 的 GestureArea 全程都在正常工作。
+        //
+        // 断言：如果将来有人为了"看得见视频"又把这行加回来，
+        // 播放区里所有 UI 会立刻集体消失 —— 别加。
+
+let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
 
         let Ok(global) = env.new_global_ref(&sv) else {
             return false;
@@ -279,13 +313,28 @@ mod imp {
         let Some(sv) = SURFACE_VIEW.get() else {
             return;
         };
-        // View.VISIBLE = 0, View.INVISIBLE = 4
-        // 同样不用 GONE，否则隐藏后 Surface 会被销毁，再显示要等重建。
+        // 隐藏策略：绝不落到 INVISIBLE/GONE —— 两者都会让系统
+        // SurfaceHolder 收到 surfaceDestroyed 并销毁 Surface。
+        // 实测：从详情页返回后再进第二个视频，Surface 再也 attach 不回来，
+        // 日志刷满「Surface 已拿到但 isValid=false」直到
+        // 「[播放失败] 等待渲染表面超时」，用户看到的就是黑屏。
+        //
+        // 改为 VISIBLE 但 alpha=0：Surface 保持存活，图层只是全透明。
+        // 代价可以忽略（GPU 合成一个空 buffer），换来的是秒进秒出不再黑。
+        let alpha = if visible { 1.0f32 } else { 0.0f32 };
+        let _ = env.call_method(
+            sv.as_obj(),
+            "setAlpha",
+            "(F)V",
+            &[JValue::Float(alpha)],
+        );
+        // 同时确保 VISIBLE：alpha=0 只在 VISIBLE 时才有意义，
+        // 若之前处于 INVISIBLE 则 alpha 不生效，Surface 依旧是死的。
         let _ = env.call_method(
             sv.as_obj(),
             "setVisibility",
             "(I)V",
-            &[JValue::Int(if visible { 0 } else { 4 })],
+            &[JValue::Int(0)],
         );
     }
 
@@ -334,6 +383,50 @@ mod imp {
         );
     }
 
+    /// 收起视频层：0 高度 + 归零边距，但保持 VISIBLE + alpha=0。
+    ///
+    /// 只改 LayoutParams，不碰 SurfaceHolder —— Surface 必须活到下次播放。
+    pub fn park() {
+        let Some(vm) = android_window::java_vm() else {
+            return;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return;
+        };
+        let Some(sv) = SURFACE_VIEW.get() else {
+            return;
+        };
+
+        // alpha=0 但不 INVISIBLE：View 保留，Surface 保留
+        let _ = env.call_method(
+            sv.as_obj(),
+            "setAlpha",
+            "(F)V",
+            &[JValue::Float(0.0)],
+        );
+
+        let Ok(lp) = env.new_object(
+            "android/widget/FrameLayout$LayoutParams",
+            "(II)V",
+            &[JValue::Int(-1), JValue::Int(0)],
+        ) else {
+            return;
+        };
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(0));
+        let _ = env.call_method(
+            sv.as_obj(),
+            "setLayoutParams",
+            "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&lp)],
+        );
+
+        // 下次 set_adaptive_layout 必须真的写回尺寸，因此清掉去重缓存
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            *lock = None;
+        }
+    }
+
     /// 根据设备真实屏幕尺寸与视频横竖屏，自适应调整 SurfaceView（在主线程运行）
     pub fn update_adaptive_layout(is_vertical: bool) {
         let Some(vm) = android_window::java_vm() else {
@@ -366,9 +459,10 @@ mod imp {
         let width_px = env.get_field(&dm, "widthPixels", "I").map(|v| v.i().unwrap_or(1080)).unwrap_or(1080);
         let height_px = env.get_field(&dm, "heightPixels", "I").map(|v| v.i().unwrap_or(2400)).unwrap_or(2400);
         let density = env.get_field(&dm, "density", "F").map(|v| v.f().unwrap_or(2.0)).unwrap_or(2.0);
+        // 播放区上沿 = 状态栏。与 Slint 的 safe_top 对齐（浮层与视频同区域）。
         let top_px = crate::android_window::status_bar_height_px();
 
-        // 竖屏与横屏尺寸与 Slint DSL 保持严格对齐，且留出顶部状态栏空间 topMargin
+        // 竖屏与横屏尺寸与 Slint DSL 保持严格对齐，且留出顶部状态栏与控制条空间
         let target_h = if is_vertical {
             let avail_h = (height_px - top_px).max(0);
             let min_h = (220.0 * density) as i32;
@@ -387,7 +481,7 @@ mod imp {
         };
 
         let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48)); // Gravity.TOP
-        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top_px)); // 状态栏留白，严禁覆盖状态栏与下方 UI
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top_px)); // 状态栏留白
 
         let _ = env.call_method(
             sv.as_obj(),

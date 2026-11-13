@@ -22,4 +22,58 @@
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
         <item name="android:windowBackground">@android:color/black</item>
     </style>
+
+    <!--
+      播放期专用主题：窗口表面带 alpha 通道。
+
+      为什么要这个主题（整条播放链路的地基，改之前先读懂）：
+
+      我们的视频是原生 SurfaceView + MediaCodec 硬解，画面零拷贝进 Surface。
+      而 Slint 的 Android 后端不跑 View 树绘制，它直接拿 Activity 的
+      window surface 用 EGL 全屏渲染 —— 也就是说 Slint 的 UI 和视频是
+      **两个独立的 SurfaceControl**，谁在上面由 z 序决定：
+
+        SurfaceView 默认 z = APPLICATION_MEDIA_SUBLAYER(-2) → 在窗口下面
+        SurfaceView setZOrderOnTop(true)  → z = 0，跑到窗口上面
+
+      两种极端都不行：
+        · z=-2：视频被 Slint 不透明的窗口表面整个盖住 = 全黑。
+        · z=0 ：视频反过来盖住 Slint = 播放区里画任何控件都看不见，
+                返回键、控制条、亮度/音量指示、手势反馈全部作废。
+
+      正解是把两者变成"玻璃叠在电视上"：
+        · 视频留在下层 z=-2（原始位置，不需要 punchHole 也不会黑，
+          因为上层是透明的，能直接看见它）
+        · Slint 的窗口表面设为 TRANSLUCENT，EGL config 带 ALPHA_SIZE，
+          整层变成带 alpha 的合成层
+
+      前提是 Slint 真的清成透明。已确认 i-slint-renderer-skia 在挑选
+      EGL config 时用 supports_transparency() 优先选择带 alpha 的配置
+      （opengl_surface.rs 的 transparency_check 分支），RootItem 的
+      background 是半透明/透明时清屏也保留 alpha。
+
+      代价（省电基线）：全屏叠加需要 GPU 每帧做 alpha blend，
+      但这是 Android 上所有"视频上叠 UI"应用的标准做法（YouTube、
+      B 站、Plex 全都如此）。不需要 CPU 回读，不需要改解码输出。
+    -->
+    <style name="AppTheme.Translucent" parent="@android:style/Theme.NoTitleBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <!--
+          黑色不透明底，不是 transparent。
+
+          windowIsTranslucent 让我们的合成层带 alpha，但底下必须有东西接住:
+            · 播放中：下层是 SurfaceView 的视频画面
+            · 未起播/已停止：下层什么都没有，若不铺黑就会透出桌面壁纸
+          所以这里用黑色 —— 它同时也是"视频加载中"该有的底板色。
+        -->
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:colorBackgroundCacheHint">#ff000000</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
 </resources>

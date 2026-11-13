@@ -39,6 +39,12 @@ export component GestureArea inherits Rectangle {
     out property <bool> is_dragging: root.dragging;
     out property <PanAxis> current_axis: root.axis;
 
+    /// 本次手势的起手点（组件内局部坐标）。
+    /// 供需要判断"从左半屏还是右半屏起手"的调用方使用
+    /// （例如播放区的左滑亮度 / 右滑音量）。
+    out property <length> origin_x: root.start_x;
+    out property <length> origin_y: root.start_y;
+
     callback tap(length, length);
     callback long_press(length, length);
     callback pan_started(PanAxis);

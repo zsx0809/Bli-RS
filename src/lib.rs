@@ -172,6 +172,18 @@ fn android_main(app: slint::android::AndroidApp) {
 
     // 登记 JVM / Activity，用于系统手势排除区
     android_window::init(app.vm_as_ptr(), app.activity_as_ptr());
+
+    // 必须在 EGL surface 创建之前把窗口设为 TRANSLUCENT。
+    //
+    // 这决定了整个播放架构能不能成立：视频是原生 SurfaceView（z=-2，
+    // 在窗口表面下方），只有当窗口表面带 alpha 时视频才看得见；
+    // 同时 Slint 那一层保持透明，播放区的浮层控制条 / 亮度音量指示 /
+    // 手势反馈才画得出来。
+    //
+    // android_main 是 Slint 后端开始处理 InitWindow 之前的唯一时机，
+    // 所以这句必须放在 create_app() 之前。
+    let translucent = android_window::set_translucent_window();
+    crate::mxprobe::log_public(&format!("[Window] 设置 TRANSLUCENT -> {translucent}"));
     // 同时登记 AndroidApp 本身：创建 SurfaceView 必须在 Java 主线程，
     // 需要借它的 run_on_java_main_thread。
     android_window::set_android_app(app.clone());
@@ -228,6 +240,33 @@ fn android_main(app: slint::android::AndroidApp) {
         main_window.on_exit_detail_view(move || {
             player::stop_play();
             // 不再动排除区：它必须全程生效，否则详情页的边缘返回会被系统抢走
+        });
+    }
+
+    // 播放交互：进度 / 亮度 / 音量 / 播放暂停
+    //
+    // 参数都是 0.0~1.0 的归一化值，由 UI 侧手势算好后回调进来。
+    // 具体落地（MediaCodec seek、WindowManager 亮度、AudioManager 音量）
+    // 在 player 模块里实现，这里只负责接线。
+    {
+        main_window.on_player_seek(move |frac| {
+            crate::mxprobe::log_public(&format!("[UI] seek -> {frac:.3}"));
+            player::seek_to(frac);
+        });
+    }
+    {
+        main_window.on_player_brightness(move |v| {
+            player::set_brightness(v);
+        });
+    }
+    {
+        main_window.on_player_volume(move |v| {
+            player::set_volume(v);
+        });
+    }
+    {
+        main_window.on_player_toggle_play(move || {
+            player::toggle_play();
         });
     }
 
