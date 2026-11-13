@@ -22,6 +22,10 @@ static CURRENT: Mutex<Option<crate::video_decoder::VideoDecoder>> = Mutex::new(N
 static AUDIO_DECODER: Mutex<Option<crate::audio_decoder::AudioDecoder>> = Mutex::new(None);
 /// 全局播放时钟（音频主时钟）。暂停/恢复要能拿到它。
 static AUDIO_CLOCK: Mutex<Option<std::sync::Arc<crate::audio_out::PlayClock>>> = Mutex::new(None);
+/// 当前视频流的 SharedBuffer。回前台重建解码器时复用同一份，
+/// 这样后台期间下载的进度不会丢。
+static CURRENT_BUFFER: Mutex<Option<std::sync::Arc<crate::stream_source::SharedBuffer>>> =
+    Mutex::new(None);
 /// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
 static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
 /// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
@@ -109,6 +113,112 @@ fn report_fail(window: &slint::Weak<AppWindow>, msg: String) {
         d.is_ready = false;
         d.load_error = msg.as_str().into();
         w.set_current_detail(d);
+    });
+}
+
+// ==============================================================================
+// 前后台切换
+//
+// 用户切换前后的诉求不同，必须区别对待：
+//   前台：画面 + 声音都要，且音画同步
+//   后台：**只要声音**。视频画面没人看，继续解码白白耗电；而且 Surface
+//         在后台多半已被系统销毁，往失效 Surface 送帧没有任何意义。
+//
+// 因此核心策略是：
+//   进后台 → 停视频解码器（保留音频解码器与下载）
+//   回前台 → 重建 Surface，再起视频解码器，并以音频时钟为基准续播
+//
+// 为什么"回前台能自然接上"：
+//   音画同步本来就是每帧读 audio_clock.position_us() 再决定等/追。
+//   新建的视频解码器从关键帧开始，第一帧 PTS 多数情况下早于音频位置，
+//   于是走"落后 >300ms 就丢帧"的路径快速追上，之后逐帧对齐。
+//   不需要任何额外的"重新同步"代码。
+// ==============================================================================
+
+/// 当前是否处于后台（后台时视频解码器应为 None）
+static IN_BACKGROUND: AtomicBool = AtomicBool::new(false);
+
+/// 由 lib.rs 的生命周期监听调用。`kind` 是事件名，只做关键字匹配。
+pub fn on_lifecycle(kind: &str) {
+    let to_background = kind.contains("Pause") || kind.contains("Stop");
+    let to_foreground = kind.contains("Resume") || kind.contains("Start");
+
+    if to_background && !IN_BACKGROUND.swap(true, Ordering::SeqCst) {
+        crate::mxprobe::log_public("[Lifecycle] 进入后台：停视频解码，保留音频");
+
+        // 停视频解码器 + 把视频层调透明。
+        // 注意**不清** PENDING_STREAM、不动 PLAY_SESSION ——
+        // 会话仍然是同一个，回前台要接着播。
+        if let Ok(mut cur) = CURRENT.lock() {
+            if let Some(mut d) = cur.take() {
+                d.stop();
+            }
+        }
+        crate::video_surface::set_visible(false);
+
+        // 音频继续：确保它不是暂停状态（用户可能是在播放中切的后台）
+        // 只有用户显式暂停过才该保持暂停，这里不强行 resume。
+    } else if to_foreground && IN_BACKGROUND.swap(false, Ordering::SeqCst) {
+        crate::mxprobe::log_public("[Lifecycle] 回到前台：重建视频");
+
+        // 没有音频时钟 = 当前根本没在播放（已停止/已退出详情页），
+        // 此时不该凭空恢复视频。
+        let has_clock = AUDIO_CLOCK.lock().ok().and_then(|g| g.clone()).is_some();
+        if !has_clock {
+            crate::mxprobe::log_public("[Lifecycle] 无活动播放会话，不恢复视频");
+            return;
+        }
+
+        resume_video_after_background();
+    }
+}
+
+/// 回前台后重建视频链路（Surface → 解码器），音频不受影响。
+fn resume_video_after_background() {
+    // 取保存的视频缓冲（起播时存进去的）。
+    // 用同一份 SharedBuffer 意味着：如果后台期间下载还在继续，
+    // 恢复后解码器能直接读到新增的数据，不需要重新下载。
+    let buffer = CURRENT_BUFFER.lock().ok().and_then(|g| g.clone());
+    let Some(buffer) = buffer else {
+        crate::mxprobe::log_public("[Lifecycle] 没有视频缓冲，无法恢复");
+        return;
+    };
+
+    let session = PLAY_SESSION.load(Ordering::SeqCst);
+
+    std::thread::spawn(move || {
+        // 给系统一点时间重建 Surface
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != session {
+            return;
+        }
+
+        let Some(surface) = wait_surface() else {
+            crate::mxprobe::log_public("[Lifecycle] 恢复失败：Surface 未就绪");
+            return;
+        };
+
+        let clock = AUDIO_CLOCK.lock().ok().and_then(|g| g.clone());
+
+        crate::video_surface::set_visible(true);
+        crate::mxprobe::log_public("[Lifecycle] 重建视频解码器，跟随音频时钟");
+
+        let dec = crate::video_decoder::VideoDecoder::start(
+            buffer,
+            clock,
+            surface,
+            || {
+                crate::mxprobe::log_public("[Lifecycle] 视频已恢复送显");
+            },
+            |e| {
+                crate::mxprobe::log_public(&format!("[Lifecycle] 恢复后解码失败: {e}"));
+            },
+        );
+
+        if let Ok(mut cur) = CURRENT.lock() {
+            *cur = Some(dec);
+        }
     });
 }
 
@@ -721,6 +831,11 @@ fn start_playback(
     let w_ready = w_clone.clone();
     let w_err = w_clone.clone();
 
+    // 保存缓冲句柄，供回前台重建解码器时复用
+    if let Ok(mut g) = CURRENT_BUFFER.lock() {
+        *g = Some(buffer.clone());
+    }
+
     crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
     let dec = crate::video_decoder::VideoDecoder::start(
         buffer,
@@ -1077,6 +1192,9 @@ fn stop_current() {
         }
     }
     if let Ok(mut g) = AUDIO_CLOCK.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = CURRENT_BUFFER.lock() {
         *g = None;
     }
 }

@@ -172,7 +172,36 @@ struct Palette {
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: slint::android::AndroidApp) {
-    slint::android::init(app.clone()).unwrap();
+    // 用带事件监听的初始化，才能拿到前后台切换。
+    //
+    // 为什么必须监听：切到后台时 Android 会销毁（或至少 detach）
+    // SurfaceView 的 Surface，视频解码器继续往一个失效的 Surface 送帧，
+    // 画面就没了；但音频还在响、下载还在跑 —— 正是"后台只剩封面、
+    // 网络还在动"的成因。
+    //
+    // 正确行为（这也是所有播放器的做法）：
+    //   后台 → 只保音频，视频解码暂停/停止，UI 层不再刷新
+    //   前台 → 视频重新 attach，解码器从**音频时钟当前的位置**续上，
+    //          自然完成音画同步（因为同步逻辑本来就是追音频时钟）
+    slint::android::init_with_event_listener(app.clone(), |event| {
+        use slint::android::android_activity::PollEvent;
+        if let PollEvent::Main(ev) = event {
+            let kind = format!("{ev:?}");
+            // 只关心窗口与生命周期相关事件，其余忽略（避免日志爆炸）
+            if kind.contains("Resume")
+                || kind.contains("Pause")
+                || kind.contains("Stop")
+                || kind.contains("Start")
+                || kind.contains("InitWindow")
+                || kind.contains("TerminateWindow")
+                || kind.contains("Destroy")
+            {
+                crate::mxprobe::log_public(&format!("[Lifecycle] {kind}"));
+                crate::player::on_lifecycle(&kind);
+            }
+        }
+    })
+    .unwrap();
 
     // 登记 JVM / Activity，用于系统手势排除区
     android_window::init(app.vm_as_ptr(), app.activity_as_ptr());
