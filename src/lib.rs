@@ -186,18 +186,43 @@ fn android_main(app: slint::android::AndroidApp) {
     slint::android::init_with_event_listener(app.clone(), |event| {
         use slint::android::android_activity::PollEvent;
         if let PollEvent::Main(ev) = event {
-            let kind = format!("{ev:?}");
-            // 只关心窗口与生命周期相关事件，其余忽略（避免日志爆炸）
-            if kind.contains("Resume")
-                || kind.contains("Pause")
-                || kind.contains("Stop")
-                || kind.contains("Start")
-                || kind.contains("InitWindow")
-                || kind.contains("TerminateWindow")
-                || kind.contains("Destroy")
-            {
-                crate::mxprobe::log_public(&format!("[Lifecycle] {kind}"));
-                crate::player::on_lifecycle(&kind);
+            // 只取事件名，不要 Debug 全文。
+            //
+            // 踩过的坑：之前用 format!("{ev:?}") 直接打，结果 Resume 事件
+            // 的 Debug 输出包含整个 AndroidAppInner（配置、looper 指针、
+            // 窗口状态…）好几 KB 一行，把真正有用的日志全淹了，
+            // 而且每一行都写盘 + 进 logcat，白耗 IO。
+            //
+            // 用 discriminant 式的短名字既可读又便宜。
+            let kind: &'static str = match ev {
+                slint::android::android_activity::MainEvent::Start => "Start",
+                slint::android::android_activity::MainEvent::Resume { .. } => "Resume",
+                slint::android::android_activity::MainEvent::Pause => "Pause",
+                slint::android::android_activity::MainEvent::Stop => "Stop",
+                slint::android::android_activity::MainEvent::Destroy => "Destroy",
+                slint::android::android_activity::MainEvent::InitWindow {} => "InitWindow",
+                slint::android::android_activity::MainEvent::TerminateWindow {} => "TerminateWindow",
+                slint::android::android_activity::MainEvent::SaveState { .. } => "SaveState",
+                slint::android::android_activity::MainEvent::InputAvailable => "InputAvailable",
+                slint::android::android_activity::MainEvent::ConfigChanged {} => "ConfigChanged",
+                slint::android::android_activity::MainEvent::WindowResized {} => "WindowResized",
+                slint::android::android_activity::MainEvent::RedrawNeeded {} => "RedrawNeeded",
+                slint::android::android_activity::MainEvent::ContentRectChanged {} => "ContentRectChanged",
+                slint::android::android_activity::MainEvent::GainedFocus => "GainedFocus",
+                slint::android::android_activity::MainEvent::LostFocus => "LostFocus",
+                slint::android::android_activity::MainEvent::LowMemory => "LowMemory",
+                _ => "Other",
+            };
+
+            // 只有生命周期相关的事件值得记日志 + 触发播放器逻辑；
+            // InputAvailable / RedrawNeeded 这类每帧都可能来，绝不打日志。
+            match kind {
+                "Start" | "Resume" | "Pause" | "Stop" | "Destroy" | "InitWindow"
+                | "TerminateWindow" => {
+                    crate::mxprobe::log_public(&format!("[Lifecycle] {kind}"));
+                    crate::player::on_lifecycle(kind);
+                }
+                _ => {}
             }
         }
     })
