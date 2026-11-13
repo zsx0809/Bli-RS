@@ -320,6 +320,13 @@ fn android_main(app: slint::android::AndroidApp) {
     // 参数都是 0.0~1.0 的归一化值，由 UI 侧手势算好后回调进来。
     // 具体落地（MediaCodec seek、WindowManager 亮度、AudioManager 音量）
     // 在 player 模块里实现，这里只负责接线。
+    // 全屏：UI 层已经改了几何，但视频是**独立的原生图层**，
+    // 必须同步改 SurfaceView 的真实尺寸，否则会"UI 全屏了、视频还在顶部"。
+    {
+        main_window.on_player_fullscreen_changed(move |fs| {
+            player::set_fullscreen(fs);
+        });
+    }
     {
         main_window.on_player_seek_by(move |secs| {
             player::seek_by(secs);

@@ -94,9 +94,14 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
 
     // 播放器动态高度：竖屏 45% 视口（自适应高度，绝不过度压盖 UI），横屏 16:9
-    out property <length> player_height: root.detail.is_vertical
-        ? Math.min(Math.max(220px, (root.height - root.safe_top) * 0.45), 380px)
-        : (root.width * 9 / 16);
+    out property <length> player_height: root.is_fullscreen
+        ? root.height
+        : (root.detail.is_vertical
+            ? Math.min(Math.max(220px, (root.height - root.safe_top) * 0.45), 380px)
+            : (root.width * 9 / 16));
+
+    // 全屏时播放区从屏幕最顶端开始（连状态栏区域也占）
+    out property <length> player_top: root.is_fullscreen ? 0px : root.safe_top;
 
     property <length> tabbar_h: 46px;
 
@@ -114,6 +119,19 @@ export component VideoDetailView inherits Rectangle {
 
     /// 是否处于暂停状态（用于把播放键画成三角/双竖线）
     in property <bool> paused: false;
+
+    // ----------------------------------------------------------------------
+    // 全屏播放
+    //
+    // 全屏时播放区铺满整个屏幕（含状态栏区域），Tab 栏与内容区整体隐藏，
+    // SurfaceView 也会被 Rust 侧同步放大到全屏。
+    //
+    // 为什么必须两边一起改：视频是**独立的原生图层**，
+    // Slint 只是把 UI 放大不改变视频的实际尺寸 —— 那样会变成
+    // "UI 全屏了但视频还缩在顶部"。所以这里触发回调，
+    // 由 Rust 侧调 update_surface_layout 改 SurfaceView 的真实几何。
+    // ----------------------------------------------------------------------
+    in-out property <bool> is_fullscreen: false;
 
     /// 手势中的浮层提示：none / brightness / volume / seek
     in-out property <string> hud_mode: "";
@@ -139,6 +157,8 @@ export component VideoDetailView inherits Rectangle {
     callback seek_to(float);
     /// 相对跳转（秒）。正数快进，负数快退。快捷键用 ±10 秒。
     callback seek_by(float);
+    /// 切换全屏。Rust 侧据此同步 SurfaceView 的真实几何。
+    callback toggle_fullscreen();
     callback set_brightness(float);
     callback set_volume(float);
     callback toggle_play();
@@ -176,7 +196,7 @@ export component VideoDetailView inherits Rectangle {
     out property <length> content_h: root.active_tab == 0
         ? body.preferred-height
         : Math.max(root.comments_measured_h, body.preferred-height);
-    out property <length> viewport_h: root.height - root.safe_top - root.player_height - root.tabbar_h - root.safe_bottom;
+    out property <length> viewport_h: root.height - root.player_top - root.player_height - root.tabbar_h - root.safe_bottom;
     out property <length> max_scroll: Math.max(0px, root.content_h - root.viewport_h);
 
     fling_timer := Timer {
@@ -288,7 +308,7 @@ export component VideoDetailView inherits Rectangle {
         x: 0px;
         y: 0px;
         width: 100%;
-        height: root.safe_top;
+        height: root.is_fullscreen ? 0px : root.safe_top;
         background: #000000;
     }
 
@@ -309,7 +329,7 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
     player_box := Rectangle {
         x: 0px;
-        y: root.safe_top;
+        y: root.player_top;
         width: root.width;
         height: root.player_height;
         background: transparent;
@@ -729,6 +749,30 @@ export component VideoDetailView inherits Rectangle {
                         commands: "M 12 5 A 7.5 7.5 0 1 1 5 12 M 12 5 L 12 9 M 12 5 L 15.8 8.5";
                     }
                 }
+
+                Rectangle { width: 20px; background: transparent; }
+
+                // ---- 全屏 / 退出全屏 ----
+                fs_btn := GestureArea {
+                    width: 64px;
+                    height: 52px;
+
+                    tap(x, y) => { root.toggle_fullscreen(); }
+
+                    // 四角括号：全屏时朝内（表示"缩回"），平时朝外
+                    IconBase {
+                        x: (parent.width - 24px) / 2;
+                        y: (parent.height - 24px) / 2;
+                        size: 24px;
+                        tint: fs_btn.pressed ? #ffffffaa : #ffffff;
+                        stroke_w: 1.8px;
+                        commands: root.is_fullscreen
+                            // 退出全屏（箭头朝内）
+                            ? "M 9 3 L 9 9 L 3 9 M 15 3 L 15 9 L 21 9 M 9 21 L 9 15 L 3 15 M 15 21 L 15 15 L 21 15"
+                            // 进入全屏（箭头朝外）
+                            : "M 3 9 L 9 9 L 9 3 M 21 9 L 15 9 L 15 3 M 3 15 L 9 15 L 9 21 M 21 15 L 15 15 L 15 21";
+                    }
+                }
             }
 
             // ---- 时间行：贴在进度条上方 ----
@@ -749,10 +793,12 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
     Rectangle {
         x: 0px;
-        y: root.safe_top + root.player_height;
+        y: root.player_top + root.player_height;
         width: 100%;
-        height: root.tabbar_h;
-        background: Theme.background;
+        // 全屏时整条 Tab 栏收起，让视频独占屏幕
+        height: root.is_fullscreen ? 0px : root.tabbar_h;
+        background: root.is_fullscreen ? transparent : Theme.background;
+        visible: !root.is_fullscreen;
 
         Rectangle {
             y: parent.height - 1px;
@@ -858,10 +904,11 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
     scroll_clip := Rectangle {
         x: 0px;
-        y: root.safe_top + root.player_height + root.tabbar_h;
+        y: root.player_top + root.player_height + (root.is_fullscreen ? 0px : root.tabbar_h);
         width: root.width;
-        height: Math.max(0px, root.viewport_h);
+        height: root.is_fullscreen ? 0px : Math.max(0px, root.viewport_h);
         clip: true;
+        visible: !root.is_fullscreen;
         background: Theme.background;
 
         // 底层手势：纵向滚动 + 横向切 Tab (简介 <-> 评论)

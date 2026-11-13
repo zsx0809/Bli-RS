@@ -410,6 +410,77 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
 
     static LAST_LAYOUT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
+    /// 全屏切换：直接按屏幕物理尺寸重设 LayoutParams。
+    pub fn apply_fullscreen(fullscreen: bool) {
+        let Some(vm) = android_window::java_vm() else {
+            return;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return;
+        };
+        let Some(sv) = SURFACE_VIEW.get() else {
+            return;
+        };
+        let Some(activity) = android_window::activity_object() else {
+            return;
+        };
+
+        // 取屏幕真实物理尺寸
+        let (width_px, height_px) = (|| -> Option<(i32, i32)> {
+            let res = env
+                .call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let dm = env
+                .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            Some((
+                env.get_field(&dm, "widthPixels", "I").ok()?.i().ok()?,
+                env.get_field(&dm, "heightPixels", "I").ok()?.i().ok()?,
+            ))
+        })()
+        .unwrap_or((1080, 2400));
+
+        let (h, top) = if fullscreen {
+            (height_px, 0)
+        } else {
+            // 退出全屏：恢复成横屏 16:9 + 状态栏下移
+            (
+                (width_px as f32 * 9.0 / 16.0) as i32,
+                crate::android_window::status_bar_height_px(),
+            )
+        };
+
+        // 清掉去重缓存，确保这次一定真的写下去
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            *lock = None;
+        }
+
+        let Ok(lp) = env.new_object(
+            "android/widget/FrameLayout$LayoutParams",
+            "(II)V",
+            &[JValue::Int(-1), JValue::Int(h)],
+        ) else {
+            return;
+        };
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top));
+
+        let _ = env.call_method(
+            sv.as_obj(),
+            "setLayoutParams",
+            "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&lp)],
+        );
+
+        crate::mxprobe::log_public(&format!(
+            "[Surface] 全屏={fullscreen} -> h={h}, top={top}"
+        ));
+    }
+
     /// 更新 SurfaceView 的高宽与顶部边距（在主线程运行）
     pub fn update_layout(height_px: i32, top_px: i32) {
         if let Ok(mut lock) = LAST_LAYOUT.lock() {
@@ -633,6 +704,19 @@ pub fn update_surface_layout(height_px: i32, top_px: i32) {
     run_on_ui_thread(move || {
         #[cfg(target_os = "android")]
         imp::update_layout(height_px, top_px);
+    });
+}
+
+/// 全屏：SurfaceView 铺满整屏（含状态栏区域）。
+///
+/// 为什么必须单独一个函数而不是复用 update_layout：
+///   全屏时 topMargin 要归 0（连状态栏区域一起占），
+///   高度用**屏幕物理高度**而不是播放区高度 —— 后者是按 16:9 或 45%
+///   算出来的，全屏语义完全不同。
+pub fn set_fullscreen_surface(fullscreen: bool) {
+    run_on_ui_thread(move || {
+        #[cfg(target_os = "android")]
+        imp::apply_fullscreen(fullscreen);
     });
 }
 

@@ -163,6 +163,11 @@ impl PlayClock {
     pub fn set_paused(&self, p: bool) {
         self.paused.store(p, Ordering::Relaxed);
     }
+
+    /// 诊断用：已消费字节数的原始值
+    pub fn played_bytes_debug(&self) -> u64 {
+        self.played_bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// 音频输出器：持有 AAudio 流与环形缓冲。
@@ -255,11 +260,24 @@ impl AudioOutput {
             (capacity as f64 / (sample_rate as f64 * bytes_per_frame as f64) * 1000.0) as i32
         ));
 
-        // 流启动后不再需要持有句柄：
-        //   AAudio 的生命周期由框架管理，我们不主动 stop（页面切走时
-        //   只是把 clock 置 paused，回调里填静音，流本身继续空转）。
-        //   这样避免 AudioStream 的 !Send 约束扩散到整个 AudioOutput。
-        drop(stream);
+        // ================================================================
+        // 关键：绝不能 drop(stream) —— 那会调用 AAudioStream_close()，
+        // 流立刻被关闭，于是完全没声音；音频时钟也永远停在 0，
+        // 视频侧每帧都判定"超前"而 sleep，看起来就是速度变慢。
+        //
+        // 实测踩过：为了绕开 AudioStream 的 !Send 约束直接 drop，
+        // 代价是整条音频链路静默失效，且症状表现为"视频变慢"，
+        // 极难从表象联想到音频。
+        //
+        // 正确做法：std::mem::forget 泄漏掉这个句柄。
+        //   · AAudio 流本身由框架内部持有，只要不 close 就一直工作
+        //   · 泄漏一个 8 字节结构体，代价可忽略
+        //   · 进程退出时由内核回收，不会造成实质泄漏
+        //
+        // 这样 AudioStream 的 !Send 也不会污染 AudioOutput：
+        // 句柄不再存在于结构体里（被遗忘了），剩下的成员全是
+        // Arc + Mutex/原子，天然 Send + Sync。
+        std::mem::forget(stream);
 
         Ok(Self {
             ring,
@@ -298,6 +316,11 @@ impl AudioOutput {
             Ok(mut r) => r.clear(),
             Err(e) => e.into_inner().clear(),
         }
+    }
+
+    /// 诊断：已消费的字节数。用来确认 AAudio 回调真的在跑。
+    pub fn played_bytes(&self) -> u64 {
+        self.clock.played_bytes_debug()
     }
 
     pub fn underrun_count(&self) -> u64 {

@@ -1464,6 +1464,16 @@ pub fn seek_to(frac: f32) {
     }
 }
 
+/// 切换全屏。
+///
+/// 只改 SurfaceView 的真实几何，UI 侧已经自己改好了
+/// （is_fullscreen 驱动 player_height / Tab 栏 / 内容区的显隐）。
+/// 两边必须一起变，否则就是"UI 全屏但视频还在顶上"。
+pub fn set_fullscreen(on: bool) {
+    crate::mxprobe::log_public(&format!("[Fullscreen] -> {on}"));
+    crate::video_surface::set_fullscreen_surface(on);
+}
+
 /// 相对跳转（秒）。
 ///
 /// 实现方式：读当前 PTS，加上偏移后走与 seek_to 相同的路径。

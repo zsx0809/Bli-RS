@@ -514,8 +514,21 @@ fn decode_loop(
                     // 没有音频时：
                     //   退回原来的"首帧基准 + 单调时钟"方案，保证 1.0x 速度。
                     if pts_us >= 0 {
-                        if let Some(ref ac) = clock {
-                            let audio_pos = ac.position_us();
+                        // 音频时钟只有在"已经开始走"时才可信。
+                        //
+                        // 踩过的坑：音频流被误关时 position_us() 恒为 0，
+                        // 于是每一帧都算出 diff = pts - 0 > 0，全部走
+                        // "sleep 到该显示的时刻"分支，每帧睡 100ms →
+                        // 观感就是播放速度变得极慢。
+                        //
+                        // 判据：音频位置 <= 0 说明还没真正开始播放
+                        // （首帧未消费 / 流被关），此时退回内部时钟。
+                        let audio_pos_opt = clock
+                            .as_ref()
+                            .map(|c| c.position_us())
+                            .filter(|&p| p > 0);
+
+                        if let Some(audio_pos) = audio_pos_opt {
                             // 视频 PTS 与音频位置在同一时间轴上比较。
                             // 两者都来自同一条 DASH 的时间原点，可直接相减。
                             let diff_us = pts_us - audio_pos;
