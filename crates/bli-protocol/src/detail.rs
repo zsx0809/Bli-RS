@@ -240,14 +240,10 @@ impl BiliClient {
             // logger，log crate 的宏不会产生任何输出。eprintln 在 Android 上
             // 会进 logcat（tag 由 std 固定），至少能被抓到。
             eprintln!(
-                "[reply] 首条顶层键数={} 有reply_control={} location={:?} 全部键={:?}",
-                first.as_object().map(|o| o.len()).unwrap_or(0),
+                "[reply] 有reply_control={} location={:?} reply_control全文={:?}",
                 has_rc,
                 loc,
-                first
-                    .as_object()
-                    .map(|o| o.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default()
+                serde_json::to_string(&first["reply_control"]).unwrap_or_default()
             );
         }
 
