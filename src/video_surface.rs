@@ -517,6 +517,19 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             )
         };
 
+        // 退出全屏时清掉 setFixedSize，否则会一直钉在横屏尺寸上
+        if !fullscreen {
+            if let Ok(holder) = env
+                .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
+                .and_then(|v| v.l())
+            {
+                let _ = env.call_method(&holder, "setSizeFromLayout", "()V", &[]);
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
+        }
+
         // 清掉去重缓存，确保这次一定真的写下去
         if let Ok(mut lock) = LAST_LAYOUT.lock() {
             *lock = None;
@@ -538,6 +551,32 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             "(Landroid/view/ViewGroup$LayoutParams;)V",
             &[JValue::Object(&lp)],
         );
+
+        // 同时告诉 SurfaceHolder 这块 buffer 的准确尺寸。
+        //
+        // 为什么光有 LayoutParams 不够：
+        //   SurfaceView 的 buffer 尺寸默认跟随 View 尺寸，但在窗口
+        //   刚旋转、布局还没走完一轮时，Surface 可能仍沿用旧尺寸。
+        //   setFixedSize 会显式钉死 buffer 大小，使 MediaCodec 拿到的
+        //   ANativeWindow 尺寸与我们算的 letterbox 完全一致 ——
+        //   否则会出现"View 是 2201 宽、实际 buffer 还是别的尺寸"
+        //   导致画面在 View 内被二次缩放，看起来就是画面偏小、黑边偏窄。
+        if w > 0 && h > 0 {
+            if let Ok(holder) = env
+                .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
+                .and_then(|v| v.l())
+            {
+                let _ = env.call_method(
+                    &holder,
+                    "setFixedSize",
+                    "(II)V",
+                    &[JValue::Int(w), JValue::Int(h)],
+                );
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
+        }
 
         crate::mxprobe::log_public(&format!(
             "[Surface] 全屏={fullscreen} -> {w}x{h}, top={top}, video={video_w}x{video_h}"
