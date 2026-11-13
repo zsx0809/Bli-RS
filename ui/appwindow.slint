@@ -98,16 +98,17 @@ export component AppWindow inherits Window {
     in-out property <bool> drawer_open: false;
     callback drawer_changed();
 
-    property <length> safe_top: root.safe-area-insets.top;
+    // 状态栏与导航栏安全边距（注入保底与系统实测值）
+    in-out property <length> status_bar_height: 0px;
+    property <length> safe_top: Math.max(Math.max(root.safe-area-insets.top, root.status_bar_height), 24px);
     property <length> safe_bottom: root.safe-area-insets.bottom;
 
     // 把手势原语需要的窗口级度量灌进 UiMetrics（见 theme.slint）。
     //
-    // system_bottom_guard 取 safe_bottom 与 24px 的较大者：
+    // system_bottom_guard 取 safe_bottom 与 32px 的较大者：
     // 手势导航下 safe_bottom 通常就是那条"上滑回桌面"的把手高度，
-    // 但个别 ROM 会报 0，所以给一个保底值。
     // 落在这一条带里的起手，GestureArea 直接不接管，全部留给系统。
-    property <length> guard_bottom: Math.max(root.safe_bottom, 24px);
+    property <length> guard_bottom: Math.max(root.safe_bottom, 32px);
 
     init => {
         UiMetrics.window_height = root.height;
@@ -255,7 +256,7 @@ export component AppWindow inherits Window {
         // 与 Android 的 ViewPager fling 阈值同量级：
         //     vx = 12px  → 折算 12 * 14 = 168px，1080 宽屏约 15.5%
         // 配合 24% 的位移阈值，手感和官方接近：慢拖靠位移，快甩靠速度。
-        let threshold = page_area.width * 0.24;
+        let threshold = page_area.width * 0.18;
         let fling_boost = (vx / 1px) * 14px;
         let effective = dx + fling_boost;
 

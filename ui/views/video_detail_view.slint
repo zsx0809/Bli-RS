@@ -64,9 +64,9 @@ export component VideoDetailView inherits Rectangle {
 
     background: Theme.background;
 
-    // 播放器动态高度：竖屏 48%，横屏 16:9
+    // 播放器动态高度：竖屏 45% 视口（自适应高度，绝不过度压盖 UI），横屏 16:9
     out property <length> player_height: root.detail.is_vertical
-        ? (root.height * 0.48)
+        ? Math.min(Math.max(220px, (root.height - root.safe_top) * 0.45), 380px)
         : (root.width * 9 / 16);
 
     property <length> tabbar_h: 46px;
@@ -86,7 +86,7 @@ export component VideoDetailView inherits Rectangle {
     property <PanAxis> active_axis: PanAxis.None;
 
     out property <length> content_h: body.preferred-height;
-    out property <length> viewport_h: root.height - root.player_height - root.tabbar_h;
+    out property <length> viewport_h: root.height - root.safe_top - root.player_height - root.tabbar_h - root.safe_bottom;
     out property <length> max_scroll: Math.max(0px, root.content_h - root.viewport_h);
 
     fling_timer := Timer {
@@ -186,17 +186,28 @@ export component VideoDetailView inherits Rectangle {
     }
 
     // ----------------------------------------------------------------------
-    // 边缘返回
+    // 左右双向边缘侧滑返回状态
     // ----------------------------------------------------------------------
-    property <length> edge_dx: 0px;
-    property <bool> edge_active: false;
+    property <length> left_edge_dx: 0px;
+    property <bool> left_edge_active: false;
+    property <length> right_edge_dx: 0px;
+    property <bool> right_edge_active: false;
+
+    // 顶部状态栏安全占位，留出手机顶部状态栏空间
+    status_bar_spacer := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: root.safe_top;
+        background: #000000;
+    }
 
     // ----------------------------------------------------------------------
     // 顶部播放视口
     // ----------------------------------------------------------------------
     player_box := Rectangle {
         x: 0px;
-        y: 0px;
+        y: root.safe_top;
         width: root.width;
         height: root.player_height;
         background: #000000;
@@ -265,10 +276,10 @@ export component VideoDetailView inherits Rectangle {
             }
         }
 
-        // 返回键：48px 命中区，视觉 32px 圆
+        // 返回键：48px 命中区，视觉 32px 圆，位于播放视口左上角
         back_btn := GestureArea {
-            x: 4px;
-            y: Math.max(4px, root.safe_top + 2px);
+            x: 6px;
+            y: 6px;
             width: 48px;
             height: 48px;
 
@@ -298,7 +309,7 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
     Rectangle {
         x: 0px;
-        y: root.player_height;
+        y: root.safe_top + root.player_height;
         width: 100%;
         height: root.tabbar_h;
         background: Theme.background;
@@ -403,23 +414,22 @@ export component VideoDetailView inherits Rectangle {
     }
 
     // ----------------------------------------------------------------------
-    // 内容区
+    // 内容区（自适应剩余视口高度）
     // ----------------------------------------------------------------------
     scroll_clip := Rectangle {
         x: 0px;
-        y: root.player_height + root.tabbar_h;
+        y: root.safe_top + root.player_height + root.tabbar_h;
         width: root.width;
         height: Math.max(0px, root.viewport_h);
         clip: true;
         background: Theme.background;
 
-        // 底层手势：纵向滚动 + 横向切 Tab。
-        // axis_ratio 1.5 —— 明显偏纵向，避免斜着划一下就误切 Tab。
+        // 底层手势：纵向滚动 + 横向切 Tab (简介 <-> 评论)
         scroll_gesture := GestureArea {
             width: 100%;
             height: 100%;
-            tap_slop: 10px;
-            axis_ratio: 1.5;
+            tap_slop: 8px;
+            axis_ratio: 1.1;
 
             pan_started(axis) => { root.pan_begin(axis); }
             pan_moved(dx, dy) => { root.pan_move(dx, dy); }
@@ -859,48 +869,86 @@ export component VideoDetailView inherits Rectangle {
     }
 
     // ----------------------------------------------------------------------
-    // 左边缘返回（最上层，从真正的 x=0 起手）
-    //
-    // 起点在 y = safe_top 之下 —— 让开顶部那一行返回按钮。
-    // vertical_enabled = false：竖向起手直接放弃，
-    // 所以边缘 48px 带内不能起手纵向滚动 —— 与官方边缘返回区一致。
+    // 左右双边缘侧滑返回（左边右滑、右边左滑均返回首页）
     // ----------------------------------------------------------------------
-    edge_back := GestureArea {
+    left_edge_back := GestureArea {
         x: 0px;
-        y: root.safe_top + 56px;
-        width: 48px;
-        height: Math.max(0px, root.height - root.safe_top - 56px);
+        y: root.safe_top + 48px;
+        width: 44px;
+        height: Math.max(0px, root.height - root.safe_top - 48px);
 
-        tap_slop: 10px;
-        axis_ratio: 1.0;
+        tap_slop: 8px;
+        axis_ratio: 0.9;
         vertical_enabled: false;
 
         tap(x, y) => { }
 
         pan_started(axis) => {
-            root.edge_active = true;
-            root.edge_dx = 0px;
+            root.left_edge_active = true;
+            root.left_edge_dx = 0px;
         }
         pan_moved(dx, dy) => {
-            if (dx > 0px) { root.edge_dx = dx; }
+            if (dx > 0px) { root.left_edge_dx = dx; }
         }
         pan_finished(dx, dy, vx, vy) => {
-            root.edge_active = false;
-            root.edge_dx = 0px;
-            if (dx > 32px) { root.back_clicked(); }
+            root.left_edge_active = false;
+            root.left_edge_dx = 0px;
+            if (dx > 25px || (vx / 1px) > 1.5) {
+                root.back_clicked();
+            }
         }
         pan_cancelled => {
-            root.edge_active = false;
-            root.edge_dx = 0px;
+            root.left_edge_active = false;
+            root.left_edge_dx = 0px;
         }
     }
 
-    // 跟手提示
-    if root.edge_active && root.edge_dx > 0px : Rectangle {
+    right_edge_back := GestureArea {
+        x: root.width - 44px;
+        y: root.safe_top + 48px;
+        width: 44px;
+        height: Math.max(0px, root.height - root.safe_top - 48px);
+
+        tap_slop: 8px;
+        axis_ratio: 0.9;
+        vertical_enabled: false;
+
+        tap(x, y) => { }
+
+        pan_started(axis) => {
+            root.right_edge_active = true;
+            root.right_edge_dx = 0px;
+        }
+        pan_moved(dx, dy) => {
+            if (dx < 0px) { root.right_edge_dx = dx; }
+        }
+        pan_finished(dx, dy, vx, vy) => {
+            root.right_edge_active = false;
+            root.right_edge_dx = 0px;
+            if (dx < -25px || (vx / 1px) < -1.5) {
+                root.back_clicked();
+            }
+        }
+        pan_cancelled => {
+            root.right_edge_active = false;
+            root.right_edge_dx = 0px;
+        }
+    }
+
+    // 跟手视觉提示
+    if root.left_edge_active && root.left_edge_dx > 0px : Rectangle {
         x: 0px;
         y: 0px;
-        width: Math.min(root.edge_dx * 0.4, 24px);
+        width: Math.min(root.left_edge_dx * 0.4, 28px);
         height: root.height;
-        background: Theme.primary.transparentize(72%);
+        background: Theme.primary.transparentize(70%);
+    }
+
+    if root.right_edge_active && root.right_edge_dx < 0px : Rectangle {
+        x: root.width - Math.min(-root.right_edge_dx * 0.4, 28px);
+        y: 0px;
+        width: Math.min(-root.right_edge_dx * 0.4, 28px);
+        height: root.height;
+        background: Theme.primary.transparentize(70%);
     }
 }

@@ -184,16 +184,14 @@ fn android_main(app: slint::android::AndroidApp) {
     // Monet 动态取色：从系统 tonal palette 拉取壁纸派生色并灌进 Theme
     apply_palette(&main_window);
 
-    // 左边缘排除出系统返回手势区。
-    //
-    // 这个排除区是 App 自己的语义，**不随页面切换而解除**：
-    //   - 首页：边缘右滑没接（抽屉走左上角头像），但保留排除区无害；
-    //   - 详情页：边缘右滑由 appwindow 的 EdgeBack 处理。
-    //
-    // 曾经在进入详情页时调 set_exclusion(false)，把左边缘交还系统，
-    // 于是边缘侧滑 = 系统返回 = finish 掉 NativeActivity = App 直接退出。
-    // 这是「左边侧滑退出 App」的直接原因，别再改回去。
-    android_window::set_exclusion(32, true);
+    // 注入真实系统状态栏高度与安全留白，避免视频加载侵占顶部状态栏
+    let sb_px = android_window::status_bar_height_px();
+    let density = android_window::display_density();
+    let sb_dp = if density > 0.0 { (sb_px as f32 / density).max(24.0) } else { 24.0 };
+    main_window.set_status_bar_height(sb_dp);
+
+    // 左右双边缘排除出系统手势区（单侧 40dp），保证详情页左右侧滑返回完全由 App 接管，杜绝被系统杀进程
+    android_window::set_exclusion(40, true);
 
     // 抽屉状态变化时不需要动排除区 —— 抽屉的关闭有显式按钮与遮罩点击。
     // 这里保留回调只是为了让 UI 侧的 drawer_changed 有落点（便于以后加动画/埋点）。

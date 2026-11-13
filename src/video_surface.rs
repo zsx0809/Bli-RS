@@ -78,7 +78,8 @@ mod imp {
             return false;
         };
 
-        // 从 Activity 获取真实 DisplayMetrics 物理像素，初始限定在 16:9 顶部区域，严禁全屏黑屏覆盖！
+        // 从 Activity 获取真实 DisplayMetrics 物理像素与状态栏高度，初始限定在 16:9 且让出顶部状态栏空间
+        let status_top = crate::android_window::status_bar_height_px();
         let default_h = (|| {
             let res = env.call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[]).ok()?.l().ok()?;
             let dm = env.call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[]).ok()?.l().ok()?;
@@ -96,6 +97,7 @@ mod imp {
             return false;
         };
         let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48)); // Gravity.TOP
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(status_top)); // 留出顶部状态栏空间
 
         let added = env.call_method(
             &decor,
@@ -353,10 +355,15 @@ mod imp {
 
         let width_px = env.get_field(&dm, "widthPixels", "I").map(|v| v.i().unwrap_or(1080)).unwrap_or(1080);
         let height_px = env.get_field(&dm, "heightPixels", "I").map(|v| v.i().unwrap_or(2400)).unwrap_or(2400);
+        let density = env.get_field(&dm, "density", "F").map(|v| v.f().unwrap_or(2.0)).unwrap_or(2.0);
+        let top_px = crate::android_window::status_bar_height_px();
 
-        // 竖屏占 48% 物理高，横屏占 16:9 物理宽，与 Slint DSL 公式绝对对齐
+        // 竖屏与横屏尺寸与 Slint DSL 保持严格对齐，且留出顶部状态栏空间 topMargin
         let target_h = if is_vertical {
-            (height_px as f32 * 0.48) as i32
+            let avail_h = (height_px - top_px).max(0);
+            let min_h = (220.0 * density) as i32;
+            let max_h = (380.0 * density) as i32;
+            ((avail_h as f32 * 0.45) as i32).clamp(min_h, max_h)
         } else {
             (width_px as f32 * 9.0 / 16.0) as i32
         };
@@ -369,7 +376,8 @@ mod imp {
             return;
         };
 
-        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48)); // Gravity.TOP
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top_px)); // 状态栏留白，严禁覆盖状态栏与下方 UI
 
         let _ = env.call_method(
             sv.as_obj(),

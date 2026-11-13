@@ -189,7 +189,64 @@ mod imp {
         .unwrap_or_default()
     }
 
-    /// 设置排除区：左侧 width_dp 宽、全高的一条竖带
+    /// 获取系统状态栏物理像素高度
+    pub fn status_bar_height_px() -> i32 {
+        with_env(|env, activity| {
+            let res = env
+                .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let jpkg = env.new_string("android").ok()?;
+            let jtype = env.new_string("dimen").ok()?;
+            let jname = env.new_string("status_bar_height").ok()?;
+            let id = env
+                .call_method(
+                    &res,
+                    "getIdentifier",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+                    &[
+                        JValue::Object(&jname),
+                        JValue::Object(&jtype),
+                        JValue::Object(&jpkg),
+                    ],
+                )
+                .ok()?
+                .i()
+                .ok()?;
+            if id > 0 {
+                env.call_method(&res, "getDimensionPixelSize", "(I)I", &[JValue::Int(id)])
+                    .ok()?
+                    .i()
+                    .ok()
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .unwrap_or(0)
+    }
+
+    /// 获取屏幕密度 density
+    pub fn display_density() -> f32 {
+        with_env(|env, activity| {
+            let res = env
+                .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let dm = env
+                .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            env.get_field(&dm, "density", "F").ok()?.f().ok()
+        })
+        .flatten()
+        .unwrap_or(2.0)
+    }
+
+    /// 设置排除区：左右两侧各 width_dp 宽、全高的竖带（同时拦截左右边缘侧滑返回给 App）
     pub fn set_exclusion(width_dp: i32, enable: bool) -> bool {
         with_env(|env, activity| {
             let Ok(window) = env
@@ -227,13 +284,18 @@ mod imp {
                 else {
                     return false;
                 };
+                let Ok(width) = env.get_field(&dm, "widthPixels", "I").and_then(|v| v.i()) else {
+                    return false;
+                };
                 let Ok(height) = env.get_field(&dm, "heightPixels", "I").and_then(|v| v.i()) else {
                     return false;
                 };
 
                 let w = (width_dp as f32 * density) as i32;
                 let Ok(rect_cls) = env.find_class("android/graphics/Rect") else { return false };
-                let Ok(rect) = env.new_object(
+
+                // 左边缘排除区
+                if let Ok(rect_left) = env.new_object(
                     &rect_cls,
                     "(IIII)V",
                     &[
@@ -242,15 +304,34 @@ mod imp {
                         JValue::Int(w),
                         JValue::Int(height),
                     ],
-                ) else {
-                    return false;
-                };
-                let _ = env.call_method(
-                    &list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[JValue::Object(&rect)],
-                );
+                ) {
+                    let _ = env.call_method(
+                        &list,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[JValue::Object(&rect_left)],
+                    );
+                }
+
+                // 右边缘排除区
+                let right_start = (width - w).max(0);
+                if let Ok(rect_right) = env.new_object(
+                    &rect_cls,
+                    "(IIII)V",
+                    &[
+                        JValue::Int(right_start),
+                        JValue::Int(0),
+                        JValue::Int(width),
+                        JValue::Int(height),
+                    ],
+                ) {
+                    let _ = env.call_method(
+                        &list,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[JValue::Object(&rect_right)],
+                    );
+                }
             }
 
             let r = env.call_method(
@@ -260,8 +341,8 @@ mod imp {
                 &[JValue::Object(&list)],
             );
             if env.exception_check().unwrap_or(false) {
-                env.exception_describe();
-                env.exception_clear();
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
             }
             r.is_ok()
         })
@@ -270,7 +351,7 @@ mod imp {
 }
 
 #[cfg(target_os = "android")]
-pub use imp::{activity_object, android_app, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion};
+pub use imp::{activity_object, android_app, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, status_bar_height_px};
 
 /// 非 Android 平台（桌面调试）为空实现
 #[cfg(not(target_os = "android"))]
@@ -279,6 +360,16 @@ pub fn init(_vm: *mut std::ffi::c_void, _activity: *mut std::ffi::c_void) {}
 #[cfg(not(target_os = "android"))]
 pub fn set_exclusion(_width_dp: i32, _enable: bool) -> bool {
     false
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn status_bar_height_px() -> i32 {
+    0
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn display_density() -> f32 {
+    1.0
 }
 
 #[cfg(not(target_os = "android"))]
