@@ -228,25 +228,6 @@ impl BiliClient {
             return Ok(Vec::new());
         };
 
-        // 一次性诊断：确认这条链路上到底有没有 reply_control.location。
-        //
-        // 背景：PiliPlus 的做法是走 gRPC（reply_item_grpc.dart），
-        // 而 Web 端点 /x/v2/reply/wbi/main 的字段集并不完全一致。
-        // 不实测就只能猜，猜错的表现是"IP 属地永远不显示"且没有任何报错。
-        if let Some(first) = replies.first() {
-            let has_rc = first.get("reply_control").is_some();
-            let loc = first["reply_control"]["location"].as_str().unwrap_or("");
-            // 用 eprintln 而不是 log::info!：宿主的 Android 入口没有装
-            // logger，log crate 的宏不会产生任何输出。eprintln 在 Android 上
-            // 会进 logcat（tag 由 std 固定），至少能被抓到。
-            eprintln!(
-                "[reply] 有reply_control={} location={:?} reply_control全文={:?}",
-                has_rc,
-                loc,
-                serde_json::to_string(&first["reply_control"]).unwrap_or_default()
-            );
-        }
-
         let res = replies
             .iter()
             .map(|r| parse_reply(r, owner_mid))
@@ -273,8 +254,20 @@ fn parse_reply(r: &serde_json::Value, owner_mid: u64) -> CommentItem {
     let vip_status = member["vip"]["vipStatus"].as_u64().unwrap_or(0);
     let vip_type = member["vip"]["vipType"].as_u64().unwrap_or(0);
 
-    // 属地：接口给的是 "IP属地：广东" 这种整串，前端直接用。
-    // 极少数老数据放在 reply_control.location 之外，这里只认这一个位置。
+    // 属地：reply_control.location
+    //
+    // 实测结论（2026-11-14，抓的是本机 App 的真实响应）：
+    //   未登录访问 /x/v2/reply/wbi/main 时，reply_control 只有这些键：
+    //     max_line / sub_reply_entry_text / sub_reply_title_text
+    //     / support_share / time_desc / translation_switch
+    //   **没有 location**。
+    //
+    //   对比 PiliPlus（lib/http/reply.dart）：它未登录时走 /x/v2/reply/main，
+    //   已登录时走 /x/v2/reply 并显式带 cookie —— 两条路径拿到的字段不同，
+    //   属地是登录态才下发的。
+    //
+    // 因此这里保留读取逻辑（有就用），但不为了它去伪造登录态。
+    // 没有 bip 时 UI 侧会自动省略这一段，不会显示空的分隔符。
     let location = r["reply_control"]["location"]
         .as_str()
         .unwrap_or_default()

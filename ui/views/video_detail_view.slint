@@ -1384,6 +1384,7 @@ export component VideoDetailView inherits Rectangle {
                                                     spacing: 3px;
 
                                                     // 楼中楼默认只展开前 1 条，除非点了"展开"
+                                                    // 折叠时只露第一条（和 B 站一致），展开时全露
                                                     if expanded || i == 0 : VerticalLayout {
                                                         spacing: 3px;
 
@@ -1403,10 +1404,14 @@ export component VideoDetailView inherits Rectangle {
                                                 }
 
                                                 // 展开 / 收起
-                                                if comment.sub_replies.length > 1 : Text {
+                                                //
+                                                // 折叠时显示总数（bilibili 的原话术是
+                                                // "共 N 条回复"，N 取自 rcount，比
+                                                // 接口预置的条数更准）；展开后变成"收起"。
+                                                if comment.reply_count > 1 || comment.sub_replies.length > 1 : Text {
                                                     text: expanded
                                                         ? "收起"
-                                                        : "共 " + (comment.reply_count > comment.sub_replies.length
+                                                        : "共 " + (comment.reply_count > 0
                                                             ? comment.reply_count
                                                             : comment.sub_replies.length) + " 条回复";
                                                     color: Theme.primary;
