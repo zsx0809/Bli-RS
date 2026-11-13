@@ -432,6 +432,14 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             return;
         };
 
+        // Window 对象：隐藏系统栏要用到
+        let Ok(window) = env
+            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+
         // 取屏幕真实物理尺寸
         let (width_px, height_px) = (|| -> Option<(i32, i32)> {
             let res = env
