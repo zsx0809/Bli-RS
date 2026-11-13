@@ -2,37 +2,36 @@
 // 视频详情与二级播放页面 (Video Detail & Player View)
 //
 // ==============================================================================
-// 交互（重写版，三条铁律）
+// 交互
 // ==============================================================================
 //
 // 1. 点击一律用 GestureArea，不用 TouchArea。
-//
-//    TouchArea 的 `clicked` 不判位移：input_items.rs 的 Released 分支只检查
-//    「pressed == true 且抬起坐标落在自身 geometry 内」，中间滑了多少完全不管。
-//    在相关视频列表上右滑，起点与终点都在同一张卡里 → 被翻译成点击 →
-//    「右滑切换视频」。这是机械原因，不是玄学。
-//
-//    GestureArea（ui/gesture.slint）自己判：位移 < tap_slop 才是 tap，
-//    超过就锁定主轴、此后只发 pan，永不发 tap。
+//    TouchArea.clicked 不判位移，右滑会被翻译成点击（见 ui/gesture.slint）。
 //
 // 2. 左边缘返回归 App，不归系统。
-//
-//    旧版进入二级页时调 set_exclusion(32, false)，把左边缘 32dp 交还系统。
-//    于是左边缘侧滑 = 系统返回 = finish 掉 NativeActivity = App 直接退出。
-//    这就是「左边侧滑退出 App」。
-//
-//    现在 Rust 侧不再解除排除，边缘区归 EdgeBackArea，
-//    从真正的 x=0 起手，全程跟手，超过阈值才返回。
+//    Rust 侧全程保持 setSystemGestureExclusionRects，边缘区归 EdgeBack。
 //
 // 3. 滚动自管，不叠 Flickable。
-//
-//    本页有两个滚动语义不同的区域（播放器固定 + 内容滚动），
-//    再嵌 Flickable 会让它的 100ms press 延迟和 grab 仲裁叠在一起，
-//    表现就是「按下有反馈延迟」。这里用 scroll_gesture 自己算，
 //    content_layer.y = -scroll_y，跟手即时。
 //
-//    scroll_gesture 声明在内容层**下面**：按在按钮/标题上时，
-//    上层的 GestureArea 先拿到事件；按在纯文字/图片上时落到它 → 滚动。
+// 4. 横向滑动切换「简介 / 评论」。
+//    内容层跟着手指走（tab_dx），松手按位移或甩速决定切换还是回弹。
+//    这是详情页唯一的横向语义 —— 详情页不存在"切视频"的横滑。
+//
+// 5. Tab 栏固定在播放器下方，不随内容滚动。
+//    早期把它塞进 content_layer，结果一滚动就看不见，想切 Tab 得先滚回顶部。
+//
+// 6. 底部系统手势条让给系统。
+//    GestureArea 的 respect_system_gesture（默认开）会忽略落在底部
+//    UiMetrics.system_bottom_guard 高度内的起手，避免"想切后台却滚了列表"。
+//
+// ==============================================================================
+// 坐标（见 ui/gesture.slint 的完整推演）
+// ==============================================================================
+//
+// GestureArea 发出的 dx / dy 已经是**窗口绝对坐标**下的位移，
+// 所以内容和手指 1:1 跟随时不会产生正反馈。
+// 这里绝不要拿 mouse-x / mouse-y 自己算位移。
 // ==============================================================================
 
 import { Theme, Spacing, VideoDetailData, RelatedVideoData, CommentItemData } from "../theme.slint";
@@ -70,6 +69,8 @@ export component VideoDetailView inherits Rectangle {
         ? (root.height * 0.48)
         : (root.width * 9 / 16);
 
+    property <length> tabbar_h: 46px;
+
     // ----------------------------------------------------------------------
     // 滚动状态
     // ----------------------------------------------------------------------
@@ -77,15 +78,22 @@ export component VideoDetailView inherits Rectangle {
     property <length> drag_base: 0px;
     property <length> fling_vel: 0px;
 
+    // ----------------------------------------------------------------------
+    // 横向切 Tab 状态
+    // ----------------------------------------------------------------------
+    property <length> tab_dx: 0px;
+    property <bool> tab_animating: false;
+    property <PanAxis> active_axis: PanAxis.None;
+
     out property <length> content_h: body.preferred-height;
-    out property <length> viewport_h: root.height - root.player_height;
+    out property <length> viewport_h: root.height - root.player_height - root.tabbar_h;
     out property <length> max_scroll: Math.max(0px, root.content_h - root.viewport_h);
 
     fling_timer := Timer {
-        interval: 8ms;
+        interval: 10ms;
         running: false;
         triggered => {
-            if (Math.abs(root.fling_vel) < 0.4px) {
+            if (Math.abs(root.fling_vel) < 0.5px) {
                 root.fling_vel = 0px;
                 self.running = false;
                 return;
@@ -104,11 +112,82 @@ export component VideoDetailView inherits Rectangle {
                 return;
             }
             root.scroll_y = next;
-            root.fling_vel = root.fling_vel * 0.955;
+            root.fling_vel = root.fling_vel * 0.95;
         }
     }
 
-    // 边缘返回跟手位移
+    // ----------------------------------------------------------------------
+    // 统一的 pan 状态机
+    //
+    // 所有 GestureArea（底层滚动层、相关视频卡片）都回调到这里，
+    // 保证同一时刻只有一套状态在写 scroll_y / tab_dx。
+    // ----------------------------------------------------------------------
+    function pan_begin(axis: PanAxis) {
+        root.active_axis = axis;
+        fling_timer.stop();
+        root.fling_vel = 0px;
+        root.tab_animating = false;
+
+        if (axis == PanAxis.Vertical) {
+            root.drag_base = root.scroll_y;
+        }
+    }
+
+    function pan_move(dx: length, dy: length) {
+        if (root.active_axis == PanAxis.Vertical) {
+            root.scroll_y = Math.max(0px, Math.min(root.max_scroll, root.drag_base - dy));
+        } else if (root.active_axis == PanAxis.Horizontal) {
+            // 到头了还继续往外拖 → 30% 阻尼（"墙"）
+            let at_left = (root.active_tab == 0 && dx > 0px);
+            let at_right = (root.active_tab == 1 && dx < 0px);
+            root.tab_dx = (at_left || at_right) ? dx * 0.3 : dx;
+        }
+    }
+
+    function pan_end(dx: length, dy: length, vx: length, vy: length) {
+        if (root.active_axis == PanAxis.Vertical) {
+            let v = -vy;
+            if ((v / 1px) > 2.5) {
+                root.fling_vel = Math.min(v, 60px);
+                fling_timer.start();
+            } else if ((v / 1px) < -2.5) {
+                root.fling_vel = Math.max(v, -60px);
+                fling_timer.start();
+            }
+        } else if (root.active_axis == PanAxis.Horizontal) {
+            // 位移过半屏的 22%，或甩得够快，就切。
+            // vx 是 px / move 事件，折算成"一帧位移 ≈ 12px 就够快"。
+            let threshold = root.width * 0.22;
+            let boost = (vx / 1px) * 12px;
+            let effective = root.tab_dx + boost;
+
+            let go_comment = (effective < -threshold && root.active_tab == 0);
+            let go_intro = (effective > threshold && root.active_tab == 1);
+
+            if (go_comment || go_intro) {
+                root.active_tab = go_comment ? 1 : 0;
+                root.scroll_y = 0px;
+                root.tab_dx = 0px;
+                root.fling_vel = 0px;
+            } else {
+                // 回弹
+                root.tab_animating = true;
+                root.tab_dx = 0px;
+            }
+        }
+        root.active_axis = PanAxis.None;
+    }
+
+    function pan_cancel() {
+        root.fling_vel = 0px;
+        root.tab_animating = true;
+        root.tab_dx = 0px;
+        root.active_axis = PanAxis.None;
+    }
+
+    // ----------------------------------------------------------------------
+    // 边缘返回
+    // ----------------------------------------------------------------------
     property <length> edge_dx: 0px;
     property <bool> edge_active: false;
 
@@ -132,7 +211,13 @@ export component VideoDetailView inherits Rectangle {
             animate opacity { duration: 240ms; }
         }
 
-        if !root.detail.is_ready : Rectangle {
+        // 加载中 / 失败。
+        //
+        // 失败必须显式画出来：原来的实现里，日志打一句 "取 playurl 失败" 就
+        // return 了，UI 永远停在"视频加载中…"。
+        // 用户看到的是一个不动也不报错的播放器，唯一出路是返回，
+        // 于是表现为"点了一下、什么都没发生、然后自己跳了下一个视频"。
+        if !root.detail.is_ready && root.detail.load_error == "" : Rectangle {
             width: 116px;
             height: 32px;
             background: #00000088;
@@ -147,6 +232,36 @@ export component VideoDetailView inherits Rectangle {
                 font-weight: 600;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+            }
+        }
+
+        if root.detail.load_error != "" : Rectangle {
+            width: parent.width - 48px;
+            background: transparent;
+            x: 24px;
+            y: (parent.height - self.height) / 2;
+            height: err_col.preferred-height;
+
+            err_col := VerticalLayout {
+                spacing: 10px;
+                alignment: center;
+
+                Text {
+                    text: "无法播放";
+                    color: #ffffff;
+                    font-size: 14px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.detail.load_error;
+                    color: #ffffffaa;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    max-lines: 3;
+                    overflow: elide;
+                    horizontal-alignment: center;
+                }
             }
         }
 
@@ -179,48 +294,149 @@ export component VideoDetailView inherits Rectangle {
     }
 
     // ----------------------------------------------------------------------
+    // Sub-Tab 栏（固定，不随内容滚动）
+    // ----------------------------------------------------------------------
+    Rectangle {
+        x: 0px;
+        y: root.player_height;
+        width: 100%;
+        height: root.tabbar_h;
+        background: Theme.background;
+
+        Rectangle {
+            y: parent.height - 1px;
+            width: 100%;
+            height: 1px;
+            background: Theme.outline_variant.transparentize(60%);
+        }
+
+        HorizontalLayout {
+            padding-left: Spacing.page_margin;
+            padding-right: Spacing.page_margin;
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 0px;
+                alignment: start;
+
+                intro_tab := GestureArea {
+                    width: 60px;
+                    height: root.tabbar_h;
+                    tap(x, y) => {
+                        root.active_tab = 0;
+                        root.scroll_y = 0px;
+                        root.tab_dx = 0px;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 5px;
+
+                        Text {
+                            text: "简介";
+                            font-size: 14px;
+                            font-weight: root.active_tab == 0 ? 700 : 500;
+                            color: root.active_tab == 0 ? Theme.primary : Theme.on_surface_variant;
+                            horizontal-alignment: center;
+                        }
+
+                        Rectangle {
+                            width: 22px;
+                            height: 2px;
+                            background: root.active_tab == 0 ? Theme.primary : transparent;
+                            border-radius: 1px;
+                            animate background { duration: Theme.animation_duration_fast; }
+                        }
+                    }
+                }
+
+                comment_tab := GestureArea {
+                    width: 84px;
+                    height: root.tabbar_h;
+                    tap(x, y) => {
+                        root.active_tab = 1;
+                        root.scroll_y = 0px;
+                        root.tab_dx = 0px;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 5px;
+
+                        Text {
+                            text: root.comments.length > 0
+                                ? "评论 " + root.comments.length
+                                : "评论";
+                            font-size: 14px;
+                            font-weight: root.active_tab == 1 ? 700 : 500;
+                            color: root.active_tab == 1 ? Theme.primary : Theme.on_surface_variant;
+                            horizontal-alignment: center;
+                        }
+
+                        Rectangle {
+                            width: 22px;
+                            height: 2px;
+                            background: root.active_tab == 1 ? Theme.primary : transparent;
+                            border-radius: 1px;
+                            animate background { duration: Theme.animation_duration_fast; }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 110px;
+                height: 28px;
+                border-radius: 14px;
+                background: Theme.surface_variant;
+                y: 9px;
+
+                Text {
+                    text: "点我发弹幕";
+                    color: Theme.on_surface_variant;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
     // 内容区
     // ----------------------------------------------------------------------
     scroll_clip := Rectangle {
         x: 0px;
-        y: root.player_height;
+        y: root.player_height + root.tabbar_h;
         width: root.width;
-        height: root.height - root.player_height;
+        height: Math.max(0px, root.viewport_h);
         clip: true;
         background: Theme.background;
 
-        // 底层滚动手势：只接纵向
+        // 底层手势：纵向滚动 + 横向切 Tab。
+        // axis_ratio 1.5 —— 明显偏纵向，避免斜着划一下就误切 Tab。
         scroll_gesture := GestureArea {
             width: 100%;
             height: 100%;
             tap_slop: 10px;
-            axis_ratio: 1.15;
+            axis_ratio: 1.5;
 
-            pan_started(axis) => {
-                if (axis == PanAxis.Vertical) {
-                    root.drag_base = root.scroll_y;
-                    fling_timer.stop();
-                }
-            }
-            pan_moved(dx, dy) => {
-                root.scroll_y = Math.max(0px,
-                    Math.min(root.max_scroll, root.drag_base - dy));
-            }
-            pan_finished(dx, dy, vx, vy) => {
-                let v = -vy;
-                if (Math.abs(v) > 1.5px) {
-                    root.fling_vel = v * 2.0;
-                    fling_timer.start();
-                } else {
-                    root.fling_vel = 0px;
-                }
-            }
+            pan_started(axis) => { root.pan_begin(axis); }
+            pan_moved(dx, dy) => { root.pan_move(dx, dy); }
+            pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+            pan_cancelled => { root.pan_cancel(); }
         }
 
         content_layer := Rectangle {
             width: parent.width;
             height: Math.max(parent.height, root.content_h);
             y: -root.scroll_y;
+            x: root.tab_dx;
+
+            animate x {
+                duration: root.tab_animating ? Theme.animation_duration_normal : 0ms;
+                easing: ease-out;
+            }
 
             body := VerticalLayout {
                 width: parent.width;
@@ -228,102 +444,13 @@ export component VideoDetailView inherits Rectangle {
                 spacing: 0px;
                 alignment: start;
 
-                // ================= Sub-Tab 栏 =================
-                Rectangle {
-                    height: 44px;
-                    width: 100%;
-                    border-width: 1px;
-                    border-color: Theme.outline_variant.transparentize(60%);
-
-                    HorizontalLayout {
-                        padding-left: Spacing.page_margin;
-                        padding-right: Spacing.page_margin;
-                        alignment: space-between;
-
-                        HorizontalLayout {
-                            spacing: 0px;
-                            alignment: start;
-
-                            intro_tab := GestureArea {
-                                width: 56px;
-                                height: 44px;
-                                tap(x, y) => { root.active_tab = 0; }
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    spacing: 4px;
-
-                                    Text {
-                                        text: "简介";
-                                        font-size: 14px;
-                                        font-weight: root.active_tab == 0 ? 700 : 500;
-                                        color: root.active_tab == 0 ? Theme.primary : Theme.on_surface_variant;
-                                        horizontal-alignment: center;
-                                    }
-
-                                    Rectangle {
-                                        width: 20px;
-                                        height: 2px;
-                                        background: root.active_tab == 0 ? Theme.primary : transparent;
-                                        border-radius: 1px;
-                                    }
-                                }
-                            }
-
-                            comment_tab := GestureArea {
-                                width: 76px;
-                                height: 44px;
-                                tap(x, y) => { root.active_tab = 1; }
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    spacing: 4px;
-
-                                    Text {
-                                        text: root.comments.length > 0
-                                            ? "评论 " + root.comments.length
-                                            : "评论";
-                                        font-size: 14px;
-                                        font-weight: root.active_tab == 1 ? 700 : 500;
-                                        color: root.active_tab == 1 ? Theme.primary : Theme.on_surface_variant;
-                                        horizontal-alignment: center;
-                                    }
-
-                                    Rectangle {
-                                        width: 20px;
-                                        height: 2px;
-                                        background: root.active_tab == 1 ? Theme.primary : transparent;
-                                        border-radius: 1px;
-                                    }
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            width: 110px;
-                            height: 28px;
-                            border-radius: 14px;
-                            background: Theme.surface_variant;
-                            y: 8px;
-
-                            Text {
-                                text: "点我发弹幕";
-                                color: Theme.on_surface_variant;
-                                font-size: 11px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
                 // ================= 简介 Tab =================
                 if root.active_tab == 0 : VerticalLayout {
                     spacing: 0px;
 
                     // ---- UP 主 ----
                     Rectangle {
-                        height: 56px;
+                        height: 60px;
                         width: 100%;
 
                         HorizontalLayout {
@@ -341,7 +468,7 @@ export component VideoDetailView inherits Rectangle {
                                     border-radius: 20px;
                                     background: Theme.surface_variant;
                                     clip: true;
-                                    y: 8px;
+                                    y: 10px;
 
                                     Image {
                                         source: root.detail.author_face;
@@ -362,7 +489,7 @@ export component VideoDetailView inherits Rectangle {
 
                                 VerticalLayout {
                                     alignment: center;
-                                    spacing: 2px;
+                                    spacing: 3px;
 
                                     Text {
                                         text: root.detail.author;
@@ -382,7 +509,7 @@ export component VideoDetailView inherits Rectangle {
                             follow_btn := GestureArea {
                                 width: root.is_following ? 64px : 72px;
                                 height: 30px;
-                                y: 13px;
+                                y: 15px;
 
                                 tap(x, y) => {
                                     root.is_following = !root.is_following;
@@ -408,13 +535,13 @@ export component VideoDetailView inherits Rectangle {
                         }
                     }
 
-                    // ---- 标题折叠 ----
+                    // ---- 标题与简介 ----
                     VerticalLayout {
                         padding-left: Spacing.page_margin;
                         padding-right: Spacing.page_margin;
-                        padding-top: 6px;
-                        padding-bottom: 8px;
-                        spacing: 6px;
+                        padding-top: 4px;
+                        padding-bottom: 10px;
+                        spacing: 8px;
 
                         title_hit := GestureArea {
                             width: 100%;
@@ -431,7 +558,7 @@ export component VideoDetailView inherits Rectangle {
                                     font-size: 15px;
                                     font-weight: 700;
                                     wrap: word-wrap;
-                                    max-lines: root.desc_expanded ? 10 : 1;
+                                    max-lines: root.desc_expanded ? 10 : 2;
                                     overflow: elide;
                                     width: root.width - 56px;
                                 }
@@ -478,14 +605,14 @@ export component VideoDetailView inherits Rectangle {
                         if root.desc_expanded : Text {
                             text: root.detail.desc != "" ? root.detail.desc : "暂无简介";
                             color: Theme.on_surface_variant;
-                            font-size: 12px;
+                            font-size: 13px;
                             wrap: word-wrap;
                         }
                     }
 
                     // ---- 五联条 ----
                     Rectangle {
-                        height: 60px;
+                        height: 62px;
                         width: 100%;
 
                         HorizontalLayout {
@@ -495,7 +622,7 @@ export component VideoDetailView inherits Rectangle {
 
                             like_btn := GestureArea {
                                 width: 56px;
-                                height: 60px;
+                                height: 62px;
                                 tap(x, y) => { root.like_clicked(); }
 
                                 VerticalLayout {
@@ -519,7 +646,7 @@ export component VideoDetailView inherits Rectangle {
 
                             dislike_btn := GestureArea {
                                 width: 56px;
-                                height: 60px;
+                                height: 62px;
                                 tap(x, y) => { root.dislike_clicked(); }
 
                                 VerticalLayout {
@@ -538,7 +665,7 @@ export component VideoDetailView inherits Rectangle {
 
                             coin_btn := GestureArea {
                                 width: 56px;
-                                height: 60px;
+                                height: 62px;
                                 tap(x, y) => { root.coin_clicked(); }
 
                                 VerticalLayout {
@@ -562,7 +689,7 @@ export component VideoDetailView inherits Rectangle {
 
                             fav_btn := GestureArea {
                                 width: 56px;
-                                height: 60px;
+                                height: 62px;
                                 tap(x, y) => { root.fav_clicked(); }
 
                                 VerticalLayout {
@@ -586,7 +713,7 @@ export component VideoDetailView inherits Rectangle {
 
                             share_btn := GestureArea {
                                 width: 56px;
-                                height: 60px;
+                                height: 62px;
                                 tap(x, y) => { root.share_clicked(); }
 
                                 VerticalLayout {
@@ -617,103 +744,113 @@ export component VideoDetailView inherits Rectangle {
                         padding-bottom: 40px;
                         spacing: 4px;
 
+                        // 卡片自带 GestureArea：纵向滚、横向切 Tab 都冒泡上来，
+                        // 保证压在卡片上的手势和压在空隙上的行为完全一致。
                         for item in root.related_list : RelatedVideoCard {
                             data: item;
                             clicked => { root.related_selected(item.bvid); }
-                            pan_started(axis) => {
-                                if (axis == PanAxis.Vertical) {
-                                    root.drag_base = root.scroll_y;
-                                    fling_timer.stop();
-                                }
-                            }
-                            pan_moved(dx, dy) => {
-                                root.scroll_y = Math.max(0px,
-                                    Math.min(root.max_scroll, root.drag_base - dy));
-                            }
-                            pan_finished(dx, dy, vx, vy) => {
-                                let v = -vy;
-                                if (Math.abs(v) > 1.5px) {
-                                    root.fling_vel = v * 2.0;
-                                    fling_timer.start();
-                                } else {
-                                    root.fling_vel = 0px;
-                                }
-                            }
+                            pan_started(axis) => { root.pan_begin(axis); }
+                            pan_moved(dx, dy) => { root.pan_move(dx, dy); }
+                            pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+                            pan_cancelled => { root.pan_cancel(); }
                         }
                     }
                 }
 
                 // ================= 评论 Tab =================
+                //
+                // 排版目标（对着 PiliPlus / 官方客户端）：
+                //   正文 15px、昵称 13px、元信息 11px、条目间距 22px + 分割线。
+                // 之前是 13 / 12 / 10 + 16px 间距，字小且挤，读起来费劲。
                 if root.active_tab == 1 : VerticalLayout {
-                    padding-left: Spacing.page_margin;
-                    padding-right: Spacing.page_margin;
-                    padding-top: 12px;
-                    padding-bottom: 40px;
-                    spacing: 16px;
+                    padding-left: Spacing.page_margin + 2px;
+                    padding-right: Spacing.page_margin + 2px;
+                    padding-top: 14px;
+                    padding-bottom: 48px;
+                    spacing: 0px;
 
                     if root.comments.length == 0 : Rectangle {
-                        height: 120px;
+                        height: 140px;
 
                         Text {
                             text: "评论加载中…";
                             color: Theme.on_surface_variant;
-                            font-size: 13px;
+                            font-size: 14px;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
                     }
 
-                    for comment in root.comments : HorizontalLayout {
-                        spacing: 12px;
-                        alignment: start;
+                    for comment in root.comments : VerticalLayout {
+                        spacing: 0px;
 
-                        Rectangle {
-                            width: 36px;
-                            height: 36px;
-                            border-radius: 18px;
-                            background: Theme.surface_variant;
-                            clip: true;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            padding-bottom: 18px;
+                            padding-top: 2px;
 
-                            Image {
-                                source: comment.user_face;
-                                width: 100%;
-                                height: 100%;
-                                image-fit: cover;
+                            // 头像
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                border-radius: 20px;
+                                background: Theme.surface_variant;
+                                clip: true;
+
+                                Image {
+                                    source: comment.user_face;
+                                    width: 100%;
+                                    height: 100%;
+                                    image-fit: cover;
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 7px;
+
+                                Text {
+                                    text: comment.user_name;
+                                    color: Theme.on_surface_variant;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: comment.content;
+                                    color: Theme.on_surface;
+                                    font-size: 15px;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 18px;
+                                    alignment: start;
+
+                                    Text {
+                                        text: comment.pubtime;
+                                        color: Theme.outline;
+                                        font-size: 11px;
+                                    }
+                                    Text {
+                                        text: "赞 " + comment.likes;
+                                        color: Theme.outline;
+                                        font-size: 11px;
+                                    }
+                                }
                             }
                         }
 
-                        VerticalLayout {
-                            spacing: 4px;
-
-                            Text {
-                                text: comment.user_name;
-                                color: Theme.on_surface_variant;
-                                font-size: 12px;
-                                font-weight: 600;
-                            }
-
-                            Text {
-                                text: comment.content;
-                                color: Theme.on_surface;
-                                font-size: 13px;
-                                wrap: word-wrap;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 16px;
-                                alignment: start;
-
-                                Text {
-                                    text: comment.pubtime;
-                                    color: Theme.outline;
-                                    font-size: 10px;
-                                }
-                                Text {
-                                    text: "赞 " + comment.likes;
-                                    color: Theme.outline;
-                                    font-size: 10px;
-                                }
-                            }
+                        // 分割线：条目之间靠它划界，比纯留白清楚
+                        Rectangle {
+                            width: 100%;
+                            height: 1px;
+                            background: Theme.outline_variant.transparentize(75%);
+                        }
+                        Rectangle {
+                            width: 100%;
+                            height: 18px;
+                            background: transparent;
                         }
                     }
                 }
@@ -724,12 +861,9 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
     // 左边缘返回（最上层，从真正的 x=0 起手）
     //
-    // 起点在 y = safe_top 之下 —— 让开顶部那一行返回按钮，
-    // 否则两者在左上角 48x48 的范围里重叠，谁在上面谁通吃。
-    // 官方客户端也是这样：返回按钮与边缘手势分居上下，不抢同一块。
-    //
-    // vertical_enabled = false：竖向起手被判成"放弃"，不发 pan、不发 tap，
-    // 所以从边缘起手的竖向滚动在 48px 带内无效 —— 与官方边缘返回区一致。
+    // 起点在 y = safe_top 之下 —— 让开顶部那一行返回按钮。
+    // vertical_enabled = false：竖向起手直接放弃，
+    // 所以边缘 48px 带内不能起手纵向滚动 —— 与官方边缘返回区一致。
     // ----------------------------------------------------------------------
     edge_back := GestureArea {
         x: 0px;
@@ -754,6 +888,10 @@ export component VideoDetailView inherits Rectangle {
             root.edge_active = false;
             root.edge_dx = 0px;
             if (dx > 32px) { root.back_clicked(); }
+        }
+        pan_cancelled => {
+            root.edge_active = false;
+            root.edge_dx = 0px;
         }
     }
 

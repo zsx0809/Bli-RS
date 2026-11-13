@@ -52,6 +52,8 @@ export struct VideoDetailData {
     is_liked: bool,
     is_coined: bool,
     is_favorited: bool,
+    /// 播放链路失败的原因。非空时播放器区域显示错误，不再显示"加载中"。
+    load_error: string,
 }
 
 /// 相关推荐单列横向卡片数据
@@ -99,6 +101,24 @@ export global Spacing {
     // 手势
     out property <length> edge_swipe_width: 28px;   // 左边缘呼出抽屉的死区宽度
     out property <length> tab_swipe_threshold: 56px;
+}
+
+/// 窗口级度量（由 AppWindow 在启动与尺寸变化时写入）
+///
+/// 存在的理由：手势原语需要知道"屏幕最底下那一条"在哪，
+/// 而那条线是窗口坐标，组件自身算不出来。
+/// 走 global 而不是逐层传参 —— 否则要穿过 VideoCard / RelatedVideoCard /
+/// RecommendView 三层才能到 GestureArea，每加一个页面就多一串样板。
+export global UiMetrics {
+    /// 窗口高度（窗口坐标）
+    in-out property <length> window_height: 844px;
+
+    /// 底部系统手势条（上滑回桌面 / 多任务）占用的高度。
+    ///
+    /// 这块区域的触摸由系统接管。App 若在这里也判定 tap / pan，
+    /// 就会与系统手势打架 —— 表现为"想切后台，却滚了一下列表或点进了视频"。
+    /// GestureArea 会直接忽略落在这条带里的起手。
+    in-out property <length> system_bottom_guard: 26px;
 }
 
 /// 全局动态调色板单例

@@ -1,0 +1,38 @@
+
+// ==============================================================================
+// 空页面的横向手势 (Page Swipe Fallback)
+//
+// LiveView / FollowView 目前是空状态占位，内部没有任何 GestureArea。
+// 于是滑到这两页之后，屏幕上没有任何东西接收横向拖动 —— 切得出去，切不回来。
+// 这是"左右两个 tap 空白、无法滑回来"的直接原因。
+//
+// 修法：在页容器最底层（**先声明** = 在下面）放一个只接横向的手势区。
+// 上层视图里凡是没被接住的触摸，最后都会落到它身上。
+//
+// 为什么不是覆盖层：覆盖层的病根是"后声明 = 在上层"，
+// 会抢在卡片之前拿到 press。这里反过来放在最下面，
+// 只有当上面没人要这个事件时才会轮到它 —— 语义与兜底完全一致。
+// ==============================================================================
+
+import { GestureArea, PanAxis } from "../gesture.slint";
+
+export component PageSwipeArea inherits Rectangle {
+    callback swipe(dx: length, dy: length);
+    callback swipe_finished(dx: length, vx: length);
+    callback swipe_cancelled();
+
+    background: transparent;
+
+    g := GestureArea {
+        width: 100%;
+        height: 100%;
+        axis_ratio: 1.6;
+        vertical_enabled: false;
+
+        tap(x, y) => { }
+        pan_started(axis) => { root.swipe(0px, 0px); }
+        pan_moved(dx, dy) => { root.swipe(dx, dy); }
+        pan_finished(dx, dy, vx, vy) => { root.swipe_finished(dx, vx); }
+        pan_cancelled => { root.swipe_cancelled(); }
+    }
+}

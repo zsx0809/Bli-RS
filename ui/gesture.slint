@@ -1,33 +1,90 @@
 // ==============================================================================
 // 手势原语 (Gesture Primitives)
 //
-// 为什么要有这一层 —— 这是整套交互的地基，别绕过它直接用 TouchArea.clicked。
+// 这是整套交互的地基。改之前先把下面三段读完，都是踩过的坑。
 //
-// Slint 内建 TouchArea 的 `clicked` **不判断位移**：
-//   input_items.rs 的 `MouseEvent::Released` 分支只做两件事 ——
-//   `pressed == true` 且 release 坐标落在自身 geometry 内，就回调 clicked。
-//   从按下到抬起中间滑了多少像素，它完全不看。
-//
-//   在列表上侧滑时，手指的起点和终点通常落在同一张卡片里，
-//   于是"一次侧滑"被翻译成"一次点击"，表现为侧滑直接打开了一个视频。
-//   这就是二级页面右滑会切视频的机械原因。
-//
-// TouchArea 的 `pointer-event` 拿的是原始 down / move / up，不受上面那套判定污染。
-// 所以这里把判定权收回来，规则只有三条：
-//
-//   1. 位移全程 < tap_slop            → tap
-//   2. 位移 >= tap_slop               → 锁定主轴，此后只发 pan_*，永不发 tap
-//   3. 长按计时到点且尚未锁定主轴      → long_press
-//
-// 锁定是**单次手势内不可逆**的：一旦判定成拖动，这次手势就再也不会变成点击。
-// 反过来，一旦判定方向，纵向与横向也不会互相翻转。
-//
-// 速度跟踪：
-//   用相邻两次 move 的位移做指数平滑（0.4 / 0.6）。
-//   直接取最后一帧的瞬时值会抖 —— 触摸事件的 move 间隔并不均匀，
-//   有时一帧只有一个 move，有时一帧连着来四个，
-//   抬手时可能刚好取到一个接近 0 的样本，表现为"明明甩得很快，松手却不动"。
 // ==============================================================================
+// 一、为什么不用 TouchArea.clicked
+// ==============================================================================
+//
+// Slint 内建 TouchArea 的 `clicked` **不判断位移**。i-slint-core 的
+// items/input_items.rs，MouseEvent::Released 分支只有两个条件：
+//
+//     if *button == Left
+//         && LogicalRect::new(Point::default(), geometry.size).contains(*position)
+//         && self.pressed()
+//     { clicked() }
+//
+// 从按下到抬起中间滑了多远，它一个字都没看。
+// 在列表上侧滑，起点终点通常落在同一张卡里 → 一次侧滑被翻译成一次点击。
+// 这就是"右滑直接切了下个视频"的机械原因。
+//
+// TouchArea 的 `pointer-event` 拿的是原始 down / move / up / cancel，
+// 不受上面那套判定污染。所以把判定权收回来：
+//
+//   1. 位移 < tap_slop            → tap
+//   2. 位移 >= tap_slop           → 锁定主轴，此后只发 pan_*，永不发 tap
+//   3. 长按到点且尚未锁轴          → long_press
+//
+// 锁定在单次手势内不可逆。一旦判成拖动，这次手势就再也不会变成点击。
+//
+// ==============================================================================
+// 二、坐标必须用窗口绝对坐标（这是本项目最贵的一个 bug）
+// ==============================================================================
+//
+// `mouse-x` / `mouse-y` 是**相对本组件原点**的局部坐标。
+// 而本组件几乎总是待在会移动的容器里：
+//
+//   RecommendView  content_layer.y = -scroll_y      （纵向滚）
+//   AppWindow      HorizontalLayout.x = page + swipe（横向切频道）
+//   VideoDetail    content_layer.y = -scroll_y      （纵向滚）
+//
+// 于是手指静止不动时：
+//
+//   卡片上移 10px → 同一个屏幕位置在卡片里的局部坐标 +10 →
+//   dy 算出 +10 → 喂给 scroll_y → 卡片再上移 10px → dy 又算出 +10 → …
+//
+// 这是一个正反馈。手指停住，画面自己上下飞，越飞越快；
+// 纵向上表现为"停留就上下晃出虚影"，横向上表现为"左右晃"。
+// 抬手时 vel 早已发散成天文数字，fling 于是随机滚到不知道哪里，
+// finish_swipe 也据此随机切频道。
+//
+// 修法：absolute-position 是这个 item 在窗口里的位置，
+// 把它加回去就抵消了所有祖先位移，得到稳定的窗口坐标：
+//
+//     px = self.absolute-position.x + self.mouse-x
+//
+// 注意：pan_moved 会移动祖先，同一个事件处理过程中 absolute-position 会变。
+// 所以每处理一个事件，先把 px/py 取进局部变量固定下来，之后一律用局部变量。
+//
+// ==============================================================================
+// 三、速度跟踪
+// ==============================================================================
+//
+// 用相邻两次 move 的位移做指数平滑（0.4 / 0.6）。
+// 直接取最后一帧的瞬时值会抖 —— 触摸事件的 move 间隔并不均匀，
+// 有时一帧一个 move，有时一帧连着来四个，抬手时可能刚好取到一个接近 0 的样本，
+// 表现为"明明甩得很快，松手却不动"。
+// ==============================================================================
+
+// ==============================================================================
+// 四、与系统手势的边界
+// ==============================================================================
+//
+// Android 10+ 的手势导航，屏幕最底下约 20~30dp 归系统（上滑回桌面 / 多任务）。
+// 这块区域 App 会收到事件，但系统同时也在监听 —— 于是"想切后台"变成
+// "顺便滚了一下列表 / 点进了视频"。
+//
+// 排除区（setSystemGestureExclusionRects）对底部上滑基本无效：
+// Android 只在三键导航下给底部配额，且不保证生效。
+// 所以这里退一步：**底部一条带内直接不起手势**，把这段彻底留给系统。
+//
+// 只忽略"起手"落在带内的情形 —— 从上方按下来一路滑到带内，那是正常拖动。
+//
+// 左侧同理留一条极窄的死区，但那是给 EdgeBack 用的，见 VideoDetailView。
+// ==============================================================================
+
+import { UiMetrics } from "theme.slint";
 
 /// 手势锁定后的主轴方向
 export enum PanAxis {
@@ -41,7 +98,7 @@ export component GestureArea inherits TouchArea {
     // 参数
     // ----------------------------------------------------------------------
 
-    /// 小于它算点击，大于等于它算拖动。8px 是 Android 的 touch slop 量级。
+    /// 小于它算点击，大于等于它算拖动。8px 是 Android touch slop 的量级。
     in property <length> tap_slop: 8px;
 
     /// 主轴判定比例：横向位移必须大于纵向的这么多倍才算横滑。
@@ -56,11 +113,15 @@ export component GestureArea inherits TouchArea {
     /// 是否接纵向拖动
     in property <bool> vertical_enabled: true;
 
+    /// 是否让出底部系统手势条。
+    /// 默认让出；只有明确要覆盖到屏幕最底边的控件（如抽屉）才关掉。
+    in property <bool> respect_system_gesture: true;
+
     // ----------------------------------------------------------------------
-    // 输出：给父组件判定用的起点与方向
+    // 输出
     // ----------------------------------------------------------------------
 
-    /// 本次手势按下的坐标（相对本组件左上角）
+    /// 起手位置，**局部坐标**（相对本组件左上角），给命中测试用
     out property <length> start_x: 0px;
     out property <length> start_y: 0px;
     /// 本次手势锁定后的主轴
@@ -72,22 +133,29 @@ export component GestureArea inherits TouchArea {
     // 回调
     // ----------------------------------------------------------------------
 
-    /// 起点坐标。父组件拿去做命中测试。
+    /// 点击：起手位置（局部坐标）
     callback tap(length, length);
-    /// 长按：起点坐标
+    /// 长按：起手位置（局部坐标）
     callback long_press(length, length);
 
-    /// 主轴刚被锁定的瞬间（父组件在这里记录拖动基准）
+    /// 主轴刚被锁定的瞬间
     callback pan_started(PanAxis);
-    /// 拖动中：累计位移（相对起点，不是增量）
+    /// 拖动中：累计位移（相对起点，窗口坐标；不是增量）
     callback pan_moved(length, length);
     /// 抬手：累计位移 + 抬手瞬间速度（px / move 事件，已平滑）
     callback pan_finished(length, length, length, length);
+    /// 手势被外部打断（系统抢走触摸 / 组件失能 / 父级重建）。
+    /// 父组件必须在这里把拖动基准与位移复位，否则状态会卡住。
+    callback pan_cancelled();
 
     // ----------------------------------------------------------------------
     // 内部状态
+    //
+    // 全部是窗口坐标，只有 start_x / start_y 例外（那是局部坐标）。
     // ----------------------------------------------------------------------
 
+    property <length> anchor_x: 0px;
+    property <length> anchor_y: 0px;
     property <length> last_x: 0px;
     property <length> last_y: 0px;
     property <bool> is_down: false;
@@ -98,7 +166,7 @@ export component GestureArea inherits TouchArea {
 
     long_timer := Timer {
         // Timer 的 interval 必须是常量：不能绑到 root.long_press_delay。
-        // 用固定的 500ms，是否启用由 long_press_delay 布尔化控制。
+        // 用固定的 500ms，是否启用由 long_enabled 布尔化控制。
         interval: 500ms;
         running: false;
         triggered => {
@@ -113,10 +181,24 @@ export component GestureArea inherits TouchArea {
 
     pointer-event(event) => {
         if (event.kind == PointerEventKind.down) {
+            // 起手落在底部系统手势条内 → 整个手势不启动，全部留给系统。
+            // 注意这里必须 return，不能在后面再判断 —— 一旦 is_down 置位，
+            // 后续 move 就会开始判定主轴，系统上滑依旧会被抢。
+            if (root.respect_system_gesture) {
+                let py_win = self.absolute-position.y + self.mouse-y;
+                if ((UiMetrics.window_height - py_win) < UiMetrics.system_bottom_guard) {
+                    return;
+                }
+            }
+
             root.start_x = self.mouse-x;
             root.start_y = self.mouse-y;
-            root.last_x = self.mouse-x;
-            root.last_y = self.mouse-y;
+
+            root.anchor_x = self.absolute-position.x + self.mouse-x;
+            root.anchor_y = self.absolute-position.y + self.mouse-y;
+            root.last_x = root.anchor_x;
+            root.last_y = root.anchor_y;
+
             root.is_down = true;
             root.locked = false;
             root.long_fired = false;
@@ -131,41 +213,44 @@ export component GestureArea inherits TouchArea {
         } else if (event.kind == PointerEventKind.move) {
             if (!root.is_down) { return; }
 
-            let dx = self.mouse-x - root.start_x;
-            let dy = self.mouse-y - root.start_y;
+            // 固定本次事件的窗口坐标。后面 pan_moved 会移动祖先，
+            // 不能再去读 absolute-position。
+            let px = self.absolute-position.x + self.mouse-x;
+            let py = self.absolute-position.y + self.mouse-y;
+            let dx = px - root.anchor_x;
+            let dy = py - root.anchor_y;
 
             if (!root.locked) {
-                let ax = Math.abs(dx);
-                let ay = Math.abs(dy);
-                if (ax < root.tap_slop && ay < root.tap_slop) { return; }
+                let ax = (dx / 1px);
+                let ay = (dy / 1px);
+                let slop = (root.tap_slop / 1px);
+                if (Math.abs(ax) < slop && Math.abs(ay) < slop) { return; }
 
-                // ---- 锁定主轴 ----
-                root.locked = true;
-                root.dragging = true;
-                long_timer.stop();
-
+                // 只接横向，但用户明显在纵向拖 → 放弃这次手势，
+                // 不发 tap 也不发 pan。典型场景是详情页左边缘返回区里的竖向滚动。
                 let horizontal = root.horizontal_enabled
-                    && (!root.vertical_enabled
-                        || (ay / 1px) * root.axis_ratio < (ax / 1px));
-
+                    && (!root.vertical_enabled || ay * root.axis_ratio < ax);
                 if (!horizontal && !root.vertical_enabled) {
-                    // 只接横向，但用户明显在纵向拖 —— 放弃这次手势
                     root.is_down = false;
                     root.axis = PanAxis.None;
                     return;
                 }
 
+                // ---- 锁定主轴 ----
+                root.locked = true;
+                root.dragging = true;
+                long_timer.stop();
                 root.axis = horizontal ? PanAxis.Horizontal : PanAxis.Vertical;
                 root.pan_started(root.axis);
             }
 
             // ---- 速度：指数平滑 ----
-            let mvx = self.mouse-x - root.last_x;
-            let mvy = self.mouse-y - root.last_y;
+            let mvx = px - root.last_x;
+            let mvy = py - root.last_y;
             root.vel_x = root.vel_x * 0.4 + mvx * 0.6;
             root.vel_y = root.vel_y * 0.4 + mvy * 0.6;
-            root.last_x = self.mouse-x;
-            root.last_y = self.mouse-y;
+            root.last_x = px;
+            root.last_y = py;
 
             root.pan_moved(dx, dy);
         } else if (event.kind == PointerEventKind.up) {
@@ -173,29 +258,39 @@ export component GestureArea inherits TouchArea {
             if (!root.is_down) { return; }
             root.is_down = false;
 
-            if (!root.locked) {
-                if (!root.long_fired) {
-                    root.tap(root.start_x, root.start_y);
-                }
-            } else {
-                root.pan_finished(
-                    self.mouse-x - root.start_x,
-                    self.mouse-y - root.start_y,
-                    root.vel_x,
-                    root.vel_y,
-                );
+            let px = self.absolute-position.x + self.mouse-x;
+            let py = self.absolute-position.y + self.mouse-y;
+
+            // 双保险：即使某些事件序列漏掉了锁轴，只要手指在窗口里
+            // 实际移动超过 slop，就不允许落成 tap。
+            let moved = Math.abs(px - root.anchor_x) >= root.tap_slop
+                     || Math.abs(py - root.anchor_y) >= root.tap_slop;
+
+            if (root.locked) {
+                root.pan_finished(px - root.anchor_x, py - root.anchor_y,
+                                  root.vel_x, root.vel_y);
+            } else if (!root.long_fired && !moved) {
+                root.tap(root.start_x, root.start_y);
             }
 
             root.locked = false;
             root.dragging = false;
             root.axis = PanAxis.None;
         } else if (event.kind == PointerEventKind.cancel) {
-            // 被别的层抢走 grab，或系统打断。什么都不发，只复位。
+            // 系统抢走触摸（底部上滑切后台、边返回）、
+            // 组件被设成 enabled=false、或所在子树被移除，都会走到这里。
+            // 复位并通知父组件 —— 否则 drag_base / swipe_dx 会卡在半路。
             long_timer.stop();
+            let was_locked = root.locked;
             root.is_down = false;
             root.locked = false;
             root.dragging = false;
             root.axis = PanAxis.None;
+            root.vel_x = 0px;
+            root.vel_y = 0px;
+            if (was_locked) {
+                root.pan_cancelled();
+            }
         }
     }
 }

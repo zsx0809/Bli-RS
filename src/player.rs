@@ -53,6 +53,22 @@ struct RawComment {
     pubtime: String,
 }
 
+
+/// 把播放链路失败原因写进 UI。
+///
+/// 为什么必须有这一步：早期所有失败分支都只 `log` 然后 `return`，
+/// 界面上永远停在"视频加载中…"。用户看到的是一个不动也不报错的播放器，
+/// 唯一出路是手动返回，体感就是"点了一下没反应，然后自己跳了下一个视频"。
+fn report_fail(window: &slint::Weak<AppWindow>, msg: String) {
+    crate::mxprobe::log_public(&format!("[播放失败] {msg}"));
+    let _ = window.upgrade_in_event_loop(move |w| {
+        let mut d = w.get_current_detail();
+        d.is_ready = false;
+        d.load_error = msg.as_str().into();
+        w.set_current_detail(d);
+    });
+}
+
 /// 停止当前播放并隐藏视频层
 pub fn stop_play() {
     stop_current();
@@ -79,6 +95,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         detail.desc = "".into();
         detail.is_ready = false;
         detail.is_vertical = false;
+        detail.load_error = "".into();
         w.set_current_detail(detail);
         // 清空前次评论
         w.set_video_comments(ModelRc::new(Rc::new(VecModel::default())));
@@ -99,7 +116,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         {
             Ok(rt) => rt,
             Err(e) => {
-                crate::mxprobe::log_public(&format!("创建 runtime 失败: {e}"));
+                report_fail(&w_clone, format!("初始化运行时失败: {e}"));
                 return;
             }
         };
@@ -107,7 +124,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         let client = match bli_protocol::BiliClient::new() {
             Ok(c) => c,
             Err(e) => {
-                crate::mxprobe::log_public(&format!("创建客户端失败: {e}"));
+                report_fail(&w_clone, format!("初始化网络失败: {e}"));
                 return;
             }
         };
@@ -164,7 +181,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 (aid, cid, is_vert, face, pic)
             }
             Err(e) => {
-                crate::mxprobe::log_public(&format!("拉取详情失败: {e}"));
+                report_fail(&w_clone, format!("获取视频信息失败: {e}"));
                 return;
             }
         };
@@ -286,17 +303,17 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         let info = match rt.block_on(client.play_url(&bvid, cid)) {
             Ok(v) => v,
             Err(e) => {
-                crate::mxprobe::log_public(&format!("取 playurl 失败: {e}"));
+                report_fail(&w_clone, format!("获取播放地址失败: {e}"));
                 return;
             }
         };
 
         let Some(vtrack) = info.pick_video(Some(1080)) else {
-            crate::mxprobe::log_public("没有可用视频轨");
+            report_fail(&w_clone, "该视频没有可用的视频流（可能是充电专属或地区限制）".into());
             return;
         };
         let Some(url) = vtrack.primary_url().map(|s| s.to_string()) else {
-            crate::mxprobe::log_public("视频轨没有 URL");
+            report_fail(&w_clone, "视频流地址为空".into());
             return;
         };
 
@@ -318,13 +335,13 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             match dl {
                 Ok(bytes) => {
                     if let Err(e) = std::fs::write(&path, &bytes) {
-                        crate::mxprobe::log_public(&format!("写文件失败: {e}"));
+                        report_fail(&w_clone, format!("写入缓存失败: {e}"));
                         return;
                     }
                     crate::mxprobe::log_public(&format!("下载完成 {} 字节 -> {path_str}", bytes.len()));
                 }
                 Err(e) => {
-                    crate::mxprobe::log_public(&format!("下载失败: {e}"));
+                    report_fail(&w_clone, format!("下载视频流失败: {e}"));
                     return;
                 }
             }
@@ -334,7 +351,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
 
         // 3.6 等 Surface 就绪
         let Some(surface) = wait_surface() else {
-            crate::mxprobe::log_public("等不到有效 Surface");
+            report_fail(&w_clone, "等待渲染表面超时".into());
             return;
         };
         crate::mxprobe::log_public(&format!("Surface 就绪: {surface:?}"));

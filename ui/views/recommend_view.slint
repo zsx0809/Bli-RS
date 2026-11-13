@@ -2,25 +2,7 @@
 // 推荐流视图 (Recommend View) —— 两列等宽网格
 //
 // ==============================================================================
-// 交互结构（这是唯一正确的形状，别再改回覆盖层或 Flickable）
-// ==============================================================================
-//
-// 失败的两种旧结构，各自的死因：
-//
-//   【全屏覆盖层】
-//     在页面区盖一个 TouchArea 吃掉所有 press，再用 tap_at(x,y) 反推命中哪张卡。
-//     → 卡片内任何按钮都收不到 down，评论点赞、更多菜单永远点不动。
-//     → 反推公式假设坐标即内容坐标，滚动过之后命中必然错位。
-//     → 按压反馈与手势状态是两套，手工同步必然错位。
-//
-//   【Flickable】
-//     Flickable 在按下时 DelayForwarding(100ms) 才把 press 交给子元素，
-//     超过 8px 且方向可滚才改判拖动。纵向滚动很完美，但：
-//     → 100ms 窗口内的快速横滑，卡片根本收不到 down，切频道失灵。
-//     → 内容里的按钮按下反馈延迟 100ms，手感发粘。
-//
-// ==============================================================================
-// 现在的结构：分层判定 + pan 冒泡
+// 交互结构
 // ==============================================================================
 //
 //   RecommendView
@@ -35,12 +17,28 @@
 //              Vertical   → 自己滚 + 惯性
 //              Horizontal → swipe_horizontal 冒泡给 AppWindow 切频道
 //
-//   事件在哪一层开始，就在那一层结束，没有跨层抢 grab，没有 100ms 延迟。
+//   事件在哪一层开始，就在那一层结束，没有跨层抢 grab。
 //
-// 滚动：
-//   content_layer 的 y 由 scroll_y 驱动。拖动中 duration 0ms（严格跟手），
-//   抬手后惯性由 8ms Timer 逐帧推进 —— 8ms < 90Hz 的 11.1ms，
-//   每帧最多一个新位置，不会出现"两帧同一张图"的顿感。
+// ==============================================================================
+// 坐标（第二条铁律，见 ui/gesture.slint 里的完整推演）
+// ==============================================================================
+//
+//   组件在滚动，所以它的**局部**坐标会随手指静止而漂移。
+//   GestureArea 已经统一换算成窗口绝对坐标再发出来，这里拿到的
+//   dx / dy 在手指不动时恒为 0 —— 这是滚动能稳住的前提。
+//
+//   绝对不要在这里拿 card 的 mouse-x 自己算位移。
+//
+// ==============================================================================
+// 滚动实现
+// ==============================================================================
+//
+//   content_layer.y = -scroll_y，拖动中 duration 0ms（严格跟手），
+//   抬手后惯性由 10ms Timer 逐帧推进。
+//
+//   不用 Flickable：它在按下时 DelayForwarding(100ms) 才把 press 交给子元素，
+//   100ms 窗口内的快速横滑卡片根本收不到 down，切频道失灵；
+//   按钮按下反馈也会延迟 100ms，手感发粘。
 // ==============================================================================
 
 import { Theme, Spacing, VideoRowPair } from "../theme.slint";
@@ -56,7 +54,6 @@ export component RecommendView inherits Rectangle {
     in property <bool> has_more: true;
     in property <bool> loading_more: false;
     in property <string> more_error: "";
-    in property <string> debug_text: "";
 
     callback video_selected(string);
     callback video_long_pressed(string);
@@ -73,23 +70,12 @@ export component RecommendView inherits Rectangle {
     in-out property <length> scroll_y: 0px;
     property <length> drag_base: 0px;
     property <length> fling_vel: 0px;
-    property <bool> scroll_animating: false;
     property <PanAxis> active_axis: PanAxis.None;
+    // 触底加载的节流标志 —— 避免每个像素都往 Rust 侧抛一次 load_more
+    property <bool> more_requested: false;
 
     out property <length> content_h: body.preferred-height + Spacing.page_margin + 32px;
     out property <length> max_scroll: Math.max(0px, root.content_h - root.height);
-
-    // 可见行范围（封面懒加载探针，由 Rust 侧轮询）
-    //
-    // 全部在 float 域里算，最后 Math.floor/ceil 出 int。
-    // 不能把 length 直接塞进算术链 —— Slint 会报 "Cannot convert float to length"。
-    out property <int> first_visible_row:
-        Math.max(0, Math.floor(((root.scroll_y / 1px) - (Spacing.page_margin / 1px))
-            / ((root.row_h + Spacing.grid_gap) / 1px)) - 2);
-    out property <int> last_visible_row:
-        Math.min(root.rows.length - 1,
-            Math.ceil(((root.scroll_y / 1px) - (Spacing.page_margin / 1px) + (root.height / 1px))
-            / ((root.row_h + Spacing.grid_gap) / 1px)) + 2);
 
     background: transparent;
     clip: true;
@@ -108,9 +94,11 @@ export component RecommendView inherits Rectangle {
         root.active_axis = axis;
         if (axis == PanAxis.Vertical) {
             root.drag_base = root.scroll_y;
-            root.scroll_animating = false;
             fling_timer.stop();
+            root.fling_vel = 0px;
         } else if (axis == PanAxis.Horizontal) {
+            fling_timer.stop();
+            root.fling_vel = 0px;
             root.swipe_horizontal(0px, 0px);
         }
     }
@@ -127,9 +115,15 @@ export component RecommendView inherits Rectangle {
 
     function pan_end(dx: length, dy: length, vx: length, vy: length) {
         if (root.active_axis == PanAxis.Vertical) {
+            // v 是 px / move 事件。fling_timer 每 10ms 推一次，
+            // 触摸采样在 90Hz 下约 11ms 一帧，比值 ≈ 0.9，直接取 1.0 即可。
+            // 上限 60px/帧：再快就是失控，肉眼也分辨不出来。
             let v = -vy;
-            if (Math.abs(v) > 1.5px) {
-                root.fling_vel = v * 2.0;
+            if ((v / 1px) > 2.5) {
+                root.fling_vel = Math.min(v, 60px);
+                fling_timer.start();
+            } else if ((v / 1px) < -2.5) {
+                root.fling_vel = Math.max(v, -60px);
                 fling_timer.start();
             } else {
                 root.fling_vel = 0px;
@@ -150,12 +144,12 @@ export component RecommendView inherits Rectangle {
         root.active_axis = PanAxis.None;
     }
 
-    // 惯性滑行。8ms 对齐高刷，撞边界立即停。
+    // 惯性滑行。10ms ≈ 90Hz 一帧，撞边界立即停。
     fling_timer := Timer {
-        interval: 8ms;
+        interval: 10ms;
         running: false;
         triggered => {
-            if (Math.abs(root.fling_vel) < 0.4px) {
+            if (Math.abs(root.fling_vel) < 0.5px) {
                 root.fling_vel = 0px;
                 self.running = false;
                 return;
@@ -174,15 +168,21 @@ export component RecommendView inherits Rectangle {
                 return;
             }
             root.scroll_y = next;
-            root.fling_vel = root.fling_vel * 0.955;
+            root.fling_vel = root.fling_vel * 0.95;
         }
     }
 
     // 触底加载下一页
     changed scroll_y => {
-        if (root.has_more && !root.loading_more && root.more_error == ""
-            && root.max_scroll > 0px
-            && root.scroll_y > root.max_scroll - root.height) {
+        let near_bottom = root.max_scroll > 0px
+            && root.scroll_y > root.max_scroll - root.height;
+
+        if (!near_bottom) {
+            // 离开底部，允许下次再触发
+            root.more_requested = false;
+        } else if (!root.more_requested && root.has_more
+                   && !root.loading_more && root.more_error == "") {
+            root.more_requested = true;
             root.load_more();
         }
     }
@@ -201,6 +201,7 @@ export component RecommendView inherits Rectangle {
         pan_started(axis) => { root.pan_begin(axis); }
         pan_moved(dx, dy) => { root.pan_move(dx, dy); }
         pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+        pan_cancelled => { root.pan_cancel(); }
     }
 
     // ----------------------------------------------------------------------
@@ -210,11 +211,6 @@ export component RecommendView inherits Rectangle {
         width: parent.width;
         height: Math.max(parent.height, root.content_h);
         y: -root.scroll_y;
-
-        animate y {
-            duration: root.scroll_animating ? Theme.animation_duration_normal : 0ms;
-            easing: ease-out;
-        }
 
         body := VerticalLayout {
             width: parent.width;
@@ -276,6 +272,7 @@ export component RecommendView inherits Rectangle {
                     pan_started(axis) => { root.pan_begin(axis); }
                     pan_moved(dx, dy) => { root.pan_move(dx, dy); }
                     pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+                    pan_cancelled => { root.pan_cancel(); }
                 }
 
                 if pair.has_right : VideoCard {
@@ -286,6 +283,7 @@ export component RecommendView inherits Rectangle {
                     pan_started(axis) => { root.pan_begin(axis); }
                     pan_moved(dx, dy) => { root.pan_move(dx, dy); }
                     pan_finished(dx, dy, vx, vy) => { root.pan_end(dx, dy, vx, vy); }
+                    pan_cancelled => { root.pan_cancel(); }
                 }
                 if !pair.has_right : Rectangle {
                     width: root.col_w;
@@ -311,16 +309,6 @@ export component RecommendView inherits Rectangle {
                     text: "加载失败，上滑重试";
                     color: Theme.on_surface_variant;
                     font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-            if root.debug_text != "" : Rectangle {
-                height: 20px;
-                Text {
-                    text: root.debug_text;
-                    color: Theme.primary;
-                    font-size: 10px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }

@@ -8,6 +8,7 @@
 
 import { Theme, Spacing } from "../theme.slint";
 import { IconHistory, IconDownload, IconStar, IconThermostat, IconSettings, IconClose } from "icons.slint";
+import { GestureArea, PanAxis } from "../gesture.slint";
 
 // 抽屉内的单个条目：图标与文字自然排列，间距 16px
 export component DrawerItem inherits Rectangle {
@@ -74,11 +75,17 @@ export component NavigationDrawer inherits Rectangle {
         animate background { duration: Theme.animation_duration_normal; }
     }
 
-    TouchArea {
+    // 遮罩：点击关闭。
+    // 用 GestureArea 而非 TouchArea —— 抽屉是全屏覆盖层，
+    // 盖住下层所有手势，TouchArea.clicked 的不判位移在这里同样会误触发：
+    // 在遮罩上滑一下想关掉，结果被判成点击，行为虽然一致但语义混乱。
+    // 这里也关掉底部让位：抽屉铺满整屏，底部那条带应当仍能点关闭。
+    scrim_touch := GestureArea {
         width: 100%;
         height: 100%;
         enabled: root.is_open;
-        clicked => { root.close_drawer(); }
+        respect_system_gesture: root.is_open ? false : true;
+        tap(x, y) => { root.close_drawer(); }
     }
 
     // --------------------------------------------------------------------------

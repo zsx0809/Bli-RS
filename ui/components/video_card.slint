@@ -32,6 +32,7 @@ export component VideoCard inherits Rectangle {
     callback pan_started(PanAxis);
     callback pan_moved(length, length);
     callback pan_finished(length, length, length, length);
+    callback pan_cancelled();
 
     property <bool> is_active: root.is_pressed || touch_layer.pressed;
 
@@ -200,5 +201,6 @@ export component VideoCard inherits Rectangle {
         pan_started(axis) => { root.pan_started(axis); }
         pan_moved(dx, dy) => { root.pan_moved(dx, dy); }
         pan_finished(dx, dy, vx, vy) => { root.pan_finished(dx, dy, vx, vy); }
+        pan_cancelled => { root.pan_cancelled(); }
     }
 }

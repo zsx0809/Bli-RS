@@ -34,13 +34,14 @@
 //   **不由 AppWindow 代管** —— 两个页面的手势语义完全不同。
 // ==============================================================================
 
-import { Theme, NavTabType, VideoItemData, VideoRowPair, VideoDetailData, RelatedVideoData, CommentItemData, Spacing } from "theme.slint";
+import { Theme, UiMetrics, NavTabType, VideoItemData, VideoRowPair, VideoDetailData, RelatedVideoData, CommentItemData, Spacing } from "theme.slint";
 import { TopBar } from "components/topbar.slint";
 import { NavigationDrawer } from "components/drawer.slint";
 import { RecommendView } from "views/recommend_view.slint";
 import { LiveView } from "views/live_view.slint";
 import { FollowView } from "views/follow_view.slint";
 import { VideoDetailView } from "views/video_detail_view.slint";
+import { PageSwipeArea } from "components/page_swipe.slint";
 
 export component AppWindow inherits Window {
     title: "Bli-RS";
@@ -99,6 +100,25 @@ export component AppWindow inherits Window {
 
     property <length> safe_top: root.safe-area-insets.top;
     property <length> safe_bottom: root.safe-area-insets.bottom;
+
+    // 把手势原语需要的窗口级度量灌进 UiMetrics（见 theme.slint）。
+    //
+    // system_bottom_guard 取 safe_bottom 与 24px 的较大者：
+    // 手势导航下 safe_bottom 通常就是那条"上滑回桌面"的把手高度，
+    // 但个别 ROM 会报 0，所以给一个保底值。
+    // 落在这一条带里的起手，GestureArea 直接不接管，全部留给系统。
+    property <length> guard_bottom: Math.max(root.safe_bottom, 24px);
+
+    init => {
+        UiMetrics.window_height = root.height;
+        UiMetrics.system_bottom_guard = root.guard_bottom;
+    }
+    changed height => {
+        UiMetrics.window_height = root.height;
+    }
+    changed guard_bottom => {
+        UiMetrics.system_bottom_guard = root.guard_bottom;
+    }
 
     property <int> tab_index:
         (root.current_tab == NavTabType.Live) ? 0
@@ -224,12 +244,19 @@ export component AppWindow inherits Window {
     }
 
     function finish_swipe(dx: length, vx: length) {
-        // 位移过半，或甩得够快 → 切页。
+        // 位移过半屏的 24%，或甩得够快 → 切页。
         //
-        // vx 是「每帧位移」，不能直接乘一个 length（会变成 px²）。
-        // 这里当成一个倍数：一帧位移 ≈ 一屏的 15% 就当甩到位。
-        let threshold = page_area.width * 0.26;
-        let fling_boost = (vx / 1px) * (page_area.width / 1px) * 0.15px;
+        // vx 是「每帧位移」。原来写成
+        //     fling_boost = (vx/1px) * (page_area.width/1px) * 0.15px
+        // 即"一帧走 1px 折算成 0.15 屏"—— 正常甩手 vx 就有 20~40px/帧，
+        // 折算出来是 3~6 屏，阈值形同虚设，轻轻一甩就切。
+        //
+        // 现在按"一帧位移"直接折算，12px/帧 ≈ 一屏的 3%，
+        // 与 Android 的 ViewPager fling 阈值同量级：
+        //     vx = 12px  → 折算 12 * 14 = 168px，1080 宽屏约 15.5%
+        // 配合 24% 的位移阈值，手感和官方接近：慢拖靠位移，快甩靠速度。
+        let threshold = page_area.width * 0.24;
+        let fling_boost = (vx / 1px) * 14px;
         let effective = dx + fling_boost;
 
         if (effective < -threshold && root.tab_index < root.page_count - 1) {
@@ -290,6 +317,17 @@ export component AppWindow inherits Window {
         height: root.app_mode == 0 ? (root.height - self.y - root.safe_bottom) : 0px;
         background: transparent;
         clip: true;
+
+        // 最底层兜底横向手势：先声明 = 在下面。
+        // LiveView / FollowView 是空壳，自身没有手势层，
+        // 没有这个兜底就切得出去切不回来。
+        PageSwipeArea {
+            width: parent.width;
+            height: parent.height;
+            swipe(dx, dy) => { root.apply_swipe(dx); }
+            swipe_finished(dx, vx) => { root.finish_swipe(dx, vx); }
+            swipe_cancelled => { root.cancel_swipe(); }
+        }
 
         HorizontalLayout {
             x: root.page_base + root.swipe_dx;
