@@ -758,6 +758,15 @@ export component VideoDetailView inherits Rectangle {
                     width: 64px;
                     height: 52px;
 
+                    // [临时诊断] 红底，用来确认按钮真实位置与命中区
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        background: #ff000066;
+                    }
+
                     tap(x, y) => { root.toggle_fullscreen(); }
 
                     // 四角括号：全屏时朝内（表示"缩回"），平时朝外
