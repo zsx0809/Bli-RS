@@ -383,6 +383,7 @@ fn decode_loop(
         let mut on_first_frame = Some(on_first_frame);
         // seek 后需要丢弃到目标 PTS 为止的帧（extractor 只能跳到关键帧）
         let mut seek_drop_until_us: Option<i64> = None;
+        let mut avsync_tick: u32 = 0;
 
         while !output_done && !stop.load(Ordering::Relaxed) {
             // ---- 外部控制：暂停 ----
@@ -532,6 +533,19 @@ fn decode_loop(
                             // 视频 PTS 与音频位置在同一时间轴上比较。
                             // 两者都来自同一条 DASH 的时间原点，可直接相减。
                             let diff_us = pts_us - audio_pos;
+
+                            // 每 2 秒打一次同步偏差，用来客观判断音画是否对齐。
+                            // 没有这个度量就只能靠耳朵，而"快了还是慢了"
+                            // 在几帧范围内根本听不出来。
+                            avsync_tick += 1;
+                            if avsync_tick % 60 == 0 {
+                                crate::mxprobe::log_public(&format!(
+                                    "[AVSync] video_pts={}ms audio_pos={}ms diff={}ms",
+                                    pts_us / 1000,
+                                    audio_pos / 1000,
+                                    diff_us / 1000
+                                ));
+                            }
 
                             if diff_us > 5_000 {
                                 // 视频超前：等到该显示的时刻。
