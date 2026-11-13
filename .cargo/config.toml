@@ -1,17 +1,15 @@
 # ==============================================================================
-# chroot 内交叉编译到 Android (aarch64)
+# Cargo 目标配置
 #
-# 关键事实：
-# 1. Google 官方 NDK 只有 linux-x86_64 版本，没有 aarch64 host；
-#    所以 chroot（aarch64 glibc）无法使用官方 NDK。
-# 2. Termux 自带的 clang 本身就是 aarch64-unknown-linux-android24 目标，
-#    且能在 chroot 内直接执行（Android 内核 + bionic 动态链接器可用），
-#    因此直接把它当作 Android 交叉链接器。
-# 3. Rust 侧用 rustup 的 aarch64-linux-android std（chroot 已安装）。
+# linker 只在 Termux 原生环境需要显式指定（宿主的 cc 不是 Android 目标）。
+# 在 CI（ubuntu-latest + 官方 NDK）上，Rust 会自动按 NDK 里的 clang 命名去找
+# aarch64-linux-android26-clang，**不能**写死 Termux 的绝对路径 ——
+# 那会让 CI 报 `failed to find tool "aarch64-linux-android-clang"`。
+#
+# 因此这里用 env 变量做开关：
+#   本地 Termux：export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=/data/data/com.termux/files/usr/bin/clang
+#   CI：什么都不用设，NDK 的 clang 由 cc-rs / rustc 自动发现
 # ==============================================================================
-
-[target.aarch64-linux-android]
-linker = "/data/data/com.termux/files/usr/bin/clang"
 
 [net]
 git-fetch-with-cli = true

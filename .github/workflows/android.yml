@@ -47,8 +47,19 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang
+          NDK_BIN: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
         run: |
+          # rustc 只知道 linker；C 依赖（ring / skia）由 cc-rs 驱动，
+          # 它需要 CC_/AR_ 环境变量，否则会去找 PATH 里不存在的
+          # `aarch64-linux-android-clang` 然后直接失败。
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android26-clang"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
+          export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang++"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$NDK_BIN/llvm-ar"
+
+          ls "$NDK_BIN" | grep aarch64 | head
+
           cargo build --lib --release --target aarch64-linux-android
 
       - name: Package APK
