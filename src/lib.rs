@@ -273,6 +273,11 @@ fn android_main(app: slint::android::AndroidApp) {
     // 具体落地（MediaCodec seek、WindowManager 亮度、AudioManager 音量）
     // 在 player 模块里实现，这里只负责接线。
     {
+        main_window.on_player_seek_by(move |secs| {
+            player::seek_by(secs);
+        });
+    }
+    {
         main_window.on_player_seek(move |frac| {
             crate::mxprobe::log_public(&format!("[UI] seek -> {frac:.3}"));
             player::seek_to(frac);

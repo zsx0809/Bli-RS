@@ -1143,6 +1143,42 @@ pub fn seek_to(frac: f32) {
     }
 }
 
+/// 相对跳转（秒）。
+///
+/// 实现方式：读当前 PTS，加上偏移后走与 seek_to 相同的路径。
+///
+/// 为什么不直接让解码器做相对 seek：
+///   解码线程不知道自己"现在播到哪"以外的东西，而边界处理
+///   （不能小于 0、不能超过总时长）属于业务逻辑，放在这里更清楚。
+pub fn seek_by(secs: f32) {
+    let dur = DURATION_US.load(Ordering::SeqCst);
+    if dur <= 0 {
+        crate::mxprobe::log_public("[Seek] 总时长未知，忽略本次快进/快退");
+        return;
+    }
+
+    let cur_pts = CURRENT
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().map(|d| d.controls.last_pts_us()))
+        .unwrap_or(0)
+        .max(0);
+
+    let target = (cur_pts as f64 + (secs as f64 * 1_000_000.0))
+        .clamp(0.0, dur as f64) as i64;
+
+    crate::mxprobe::log_public(&format!(
+        "[Seek] {}s -> {}us（当前 {}us）",
+        secs, target, cur_pts
+    ));
+
+    if let Ok(cur) = CURRENT.lock() {
+        if let Some(dec) = cur.as_ref() {
+            dec.controls.request_seek(target);
+        }
+    }
+}
+
 /// 播放 / 暂停切换。
 ///
 /// 三种情形：

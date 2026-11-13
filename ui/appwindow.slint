@@ -194,6 +194,7 @@ export component AppWindow inherits Window {
     in property <string> play_time_current: "00:00";
 
     callback player_seek(float);
+    callback player_seek_by(float);
     callback player_brightness(float);
     callback player_volume(float);
     callback player_toggle_play();
@@ -433,6 +434,7 @@ export component AppWindow inherits Window {
         progress: root.play_progress;
 
         seek_to(frac) => { root.player_seek(frac); }
+        seek_by(secs) => { root.player_seek_by(secs); }
         set_brightness(v) => { root.player_brightness(v); }
         set_volume(v) => { root.player_volume(v); }
         toggle_play => { root.player_toggle_play(); }
