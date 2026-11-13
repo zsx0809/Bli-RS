@@ -111,6 +111,9 @@ export component VideoDetailView inherits Rectangle {
     /// 由 Rust 侧在拿到播放地址后置 true；用户点播放后置 false。
     in-out property <bool> awaiting_play: false;
 
+    /// 是否处于暂停状态（用于把播放键画成三角/双竖线）
+    in property <bool> paused: false;
+
     /// 手势中的浮层提示：none / brightness / volume / seek
     in-out property <string> hud_mode: "";
 
@@ -494,27 +497,103 @@ export component VideoDetailView inherits Rectangle {
         }
 
         // ==================================================================
-        // 浮层控制条（点击播放区显隐）
+        // 浮层控制条 —— 极简风格（参考 PiliPlus / B 站客户端）
+        //
+        // 设计取向：**越少越好**。
+        //   上：返回键 + 一排功能图标，压在顶部渐变蒙版上
+        //   下：进度条贴着画面下缘，其下是「时间 · 播放 · 时长」
+        //   中间大面积留给视频本身，不放任何常驻控件
+        //
+        // 为什么不用厚黑底块：
+        //   之前是 78px 高的 #000000a8 实心条，把画面下缘吃掉一整块，
+        //   竖屏视频本来就矮，再扣掉就更憋屈。现在改成渐隐蒙版，
+        //   视觉上只压暗、不遮挡，视频仍是主角。
         // ==================================================================
         if root.controls_visible && root.detail.load_error == "" : Rectangle {
             x: 0px;
-            y: parent.height - self.height;
+            y: 0px;
             width: parent.width;
-            height: 78px;
-            background: #000000a8;
+            height: parent.height;
+            background: transparent;
 
-            // 进度条
+            // ---- 顶部蒙版：从上到下渐隐，托住返回键与图标 ----
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 56px;
+                background: @linear-gradient(180deg, #000000cc 0%, #00000000 100%);
+            }
+
+            // ---- 底部蒙版：从下到上渐隐，托住进度条与时间 ----
+            Rectangle {
+                x: 0px;
+                y: parent.height - 64px;
+                width: parent.width;
+                height: 64px;
+                background: @linear-gradient(0deg, #000000cc 0%, #00000000 100%);
+            }
+
+            // ---- 返回键 ----
+            back_btn := GestureArea {
+                x: 4px;
+                y: 6px;
+                width: 44px;
+                height: 44px;
+
+                tap(x, y) => { root.back_clicked(); }
+
+                IconBack {
+                    x: 10px;
+                    y: 10px;
+                    size: 24px;
+                    tint: #ffffff;
+                    stroke_w: 2px;
+                }
+            }
+
+            // ---- 右侧功能图标：日志 ----
+            //
+            // 只放一个。播放设置、投屏这些还没做，占位图标点不了是欺骗，
+            // 等真做了再加。
+            log_btn := GestureArea {
+                x: parent.width - self.width - 8px;
+                y: 6px;
+                width: 44px;
+                height: 44px;
+
+                tap(x, y) => {
+                    root.show_log_dialog = !root.show_log_dialog;
+                    if (root.show_log_dialog) {
+                        root.refresh_log_clicked();
+                    }
+                }
+
+                // 三横线（"日志列表"意象），比"日志"两个字更轻
+                IconBase {
+                    x: 10px;
+                    y: 10px;
+                    size: 24px;
+                    tint: #ffffff;
+                    stroke_w: 2px;
+                    commands: "M 4 7 L 20 7 M 4 12 L 20 12 M 4 17 L 20 17";
+                }
+            }
+
+            // ---- 进度条：贴着画面底缘，无内边距 ----
             progress_bar := GestureArea {
                 property <float> bar_frac: root.seek_preview >= 0.0 ? root.seek_preview : root.progress;
-                x: 12px;
-                y: 10px;
-                width: parent.width - 24px;
-                height: 22px;
-                tap_slop: 4px;
+                x: 0px;
+                y: parent.height - 30px;
+                width: parent.width;
+                height: 20px;
+                tap_slop: 3px;
                 axis_ratio: 2.0;
                 vertical_enabled: false;
                 respect_system_gesture: false;
 
+                // 进度条左右各留 0：和视频边缘齐平，
+                // 这是 PiliPlus 的观感来源之一 —— 通长的细线。
                 tap(px, py) => {
                     let frac = Math.max(0.0, Math.min(1.0, (px / 1px) / (self.width / 1px)));
                     root.progress = frac;
@@ -543,222 +622,82 @@ export component VideoDetailView inherits Rectangle {
                     root.hud_mode = "";
                 }
 
-                // 轨道
+                // 轨道：2px 细线，半透明白
                 Rectangle {
-                    y: (parent.height - 3px) / 2;
+                    y: (parent.height - 2px) / 2;
                     width: parent.width;
-                    height: 3px;
-                    border-radius: 1.5px;
-                    background: #ffffff40;
+                    height: 2px;
+                    background: #ffffff44;
 
-                    // 已播放
                     Rectangle {
                         width: parent.width * progress_bar.bar_frac;
                         height: parent.height;
-                        border-radius: 1.5px;
-                        background: Theme.primary;
+                        background: #ffffff;
                     }
                 }
 
-                // 拖动手柄
+                // 手柄：小圆点，拖动时出现
                 Rectangle {
                     x: parent.width * progress_bar.bar_frac - self.width / 2;
                     y: (parent.height - self.height) / 2;
-                    width: 12px;
-                    height: 12px;
-                    border-radius: 6px;
-                    background: Theme.primary;
+                    width: root.hud_mode == "seek" ? 10px : 0px;
+                    height: self.width;
+                    border-radius: self.width / 2;
+                    background: #ffffff;
                 }
             }
 
-            // 底部一行：播放/暂停 + 时间
+            // ---- 底部一行：当前时间 · 播放键 · 总时长 ----
+            //
+            // 布局照截图：时间在左，播放/暂停在中间，总时长在右。
+            // 全部无背景，纯白文字 + 白箭头。
             HorizontalLayout {
                 x: 12px;
-                y: parent.height - 40px;
+                y: parent.height - 26px;
                 width: parent.width - 24px;
-                height: 32px;
-                spacing: 10px;
-                alignment: start;
+                height: 22px;
+                spacing: 0px;
+                alignment: space-between;
 
+                Text {
+                    text: root.time_current;
+                    color: #ffffff;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                // 播放 / 暂停
                 play_btn := GestureArea {
                     width: 32px;
-                    height: 32px;
+                    height: 22px;
+
                     tap(x, y) => { root.toggle_play(); }
-                    Rectangle {
-                        width: parent.width;
-                        height: parent.height;
-                        border-radius: 16px;
-                        background: play_btn.pressed ? #ffffff33 : #ffffff1a;
-                        Text {
-                            text: "▶";
-                            color: #ffffff;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+
+                    // 纯白三角（或暂停双竖线），无底板
+                    IconBase {
+                        x: (parent.width - 16px) / 2;
+                        y: 2px;
+                        size: 16px;
+                        tint: #ffffff;
+                        fill_mode: root.paused ? true : true;
+                        stroke_w: 0px;
+                        commands: root.paused
+                            // 暂停中 → 显示播放三角
+                            ? "M 5 3.5 L 13.5 8 L 5 12.5 Z"
+                            // 播放中 → 显示暂停双竖线
+                            : "M 5 3.5 L 7.5 3.5 L 7.5 12.5 L 5 12.5 Z M 9.5 3.5 L 12 3.5 L 12 12.5 L 9.5 12.5 Z";
                     }
                 }
 
                 Text {
-                    text: root.time_current + " / " + root.time_total;
-                    color: #ffffffcc;
+                    text: root.time_total;
+                    color: #ffffff;
                     font-size: 11px;
                     vertical-alignment: center;
                 }
             }
         }
 
-        // 加载中 / 失败。
-        //
-        // 失败必须显式画出来：原来的实现里，日志打一句 "取 playurl 失败" 就
-        // return 了，UI 永远停在"视频加载中…"。
-        // 用户看到的是一个不动也不报错的播放器，唯一出路是返回，
-        // 于是表现为"点了一下、什么都没发生、然后自己跳了下一个视频"。
-        if !root.detail.is_ready && root.detail.load_error == "" : Rectangle {
-            width: 116px;
-            height: 32px;
-            background: #00000088;
-            border-radius: 16px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-
-            Text {
-                text: "视频加载中…";
-                color: #ffffff;
-                font-size: 11px;
-                font-weight: 600;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-
-        if root.detail.load_error != "" : Rectangle {
-            width: parent.width - 48px;
-            background: transparent;
-            x: 24px;
-            y: (parent.height - self.height) / 2;
-            height: err_col.preferred-height;
-
-            err_col := VerticalLayout {
-                spacing: 10px;
-                alignment: center;
-
-                Text {
-                    text: "无法播放";
-                    color: #ffffff;
-                    font-size: 14px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-                Text {
-                    text: root.detail.load_error;
-                    color: #ffffffaa;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                    max-lines: 3;
-                    overflow: elide;
-                    horizontal-alignment: center;
-                }
-
-                // 诊断日志入口按钮
-                Rectangle {
-                    width: 124px;
-                    height: 32px;
-                    border-radius: 16px;
-                    background: Theme.primary;
-
-                    Text {
-                        text: "📋 查看诊断日志";
-                        color: #ffffff;
-                        font-size: 12px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    TouchArea {
-                        clicked => {
-                            root.show_log_dialog = true;
-                            root.refresh_log_clicked();
-                        }
-                    }
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // 浮层按钮：返回 + 日志
-        //
-        // 两者都跟随控制条显隐（点一下视频出现，4 秒后一起淡出）。
-        // 理由：常驻按钮会一直压在画面上，看视频时是纯干扰；
-        // 而 B 站 / PiliPlus / YouTube 全都是"点一下才出现控制层"。
-        //
-        // 日志按钮保留但只在这里出现 —— 需要看日志的人点一下视频就有了，
-        // 不需要它一直占着画面右上角。
-        // ------------------------------------------------------------------
-        if root.controls_visible || !root.detail.is_ready || root.detail.load_error != "" : Rectangle {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            height: 56px;
-            background: transparent;
-
-            back_btn := GestureArea {
-                x: 6px;
-                y: 4px;
-                width: 48px;
-                height: 48px;
-
-                tap(x, y) => { root.back_clicked(); }
-
-                Rectangle {
-                    x: 8px;
-                    y: 8px;
-                    width: 32px;
-                    height: 32px;
-                    border-radius: 16px;
-                    background: back_btn.pressed ? #000000AA : #00000066;
-                    animate background { duration: Theme.animation_duration_fast; }
-
-                    IconBack {
-                        x: 4px;
-                        y: 4px;
-                        size: 24px;
-                        tint: #ffffff;
-                    }
-                }
-            }
-
-            log_btn := GestureArea {
-                x: parent.width - self.width - 12px;
-                y: 11px;
-                width: 60px;
-                height: 30px;
-
-                tap(x, y) => {
-                    root.show_log_dialog = !root.show_log_dialog;
-                    if (root.show_log_dialog) {
-                        root.refresh_log_clicked();
-                    }
-                }
-
-                Rectangle {
-                    width: parent.width;
-                    height: parent.height;
-                    border-radius: 15px;
-                    background: log_btn.pressed ? #000000AA : #00000088;
-
-                    Text {
-                        text: "日志";
-                        color: #ffffff;
-                        font-size: 12px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-        }
     }
 
     // ----------------------------------------------------------------------

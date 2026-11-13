@@ -187,6 +187,7 @@ export component AppWindow inherits Window {
 
     /// 已拿到播放地址、但还没起播（自动播放关闭时的状态）
     in-out property <bool> awaiting_play: false;
+    in-out property <bool> play_paused: false;
 
     in-out property <float> play_progress: 0.0;
     in property <string> play_time_total: "00:00";
@@ -426,6 +427,7 @@ export component AppWindow inherits Window {
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;
+        paused: root.play_paused;
         time_total: root.play_time_total;
         time_current: root.play_time_current;
         progress: root.play_progress;

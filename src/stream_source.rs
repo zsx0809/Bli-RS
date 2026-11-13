@@ -74,6 +74,14 @@ impl SharedBuffer {
         })
     }
 
+    /// 当前已可读字节数（下载线程用于计算增量）
+    pub fn available_now(&self) -> u64 {
+        match self.inner.lock() {
+            Ok(g) => g.available,
+            Err(e) => e.into_inner().available,
+        }
+    }
+
     /// 下载线程调用：追加了 n 字节
     pub fn advance(&self, n: u64) {
         if let Ok(mut s) = self.inner.lock() {
@@ -110,6 +118,19 @@ impl SharedBuffer {
             Err(e) => e.into_inner(),
         };
         loop {
+            // 以**实际文件大小**为准，而不是下载线程上报的计数。
+            //
+            // 为什么：下载线程是按 chunk 写入的，但 reqwest 的 chunk 边界
+            // 和"已 flush 到磁盘"的时刻并不一致；而且续传重试时会有
+            // 多个写入阶段。直接 stat 文件既简单又不会漏。
+            // 这条也自动解决了"下载线程还没来得及 advance"的时序问题。
+            if let Ok(meta) = std::fs::metadata(&s.path) {
+                let real = meta.len();
+                if real > s.available {
+                    s.available = real;
+                }
+            }
+
             if s.failed {
                 return (0, true, true);
             }
@@ -162,7 +183,14 @@ unsafe extern "C" fn ds_read_at(
 
     let (avail, finished, failed) = ctx.buf.wait_for(offset, size);
     if failed {
-        return -1;
+        // 下载失败：返回 0（EOF）而不是 -1（错误）。
+        //
+        // 为什么：返回 -1 会让 AMediaExtractor 立即判定整个数据源不可用，
+        // 直接把 setDataSourceCustom 打成失败(-10000)，连已经解出来的
+        // 部分都保不住。返回 0 至少让解码器把手上已有的数据播完再结束，
+        // 比硬失败体验好。
+        eprintln!("[ds] readAt: 下载失败，按 EOF 处理");
+        return 0;
     }
     if offset >= avail {
         // 没有更多数据：下完了就是 EOF，没下完就是还没到（返回 0 让框架稍后再来）
@@ -240,10 +268,17 @@ unsafe extern "C" fn ds_get_available_size(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         {
-            let s = match ctx.buf.inner.lock() {
+            let mut s = match ctx.buf.inner.lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
+            // 同样以实际文件大小为准
+            if let Ok(meta) = std::fs::metadata(&s.path) {
+                let real = meta.len();
+                if real > s.available {
+                    s.available = real;
+                }
+            }
             if s.available > off {
                 return (s.available - off) as isize;
             }

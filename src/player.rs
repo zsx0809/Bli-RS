@@ -611,27 +611,79 @@ fn start_playback(
                 }
             };
 
-            let res = rt_dl.block_on(client_dl.download_stream_to_file(
-                &url_dl,
-                &path_dl,
-                512_000,
-                move || {
-                    let _ = tx_ready.send(());
-                },
-            ));
+            // ---- 带断点续传的重试循环 ----
+            //
+            // 为什么必须重试：B 站 CDN 在长连接上经常中途掐断
+            // （日志里的 "error decoding response body" 就是这个）。
+            // 一小时的视频要连续下几十 MB，单次请求基本不可能不断。
+            //
+            // 策略：失败后从已下载的字节数继续（HTTP Range 续传），
+            // 最多重试 6 次，每次间隔递增。只要总进度在推进就继续，
+            // 连续 3 次没有任何进展才放弃 —— 这样弱网下也能下完。
+            const MAX_RETRY: u32 = 6;
+            let mut retry = 0u32;
+            let mut last_size = 0u64;
+            let mut stall = 0u32;
+            let mut ready_sent = false;
 
-            match res {
-                Ok(()) => {
-                    let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
-                    crate::mxprobe::log_public(&format!(
-                        "[下载] 完成 {:.1} MB",
-                        total as f64 / 1_048_576.0
-                    ));
-                    buffer_dl.finish(total);
-                }
-                Err(e) => {
-                    crate::mxprobe::log_public(&format!("[下载] 失败: {e}"));
-                    buffer_dl.fail();
+            loop {
+                let start_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+
+                let tx2 = tx_ready.clone();
+                let res = rt_dl.block_on(client_dl.download_stream_to_file_from(
+                    &url_dl,
+                    &path_dl,
+                    start_size,
+                    512_000,
+                    move || {
+                        let _ = tx2.send(());
+                    },
+                ));
+                ready_sent = ready_sent || start_size > 0;
+
+                match res {
+                    Ok(()) => {
+                        let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+                        crate::mxprobe::log_public(&format!(
+                            "[下载] 完成 {:.1} MB",
+                            total as f64 / 1_048_576.0
+                        ));
+                        buffer_dl.finish(total);
+                        return;
+                    }
+                    Err(e) => {
+                        let now_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+                        // 把已经写下的部分同步给解码器，让它能继续播
+                        let delta = now_size.saturating_sub(buffer_dl.available_now());
+                        if delta > 0 {
+                            buffer_dl.advance(delta);
+                        }
+
+                        if now_size > last_size {
+                            // 有进展，重试计数不清零但 stall 归零
+                            stall = 0;
+                            last_size = now_size;
+                        } else {
+                            stall += 1;
+                        }
+
+                        retry += 1;
+                        crate::mxprobe::log_public(&format!(
+                            "[下载] 中断({e})，已下载 {:.1} MB，第 {retry} 次重试",
+                            now_size as f64 / 1_048_576.0
+                        ));
+
+                        if retry >= MAX_RETRY || stall >= 3 {
+                            crate::mxprobe::log_public("[下载] 重试耗尽，放弃");
+                            buffer_dl.fail();
+                            return;
+                        }
+
+                        // 递增退避：0.5s, 1s, 1.5s...
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500 * retry as u64,
+                        ));
+                    }
                 }
             }
         });
@@ -1106,8 +1158,14 @@ pub fn toggle_play(window: slint::Weak<AppWindow>) {
     };
 
     match new_paused {
-        Some(true) => crate::mxprobe::log_public("[Play] 已暂停"),
-        Some(false) => crate::mxprobe::log_public("[Play] 继续播放"),
+        Some(p) => {
+            crate::mxprobe::log_public(if p { "[Play] 已暂停" } else { "[Play] 继续播放" });
+            // 同步到 UI，让播放键在三角/双竖线之间切换
+            let w = window.clone();
+            let _ = w.upgrade_in_event_loop(move |ui| {
+                ui.set_play_paused(p);
+            });
+        }
         None => crate::mxprobe::log_public("[Play] 解码器已消失，忽略"),
     }
 }

@@ -181,6 +181,92 @@ impl BiliClient {
 
     /// 流式下载媒体流到本地文件，并在写入达到 `initial_threshold_bytes`（例如 1.5MB）时触发 `on_ready` 回调，
     /// 从而实现边下载边播放（首段即播，极速秒开）。
+    /// 从指定偏移继续下载（断点续传）。
+    ///
+    /// `resume_from` > 0 时用 `Range: bytes=N-` 续传，并**追加**写入
+    /// （不是截断重建）。这是长视频下载能在弱网下完成的前提：
+    /// CDN 每隔几十秒就可能掐一次连接，没有续传就永远下不完。
+    pub async fn download_stream_to_file_from<F>(
+        &self,
+        url: &str,
+        dest_path: &std::path::Path,
+        resume_from: u64,
+        initial_threshold_bytes: u64,
+        on_ready: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| Error::Network(format!("创建下载客户端失败: {e}")))?;
+
+        let range = if resume_from > 0 {
+            format!("bytes={resume_from}-")
+        } else {
+            "bytes=0-".to_string()
+        };
+
+        let mut resp = client
+            .get(url)
+            .header("user-agent", api::BROWSER_UA_PC)
+            .header("referer", api::REFERER)
+            .header("accept-encoding", "identity")
+            .header("range", range)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT && !status.is_success() {
+            return Err(Error::Network(format!("HTTP {status}")));
+        }
+
+        // 续传时打开已有文件并定位到末尾；首次则新建
+        let mut file = if resume_from > 0 {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dest_path)
+                .map_err(|e| Error::Other(format!("打开缓存文件失败: {e}")))?;
+            f.seek(SeekFrom::Start(resume_from))
+                .map_err(|e| Error::Other(format!("定位写入位置失败: {e}")))?;
+            f
+        } else {
+            std::fs::File::create(dest_path)
+                .map_err(|e| Error::Other(format!("创建缓存文件失败: {e}")))?
+        };
+
+        let mut downloaded = resume_from;
+        let mut ready_called = false;
+        let mut on_ready_opt = Some(on_ready);
+
+        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Network(e.to_string()))? {
+            file.write_all(&chunk)
+                .map_err(|e| Error::Other(format!("写入缓存文件失败: {e}")))?;
+            downloaded += chunk.len() as u64;
+
+            if !ready_called && downloaded >= initial_threshold_bytes {
+                ready_called = true;
+                file.flush().ok();
+                if let Some(cb) = on_ready_opt.take() {
+                    cb();
+                }
+            }
+        }
+
+        file.flush().ok();
+        if !ready_called {
+            if let Some(cb) = on_ready_opt.take() {
+                cb();
+            }
+        }
+
+        Ok(downloaded)
+    }
+
     /// 用 HTTP Range 探测资源的**总长度**（Content-Range 里的 total）。
     ///
     /// 为什么必须单独问一次：
