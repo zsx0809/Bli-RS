@@ -80,12 +80,15 @@ export component RecommendView inherits Rectangle {
     out property <length> max_scroll: Math.max(0px, root.content_h - root.height);
 
     // 可见行范围（封面懒加载探针，由 Rust 侧轮询）
+    //
+    // 全部在 float 域里算，最后 Math.floor/ceil 出 int。
+    // 不能把 length 直接塞进算术链 —— Slint 会报 "Cannot convert float to length"。
     out property <int> first_visible_row:
-        Math.max(0, Math.floor(((root.scroll_y / 1px) - Spacing.page_margin)
+        Math.max(0, Math.floor(((root.scroll_y / 1px) - (Spacing.page_margin / 1px))
             / ((root.row_h + Spacing.grid_gap) / 1px)) - 2);
     out property <int> last_visible_row:
         Math.min(root.rows.length - 1,
-            Math.ceil(((root.scroll_y / 1px) - Spacing.page_margin + (root.height / 1px))
+            Math.ceil(((root.scroll_y / 1px) - (Spacing.page_margin / 1px) + (root.height / 1px))
             / ((root.row_h + Spacing.grid_gap) / 1px)) + 2);
 
     background: transparent;
