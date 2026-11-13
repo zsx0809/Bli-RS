@@ -24,6 +24,19 @@ static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
 /// 0 表示未知（此时 seek 直接忽略，避免跳到片头）。
 static DURATION_US: AtomicI64 = AtomicI64::new(0);
 
+/// 「自动播放关闭」时暂存的待播流信息。
+///
+/// 用户点播放键时用它启动，省掉重新请求 playurl（那要 WBI 签名 + 一次
+/// 网络往返，体验上会明显卡一下）。
+struct PendingStream {
+    session: u64,
+    bvid: String,
+    url: String,
+    duration_us: i64,
+}
+
+static PENDING_STREAM: Mutex<Option<PendingStream>> = Mutex::new(None);
+
 thread_local! {
     /// 相关推荐视频模型句柄（仅在 UI 线程访问，杜绝跨线程 Send 冲突）
     static RELATED_MODEL: RefCell<Option<Rc<VecModel<RelatedVideoData>>>> = const { RefCell::new(None) };
