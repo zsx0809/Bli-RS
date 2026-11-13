@@ -121,6 +121,7 @@ impl VideoDecoder {
     pub fn start(
         path: String,
         surface: *mut std::ffi::c_void,
+        on_first_frame: impl FnOnce() + Send + 'static,
         on_error: impl Fn(String) + Send + 'static,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -132,7 +133,7 @@ impl VideoDecoder {
             // 若在外部 `sp.0` 提前取出，裸指针会被捕获进闭包，
             // 编译期就会因为 *mut c_void 不是 Send 而报错。
             let surface_ptr = sp.get();
-            if let Err(e) = decode_loop(&path, surface_ptr, &stop_for_thread) {
+            if let Err(e) = decode_loop(&path, surface_ptr, on_first_frame, &stop_for_thread) {
                 on_error(e);
             }
         });
@@ -149,6 +150,7 @@ impl VideoDecoder {
 fn decode_loop(
     path: &str,
     surface: *mut std::ffi::c_void,
+    on_first_frame: impl FnOnce(),
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
@@ -248,9 +250,11 @@ fn decode_loop(
         let mut output_done = false;
         let timeout = Duration::from_millis(8);
 
-        // PTS 帧同步时钟，杜绝硬件极限无等待刷帧导致的“快进”
+        // PTS 帧同步时钟，杜绝硬件极限无等待刷帧导致的“快进/倍速播放”
         let mut first_pts: Option<i64> = None;
         let mut start_instant: Option<std::time::Instant> = None;
+        let mut first_frame_sent = false;
+        let mut on_first_frame = Some(on_first_frame);
 
         while !output_done && !stop.load(Ordering::Relaxed) {
             // 送输入
@@ -270,12 +274,14 @@ fn decode_loop(
                             input_done = true;
                         } else {
                             let pts = extractor::AMediaExtractor_getSampleTime(ex);
+                            // 注意：AMediaExtractor_getSampleTime 返回的是微秒 (us)，绝不能再乘以 1000
+                            let pts_us = if pts >= 0 { pts as u64 } else { 0 };
                             codec
                                 .queue_input_buffer(
                                     buf,
                                     0,
                                     n as usize,
-                                    pts as u64 * 1000, // us
+                                    pts_us,
                                     0,
                                 )
                                 .ok();
@@ -297,25 +303,43 @@ fn decode_loop(
                     let eos = buf.info().flags() & BUFFER_FLAG_END_OF_STREAM != 0;
                     let pts_us = buf.info().presentation_time_us();
 
-                    // PTS 帧同步：根据视频实际时间戳休眠，实现恒定 1.0x 正常速度播放
+                    // PTS 帧同步：根据视频实际时间戳（微秒）休眠，实现恒定 1.0x 正常速度播放
                     if pts_us >= 0 {
                         if first_pts.is_none() {
                             first_pts = Some(pts_us);
                             start_instant = Some(std::time::Instant::now());
                         } else if let (Some(base_pts), Some(start_t)) = (first_pts, start_instant) {
-                            let target_elapsed_us = (pts_us - base_pts).max(0) as u64;
-                            let actual_elapsed_us = start_t.elapsed().as_micros() as u64;
-                            if target_elapsed_us > actual_elapsed_us {
-                                let sleep_us = target_elapsed_us - actual_elapsed_us;
-                                if sleep_us < 2_000_000 {
-                                    std::thread::sleep(Duration::from_micros(sleep_us));
+                            let target_elapsed_us = pts_us - base_pts;
+                            let actual_elapsed_us = start_t.elapsed().as_micros() as i64;
+                            let diff_us = target_elapsed_us - actual_elapsed_us;
+
+                            if diff_us > 0 {
+                                if diff_us <= 80_000 {
+                                    // 正常帧间隔等待（最多休眠 80ms，杜绝任何假死卡顿）
+                                    std::thread::sleep(Duration::from_micros(diff_us as u64));
+                                } else {
+                                    // 差值过大说明视频流发生时间戳跳变或切片断层，重新校准基准时基
+                                    first_pts = Some(pts_us);
+                                    start_instant = Some(std::time::Instant::now());
                                 }
+                            } else if diff_us < -150_000 {
+                                // 解码落后超过 150ms，重设时钟追赶，杜绝持续慢放
+                                first_pts = Some(pts_us);
+                                start_instant = Some(std::time::Instant::now());
                             }
                         }
                     }
 
                     // render=true → 交给 Surface 显示。
                     codec.release_output_buffer(buf, true).ok();
+
+                    // 首帧已送达 SurfaceView，通知 UI 淡出封面占位图
+                    if !first_frame_sent {
+                        first_frame_sent = true;
+                        if let Some(cb) = on_first_frame.take() {
+                            cb();
+                        }
+                    }
 
                     if eos {
                         output_done = true;

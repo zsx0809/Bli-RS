@@ -308,7 +308,8 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             }
         };
 
-        let Some(vtrack) = info.pick_video(Some(1080)) else {
+        // 优先 720P / 480P，移动端秒级快速下载，杜绝 1080P 超大体积与限速导致长时间卡在加载中
+        let Some(vtrack) = info.pick_video(Some(720)) else {
             report_fail(&w_clone, "该视频没有可用的视频流（可能是充电专属或地区限制）".into());
             return;
         };
@@ -324,9 +325,19 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             vtrack.codecs
         ));
 
-        // 3.5 下载到本地临时缓存
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("v_{bvid}.m4s"));
+        // 3.5 下载到本地内部缓存目录，避免 /data/local/tmp 权限受限 (Permission Denied)
+        let cache_dir = crate::android_window::cache_dir()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let p = std::path::PathBuf::from("/data/data/com.bli.rs/cache");
+                if p.exists() || std::fs::create_dir_all(&p).is_ok() {
+                    p
+                } else {
+                    std::env::temp_dir()
+                }
+            });
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let path = cache_dir.join(format!("v_{bvid}.m4s"));
         let path_str = path.to_string_lossy().to_string();
 
         if !path.exists() {
@@ -359,18 +370,23 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         // 3.7 展现视频层并启动硬解
         crate::video_surface::set_visible(true);
 
-        // 标记 UI 视频已就绪，淡出封面占位图
         let w_ready = w_clone.clone();
-        let _ = w_ready.upgrade_in_event_loop(|w| {
-            let mut d = w.get_current_detail();
-            d.is_ready = true;
-            w.set_current_detail(d);
-        });
+        let w_err = w_clone.clone();
 
         let dec = crate::video_decoder::VideoDecoder::start(
             path_str,
             surface,
-            |e| crate::mxprobe::log_public(&format!("[解码错误] {e}")),
+            move || {
+                // 首帧成功送显到 SurfaceView，淡出封面占位图
+                let _ = w_ready.upgrade_in_event_loop(|w| {
+                    let mut d = w.get_current_detail();
+                    d.is_ready = true;
+                    w.set_current_detail(d);
+                });
+            },
+            move |e| {
+                report_fail(&w_err, format!("视频解码失败: {e}"));
+            },
         );
 
         if let Ok(mut cur) = CURRENT.lock() {

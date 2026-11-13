@@ -348,14 +348,36 @@ mod imp {
         })
         .unwrap_or(false)
     }
+
+    /// 获取 Android 应用的内部缓存目录 (Context.getCacheDir().getAbsolutePath())
+    pub fn cache_dir() -> Option<String> {
+        with_env(|env, activity| {
+            let file = env
+                .call_method(activity, "getCacheDir", "()Ljava/io/File;", &[])
+                .and_then(|v| v.l())
+                .ok()?;
+            let path = env
+                .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())
+                .ok()?;
+            let js: &jni::objects::JString = (&path).into();
+            env.get_string(js).ok().map(String::from)
+        })
+        .flatten()
+    }
 }
 
 #[cfg(target_os = "android")]
-pub use imp::{activity_object, android_app, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, status_bar_height_px};
+pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, status_bar_height_px};
 
 /// 非 Android 平台（桌面调试）为空实现
 #[cfg(not(target_os = "android"))]
 pub fn init(_vm: *mut std::ffi::c_void, _activity: *mut std::ffi::c_void) {}
+
+#[cfg(not(target_os = "android"))]
+pub fn cache_dir() -> Option<String> {
+    None
+}
 
 #[cfg(not(target_os = "android"))]
 pub fn set_exclusion(_width_dp: i32, _enable: bool) -> bool {
