@@ -33,9 +33,20 @@ jobs:
 
       - name: Setup Android SDK tools (aapt2 / zipalign / apksigner)
         run: |
-          # ubuntu-latest 自带 Android SDK commandline-tools 与 build-tools
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
-          ls "$ANDROID_HOME/build-tools" || true
+          # ubuntu-latest 的 runner 自带 Android SDK，但 ANDROID_HOME 只在
+          # runner 的 shell 环境里，GitHub 的 ${{ env.ANDROID_HOME }} 表达式取不到
+          # （env 上下文只含 workflow/job/step 定义的值）。
+          # 所以这里显式解析出真实路径并写进 $GITHUB_ENV，供后续步骤使用。
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "SDK=$SDK"
+          ls "$SDK/build-tools" "$SDK/platforms"
+          # 取最新的 build-tools，避免写死版本号
+          BT=$(ls -1 "$SDK/build-tools" | sort -V | tail -1)
+          echo "$SDK/build-tools/$BT" >> "$GITHUB_PATH"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$SDK/platforms/android-35/android.jar" >> "$GITHUB_ENV"
+          which aapt2 zipalign apksigner || true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -64,7 +75,6 @@ jobs:
 
       - name: Package APK
         env:
-          ANDROID_JAR: ${{ env.ANDROID_HOME }}/platforms/android-35/android.jar
           # CI 用官方 NDK 链接，DT_NEEDED 已正确，不需要 patchelf
           SKIP_PATCHELF: "1"
         run: |
