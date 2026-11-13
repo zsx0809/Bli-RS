@@ -65,22 +65,19 @@ jobs:
       - name: Package APK
         env:
           ANDROID_JAR: ${{ env.ANDROID_HOME }}/platforms/android-35/android.jar
+          # CI 用官方 NDK 链接，DT_NEEDED 已正确，不需要 patchelf
+          SKIP_PATCHELF: "1"
         run: |
-          # package_apk.sh 里的路径是 Termux 硬编码的，这里做一次等价替换
-          sed -i 's#/data/data/com.termux/files/usr/bin/##g' scripts/package_apk.sh
-          sed -i "s#/data/data/com.termux/files/home/Android/Sdk#$ANDROID_HOME#g" scripts/package_apk.sh
-          sed -i "s#/data/data/com.termux/files/usr/lib/libc++_shared.so#$(find ${{ steps.ndk.outputs.ndk-path }} -name 'libc++_shared.so' -path '*aarch64-linux-android*' | head -1)#g" scripts/package_apk.sh
+          LIBCXX=$(find ${{ steps.ndk.outputs.ndk-path }} -name 'libc++_shared.so' -path '*aarch64-linux-android*' | head -1)
+          echo "libc++_shared: $LIBCXX"
 
-          # CI 上不需要 patchelf 修 DT_NEEDED：NDK 的 clang 已经正确链接
-          sed -i '/patchelf/d' scripts/package_apk.sh
-
-          # 生成 debug keystore
+          mkdir -p ~/.android
           keytool -genkeypair -v -keystore ~/.android/debug.keystore \
             -storepass android -keypass android -alias androiddebugkey \
             -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US" || true
+            -dname "CN=Android Debug,O=Android,C=US"
 
-          bash scripts/package_apk.sh
+          LIBCXX_SO="$LIBCXX" bash scripts/package_apk.sh
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

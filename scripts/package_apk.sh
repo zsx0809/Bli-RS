@@ -11,11 +11,14 @@ cd "$PROJECT_ROOT"
 
 echo "==> [1/5] 准备打包环境..."
 export PATH=/data/data/com.termux/files/usr/bin:$PATH
-AAPT2="/data/data/com.termux/files/usr/bin/aapt2"
-ZIPALIGN="/data/data/com.termux/files/usr/bin/zipalign"
-APKSIGNER="/data/data/com.termux/files/usr/bin/apksigner"
-ANDROID_JAR="/data/data/com.termux/files/home/Android/Sdk/platforms/android-35/android.jar"
-KEYSTORE="$HOME/.android/debug.keystore"
+
+# 工具路径：Termux 上走 /data/data/...（PATH 里就有），
+# CI 上这些工具由 $ANDROID_HOME/build-tools 提供，直接走 PATH 即可。
+AAPT2="${AAPT2:-aapt2}"
+ZIPALIGN="${ZIPALIGN:-zipalign}"
+APKSIGNER="${APKSIGNER:-apksigner}"
+ANDROID_JAR="${ANDROID_JAR:-/data/data/com.termux/files/home/Android/Sdk/platforms/android-35/android.jar}"
+KEYSTORE="${KEYSTORE:-$HOME/.android/debug.keystore}"
 
 BUILD_DIR="$PROJECT_ROOT/android/build"
 DIST_DIR="$PROJECT_ROOT/dist"
@@ -39,7 +42,7 @@ fi
 if [ ! -f "$SO_PATH" ]; then
     SO_PATH="$PROJECT_ROOT/target/debug/libbli_rs.so"
 fi
-LIBCXX_SO="/data/data/com.termux/files/usr/lib/libc++_shared.so"
+LIBCXX_SO="${LIBCXX_SO:-/data/data/com.termux/files/usr/lib/libc++_shared.so}"
 
 if [ ! -f "$SO_PATH" ]; then
     echo "[-] 错误: 未找到编译产物 libbli_rs.so，请先运行 cargo build --lib"
@@ -47,9 +50,14 @@ if [ ! -f "$SO_PATH" ]; then
 fi
 
 # 确保 DT_NEEDED 里有 libc++_shared.so（Slint 的 Skia/字体链路需要）
-if ! patchelf --print-needed "$SO_PATH" | grep -q '^libc++_shared\.so$'; then
-    echo "    patchelf: 补入 libc++_shared.so 依赖"
-    patchelf --add-needed libc++_shared.so "$SO_PATH"
+#
+# 只在 Termux 原生编译时需要这个补丁：那边的 clang 不会自动带上它。
+# CI 用官方 NDK 的 clang 链接，DT_NEEDED 已经正确，不需要也不能 patch。
+if [ "${SKIP_PATCHELF:-0}" != "1" ] && command -v patchelf >/dev/null 2>&1; then
+    if ! patchelf --print-needed "$SO_PATH" | grep -q '^libc++_shared\.so$'; then
+        echo "    patchelf: 补入 libc++_shared.so 依赖"
+        patchelf --add-needed libc++_shared.so "$SO_PATH"
+    fi
 fi
 echo "    使用产物: ${SO_PATH#$PROJECT_ROOT/}"
 
