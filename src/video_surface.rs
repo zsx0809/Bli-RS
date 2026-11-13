@@ -444,8 +444,15 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         })()
         .unwrap_or((1080, 2400));
 
+        // 全屏时用 MATCH_PARENT 的宽高，让系统按实际方向布局。
+        //
+        // 为什么不用 height_px：调用此刻屏幕还没转过去，
+        // getDisplayMetrics 给的还是竖屏的尺寸（宽<高）。若直接拿它设
+        // 高度，旋转后视频高度会是错的（比如 2400 而屏幕现在是 1240 高）。
+        // 交给 MATCH_PARENT(-1) 由 View 系统自己跟随窗口尺寸，
+        // 旋转完成后自动铺满，不需要我们再算一次。
         let (h, top) = if fullscreen {
-            (height_px, 0)
+            (-1, 0)
         } else {
             // 退出全屏：恢复成横屏 16:9 + 状态栏下移
             (
@@ -479,6 +486,33 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         crate::mxprobe::log_public(&format!(
             "[Surface] 全屏={fullscreen} -> h={h}, top={top}"
         ));
+
+        // ---- 屏幕方向 ----
+        //
+        // 全屏必须是**横屏**。上一版只把播放区铺满，结果竖屏状态下
+        // 视频被拉成一个大方块，既不是电影比例也不像全屏。
+        //
+        // setRequestedOrientation：
+        //   SCREEN_ORIENTATION_SENSOR_LANDSCAPE = 6  （全屏：横屏，可左右翻转）
+        //   SCREEN_ORIENTATION_UNSPECIFIED      = -1 （退出：交还系统）
+        //
+        // 注意：Manifest 里 configChanges 已含 orientation，
+        // Activity 不会因为旋转被重建，所以播放状态不会丢。
+        let orientation: i32 = if fullscreen { 6 } else { -1 };
+        let _ = env.call_method(
+            &activity,
+            "setRequestedOrientation",
+            "(I)V",
+            &[JValue::Int(orientation)],
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        } else {
+            crate::mxprobe::log_public(&format!(
+                "[Surface] 屏幕方向 -> {}",
+                if fullscreen { "横屏(SENSOR_LANDSCAPE)" } else { "交还系统" }
+            ));
+        }
     }
 
     /// 更新 SurfaceView 的高宽与顶部边距（在主线程运行）

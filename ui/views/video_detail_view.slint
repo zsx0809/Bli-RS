@@ -94,8 +94,9 @@ export component VideoDetailView inherits Rectangle {
     // ----------------------------------------------------------------------
 
     // 播放器动态高度：竖屏 45% 视口（自适应高度，绝不过度压盖 UI），横屏 16:9
+    // 全屏时铺满整个窗口（横屏后 root.height 自然变成短边）
     out property <length> player_height: root.is_fullscreen
-        ? root.height
+        ? Math.max(root.height, root.width)
         : (root.detail.is_vertical
             ? Math.min(Math.max(220px, (root.height - root.safe_top) * 0.45), 380px)
             : (root.width * 9 / 16));
@@ -607,7 +608,7 @@ export component VideoDetailView inherits Rectangle {
             progress_bar := GestureArea {
                 property <float> bar_frac: root.seek_preview >= 0.0 ? root.seek_preview : root.progress;
                 x: 0px;
-                y: parent.height - 38px;
+                y: parent.height - 30px;
                 width: parent.width;
                 height: 18px;
                 tap_slop: 3px;
@@ -775,10 +776,13 @@ export component VideoDetailView inherits Rectangle {
                 }
             }
 
-            // ---- 时间行：贴在进度条上方 ----
+            // ---- 时间行：在进度条正上方，与进度条留 4px 间距 ----
+            //
+            // 之前 y=-40 而进度条在 -38..-20，两者重叠成一条糊字。
+            // 现在进度条在 -30..-12，时间行放到 -52。
             Text {
                 x: 12px;
-                y: parent.height - 40px;
+                y: parent.height - 52px;
                 text: root.time_current + " / " + root.time_total;
                 color: #ffffff;
                 font-size: 11px;

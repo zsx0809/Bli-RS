@@ -89,8 +89,18 @@ impl Ring {
 pub struct PlayClock {
     /// 已写入环形缓冲的累计字节数（解码侧维护）
     written_bytes: AtomicU64,
-    /// 已从环形缓冲取走、真正送去播放的累计字节数（回调侧维护）
+    /// 已从环形缓冲取走、交给 AAudio 的累计字节数（回调侧维护）
     played_bytes: AtomicU64,
+    /// AAudio 流裸指针，用于查硬件时间戳。
+    ///
+    /// 为什么需要它：played_bytes 只表示"数据已交给 AAudio"，
+    /// 而 AAudio 内部还有它自己的缓冲（我们设了 1000ms 容量，
+    /// 实际硬件缓冲通常 20~200ms）。真正从扬声器出来的位置比
+    /// played_bytes 落后那一段 —— 这就是音画不同步（画面超前）的来源。
+    ///
+    /// AAudioStream_getTimestamp 返回的是**硬件侧已播放帧数**，
+    /// 这才是唯一准确的播放位置。
+    hw_frames: AtomicI64,
     /// 每帧字节数（通道数 × 每样本字节数）
     frame_bytes: AtomicU64,
     /// 采样率
@@ -108,6 +118,7 @@ impl PlayClock {
         Arc::new(Self {
             written_bytes: AtomicU64::new(0),
             played_bytes: AtomicU64::new(0),
+            hw_frames: AtomicI64::new(-1),
             frame_bytes: AtomicU64::new(4),
             sample_rate: AtomicU64::new(48000),
             paused: AtomicBool::new(false),
@@ -120,13 +131,39 @@ impl PlayClock {
     ///
     /// 这是音画同步的**唯一权威时间**：视频解码线程每帧拿它比较，
     /// 决定是等待还是快进丢帧。
+    /// 当前播放位置（微秒）。
+    ///
+    /// 优先用 AAudio 的硬件时间戳（AAudioStream_getTimestamp），
+    /// 它给的是**已经真正输出到扬声器**的帧位置，是最准的。
+    ///
+    /// 退路：时间戳取不到（流刚起、驱动不支持）时，用已消费字节数估算。
+    /// 估算值会偏大最多一个 AAudio 内部缓冲周期，所以只作为兜底。
     pub fn position_us(&self) -> i64 {
-        let played = self.played_bytes.load(Ordering::Relaxed);
+        let base = self.base_pts_us.load(Ordering::Relaxed);
         let fb = self.frame_bytes.load(Ordering::Relaxed).max(1);
         let sr = self.sample_rate.load(Ordering::Relaxed).max(1);
+
+        // ---- 首选：硬件时间戳（由回调每次刷新）----
+        let hw = self.hw_frames.load(Ordering::Relaxed);
+        if hw >= 0 {
+            return base + (hw as f64 / sr as f64 * 1_000_000.0) as i64;
+        }
+
+        // ---- 兜底：按已消费字节估算 ----
+        let played = self.played_bytes.load(Ordering::Relaxed);
         let frames = played / fb;
-        self.base_pts_us.load(Ordering::Relaxed)
-            + (frames as f64 / sr as f64 * 1_000_000.0) as i64
+        base + (frames as f64 / sr as f64 * 1_000_000.0) as i64
+    }
+
+    /// 由回调线程周期性刷新：用 AAudio 的硬件时间戳记录真实播放帧数。
+    ///
+    /// 为什么在回调里做：回调参数就带着 &AudioStream，能直接调
+    /// AAudioStream_getTimestamp；而 AudioOutput 里存不了这个指针
+    /// （AudioStream 的 inner 是私有字段，ndk crate 没暴露 as_ptr）。
+    ///
+    /// 回调频率通常 10~50Hz，开销可以忽略。
+    fn refresh_hw_frames(&self, frames: i64) {
+        self.hw_frames.store(frames, Ordering::Relaxed);
     }
 
     pub fn set_format(&self, sample_rate: u32, channel_count: u32, bytes_per_sample: u64) {
@@ -203,6 +240,7 @@ impl AudioOutput {
 
         let ring_cb = ring.clone();
         let clock_cb = clock.clone();
+        let clock_ts = clock.clone();
         let under_cb = underruns.clone();
 
         let stream = AudioStreamBuilder::new()
@@ -215,7 +253,20 @@ impl AudioOutput {
             .sharing_mode(AudioSharingMode::Shared)
             .usage(AudioUsage::Media)
             .data_callback(Box::new(
-                move |_stream: &AudioStream, data: *mut std::ffi::c_void, frames: i32| {
+                move |stream: &AudioStream, data: *mut std::ffi::c_void, frames: i32| {
+                    // 先刷新硬件播放位置。
+                    //
+                    // 这是音画同步的准确性来源：AAudio 内部有它自己的
+                    // 缓冲（几十到几百毫秒），"已交给 AAudio" 与
+                    // "已从扬声器播出" 是两个进度。
+                    // getTimestamp 返回的是后者 —— 用它做时钟，
+                    // 画面才不会比声音超前一个缓冲周期。
+                    if let Ok(ts) = stream.timestamp(ndk::audio::Clockid::Monotonic) {
+                        if ts.frame_position >= 0 {
+                            clock_ts.refresh_hw_frames(ts.frame_position);
+                        }
+                    }
+
                     if data.is_null() || frames <= 0 {
                         return AudioCallbackResult::Continue;
                     }
