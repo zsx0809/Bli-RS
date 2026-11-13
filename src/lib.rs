@@ -8,6 +8,8 @@ pub mod video_decoder;
 pub mod video_surface;
 pub mod settings;
 pub mod stream_source;
+pub mod audio_out;
+pub mod audio_decoder;
 pub mod feed;
 
 slint::include_modules!();

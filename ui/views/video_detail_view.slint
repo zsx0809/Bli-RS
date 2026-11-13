@@ -650,102 +650,95 @@ export component VideoDetailView inherits Rectangle {
                 }
             }
 
-            // ---- 底部一行：时间 · 快退 · 播放 · 快进 ----
+            // ---- 操作按钮行：快退 / 播放 / 快进 ----
             //
-            // 布局说明（改过一版，之前的排法是错的）：
-            //   上一版把播放键放在进度条**正中间**，因为它在一个
-            //   space-between 的三段布局里居中 —— 视觉上像是挂在进度条
-            //   中间的一颗钉子，很别扭。
+            // 位置与尺寸都改过（第二版）：
+            //   上一版把三个按钮塞在进度条右侧一簇，每个只有 40x24。
+            //   实测结果是"快退能点到、播放能点到、快进点不到"——
+            //   因为那一簇贴着屏幕右边缘，最右侧的按钮有相当一部分
+            //   落在系统边缘手势区里，触摸被系统吃掉。
             //
-            //   现在的排法（B 站 / PiliPlus 都是这个）：
-            //     [00:12 / 21:29]        [-10s] [▶] [+10s]
-            //   时间靠左成一整块（不是左右各一个把播放键夹中间），
-            //   三个操作按钮靠右聚成一簇。这样播放键永远在右侧一组里，
-            //   不会孤立在画面正中。
-            Rectangle {
+            //   现在改成：
+            //     · 整行**横向居中、等距铺开**，三个按钮各自远离屏幕边缘
+            //     · 每个按钮 64x52 的大命中区（远超 48dp 最小触控尺寸）
+            //     · 整体放在**进度条上方**，不与进度条的拖动区重叠
+            //
+            //   反正播放几秒后整个控制层都会隐藏，占这点位置完全没问题，
+            //   换来的是"闭着眼也能点中"。
+            HorizontalLayout {
                 x: 0px;
-                y: parent.height - 34px;
+                y: parent.height - 96px;
                 width: parent.width;
-                height: 26px;
-                background: transparent;
+                height: 52px;
+                alignment: center;
 
-                // 左：当前时间 / 总时长
-                Text {
-                    x: 12px;
-                    y: 0px;
-                    height: parent.height;
-                    text: root.time_current + " / " + root.time_total;
-                    color: #ffffff;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                }
+                // ---- 后退 10 秒 ----
+                back10_btn := GestureArea {
+                    width: 64px;
+                    height: 52px;
 
-                // 右：快退 / 播放暂停 / 快进
-                HorizontalLayout {
-                    x: parent.width - self.width - 8px;
-                    y: 0px;
-                    height: parent.height;
-                    spacing: 2px;
-                    alignment: end;
+                    tap(x, y) => { root.seek_by(-10.0); }
 
-                    // ---- 后退 10 秒 ----
-                    back10_btn := GestureArea {
-                        width: 40px;
-                        height: 24px;
-
-                        tap(x, y) => { root.seek_by(-10.0); }
-
-                        // 逆时针圆弧箭头 + "10"
-                        IconBase {
-                            x: (parent.width - 18px) / 2;
-                            y: 3px;
-                            size: 18px;
-                            tint: #ffffff;
-                            stroke_w: 1.6px;
-                            commands: "M 12 4 A 8 8 0 1 0 19.5 11 M 12 4 L 12 8 M 12 4 L 8 7.5";
-                        }
-                    }
-
-                    // ---- 播放 / 暂停 ----
-                    play_btn := GestureArea {
-                        width: 34px;
-                        height: 24px;
-
-                        tap(x, y) => { root.toggle_play(); }
-
-                        IconBase {
-                            x: (parent.width - 16px) / 2;
-                            y: 4px;
-                            size: 16px;
-                            tint: #ffffff;
-                            fill_mode: true;
-                            stroke_w: 0px;
-                            commands: root.paused
-                                // 暂停中 → 播放三角
-                                ? "M 5 3.5 L 13.5 8 L 5 12.5 Z"
-                                // 播放中 → 暂停双竖线
-                                : "M 5 3.5 L 7.5 3.5 L 7.5 12.5 L 5 12.5 Z M 9.5 3.5 L 12 3.5 L 12 12.5 L 9.5 12.5 Z";
-                        }
-                    }
-
-                    // ---- 前进 10 秒 ----
-                    fwd10_btn := GestureArea {
-                        width: 40px;
-                        height: 24px;
-
-                        tap(x, y) => { root.seek_by(10.0); }
-
-                        // 顺时针圆弧箭头
-                        IconBase {
-                            x: (parent.width - 18px) / 2;
-                            y: 3px;
-                            size: 18px;
-                            tint: #ffffff;
-                            stroke_w: 1.6px;
-                            commands: "M 12 4 A 8 8 0 1 1 4.5 11 M 12 4 L 12 8 M 12 4 L 16 7.5";
-                        }
+                    IconBase {
+                        x: (parent.width - 26px) / 2;
+                        y: (parent.height - 26px) / 2;
+                        size: 26px;
+                        tint: back10_btn.pressed ? #ffffffaa : #ffffff;
+                        stroke_w: 1.8px;
+                        commands: "M 12 5 A 7.5 7.5 0 1 0 19 12 M 12 5 L 12 9 M 12 5 L 8.2 8.5";
                     }
                 }
+
+                Rectangle { width: 20px; background: transparent; }
+
+                // ---- 播放 / 暂停 ----
+                play_btn := GestureArea {
+                    width: 64px;
+                    height: 52px;
+
+                    tap(x, y) => { root.toggle_play(); }
+
+                    IconBase {
+                        x: (parent.width - 28px) / 2;
+                        y: (parent.height - 28px) / 2;
+                        size: 28px;
+                        tint: play_btn.pressed ? #ffffffaa : #ffffff;
+                        fill_mode: true;
+                        stroke_w: 0px;
+                        commands: root.paused
+                            ? "M 4.5 2.5 L 14.5 8 L 4.5 13.5 Z"
+                            : "M 4.5 2.5 L 7.5 2.5 L 7.5 13.5 L 4.5 13.5 Z M 10.5 2.5 L 13.5 2.5 L 13.5 13.5 L 10.5 13.5 Z";
+                    }
+                }
+
+                Rectangle { width: 20px; background: transparent; }
+
+                // ---- 前进 10 秒 ----
+                fwd10_btn := GestureArea {
+                    width: 64px;
+                    height: 52px;
+
+                    tap(x, y) => { root.seek_by(10.0); }
+
+                    IconBase {
+                        x: (parent.width - 26px) / 2;
+                        y: (parent.height - 26px) / 2;
+                        size: 26px;
+                        tint: fwd10_btn.pressed ? #ffffffaa : #ffffff;
+                        stroke_w: 1.8px;
+                        commands: "M 12 5 A 7.5 7.5 0 1 1 5 12 M 12 5 L 12 9 M 12 5 L 15.8 8.5";
+                    }
+                }
+            }
+
+            // ---- 时间行：贴在进度条上方 ----
+            Text {
+                x: 12px;
+                y: parent.height - 40px;
+                text: root.time_current + " / " + root.time_total;
+                color: #ffffff;
+                font-size: 11px;
+                vertical-alignment: center;
             }
         }
 

@@ -36,7 +36,7 @@ use ndk::native_window::NativeWindow;
 ///   - rust_mediacodec 那个 crate 有，但它无 license、2022 年后停更、12 星，
 ///     不适合作为依赖。所以自己写这几十行。
 #[allow(dead_code)]
-mod extractor {
+pub mod raw_extractor {
     use std::os::raw::{c_char, c_int};
 
     #[repr(C)]
@@ -98,7 +98,7 @@ mod extractor {
     }
 }
 
-pub use extractor::AMediaExtractor;
+pub use raw_extractor::AMediaExtractor;
 
 /// 把裸指针包成可跨线程传递的类型。
 ///
@@ -186,6 +186,7 @@ impl VideoDecoder {
     /// 返回后解码在后台线程进行，`stop()` 可停止。
     pub fn start(
         buffer: std::sync::Arc<crate::stream_source::SharedBuffer>,
+        clock: Option<std::sync::Arc<crate::audio_out::PlayClock>>,
         surface: *mut std::ffi::c_void,
         on_first_frame: impl FnOnce() + Send + 'static,
         on_error: impl Fn(String) + Send + 'static,
@@ -196,6 +197,7 @@ impl VideoDecoder {
         let controls_for_thread = controls.clone();
         let sp = SendPtr(surface);
         let buffer_for_thread = buffer.clone();
+        let clock_for_thread = clock;
 
         let handle = std::thread::spawn(move || {
             // 在闭包内（已成为新线程的栈）才解包指针。
@@ -205,6 +207,7 @@ impl VideoDecoder {
             if let Err(e) = decode_loop(
                 surface_ptr,
                 buffer_for_thread,
+                clock_for_thread,
                 on_first_frame,
                 &stop_for_thread,
                 &controls_for_thread,
@@ -232,6 +235,7 @@ impl VideoDecoder {
 fn decode_loop(
     surface: *mut std::ffi::c_void,
     buffer: std::sync::Arc<crate::stream_source::SharedBuffer>,
+    clock: Option<std::sync::Arc<crate::audio_out::PlayClock>>,
     on_first_frame: impl FnOnce(),
     stop: &AtomicBool,
     controls: &Controls,
@@ -245,27 +249,27 @@ fn decode_loop(
         // 打开瞬间定死的，文件再涨它看不见，必然在那一刻的 EOF 卡死。
         // AMediaDataSource 让解码器每次要数据都回调我们，我们再去等
         // 下载线程把这一段写下来 —— 这才是真正的边下边播。
-        let ex = extractor::AMediaExtractor_new();
+        let ex = raw_extractor::AMediaExtractor_new();
         if ex.is_null() {
             return Err("AMediaExtractor_new 失败".into());
         }
 
         let ds = crate::stream_source::create_data_source(buffer.clone());
         if ds.is_null() {
-            extractor::AMediaExtractor_delete(ex);
+            raw_extractor::AMediaExtractor_delete(ex);
             return Err("创建 AMediaDataSource 失败".into());
         }
 
-        let r = extractor::AMediaExtractor_setDataSourceCustom(ex, ds);
+        let r = raw_extractor::AMediaExtractor_setDataSourceCustom(ex, ds);
         if r != 0 {
-            extractor::AMediaExtractor_delete(ex);
+            raw_extractor::AMediaExtractor_delete(ex);
             ndk_sys::AMediaDataSource_delete(ds);
             return Err(format!("setDataSourceCustom 失败: {r}"));
         }
 
-        let tracks = extractor::AMediaExtractor_getTrackCount(ex);
+        let tracks = raw_extractor::AMediaExtractor_getTrackCount(ex);
         if tracks == 0 {
-            extractor::AMediaExtractor_delete(ex);
+            raw_extractor::AMediaExtractor_delete(ex);
             return Err("文件里没有轨道".into());
         }
 
@@ -274,11 +278,11 @@ fn decode_loop(
         let mut format = MediaFormat::new();
 
         for i in 0..tracks {
-            let fmt = extractor::AMediaExtractor_getTrackFormat(ex, i);
+            let fmt = raw_extractor::AMediaExtractor_getTrackFormat(ex, i);
             if fmt.is_null() {
                 continue;
             }
-            let s = extractor::AMediaFormat_toString(fmt);
+            let s = raw_extractor::AMediaFormat_toString(fmt);
             let desc = if s.is_null() {
                 String::new()
             } else {
@@ -297,15 +301,15 @@ fn decode_loop(
                 }
                 break;
             }
-            extractor::AMediaFormat_delete(fmt);
+            raw_extractor::AMediaFormat_delete(fmt);
         }
 
         let Some(vidx) = video_idx else {
-            extractor::AMediaExtractor_delete(ex);
+            raw_extractor::AMediaExtractor_delete(ex);
             return Err("没有找到视频轨".into());
         };
 
-        extractor::AMediaExtractor_selectTrack(ex, vidx);
+        raw_extractor::AMediaExtractor_selectTrack(ex, vidx);
 
         // 取 mime 建解码器
         let mime = format
@@ -358,7 +362,7 @@ fn decode_loop(
         }
 
         let Some(codec) = active_codec else {
-            extractor::AMediaExtractor_delete(ex);
+            raw_extractor::AMediaExtractor_delete(ex);
             return Err(format!(
                 "configure 失败: {}",
                 last_err.unwrap_or_else(|| "无法连接渲染表面".into())
@@ -405,7 +409,7 @@ fn decode_loop(
             // SEEK_TO_CLOSEST_SYNC = 2，SEEK_TO_PREVIOUS_SYNC = 0
             if let Some(target_us) = controls.take_seek() {
                 const SEEK_TO_CLOSEST_SYNC: i32 = 2;
-                let r = extractor::AMediaExtractor_seekTo(ex, target_us, SEEK_TO_CLOSEST_SYNC);
+                let r = raw_extractor::AMediaExtractor_seekTo(ex, target_us, SEEK_TO_CLOSEST_SYNC);
                 crate::mxprobe::log_public(&format!(
                     "[Seek] extractor.seekTo({target_us}us) -> {r}"
                 ));
@@ -428,7 +432,7 @@ fn decode_loop(
                 match codec.dequeue_input_buffer(timeout) {
                     Ok(DequeuedInputBufferResult::Buffer(mut buf)) => {
                         let cap = buf.buffer_mut().len();
-                        let n = extractor::AMediaExtractor_readSampleData(
+                        let n = raw_extractor::AMediaExtractor_readSampleData(
                             ex,
                             buf.buffer_mut().as_mut_ptr() as *mut u8,
                             cap,
@@ -448,7 +452,7 @@ fn decode_loop(
                                 .ok();
                             input_done = true;
                         } else {
-                            let pts = extractor::AMediaExtractor_getSampleTime(ex);
+                            let pts = raw_extractor::AMediaExtractor_getSampleTime(ex);
                             // 注意：AMediaExtractor_getSampleTime 返回的是微秒 (us)，绝不能再乘以 1000
                             let pts_us = if pts >= 0 { pts as u64 } else { 0 };
                             codec
@@ -460,7 +464,7 @@ fn decode_loop(
                                     0,
                                 )
                                 .ok();
-                            extractor::AMediaExtractor_advance(ex);
+                            raw_extractor::AMediaExtractor_advance(ex);
                         }
                     }
                     Ok(DequeuedInputBufferResult::TryAgainLater) => {}
@@ -493,29 +497,61 @@ fn decode_loop(
                         ));
                     }
 
-                    // PTS 帧同步：根据视频实际时间戳（微秒）休眠，实现恒定 1.0x 正常速度播放
+                    // ==================================================
+                    // 音画同步：以音频时钟为基准
+                    // ==================================================
+                    //
+                    // 有音频时（绝大多数情况）：
+                    //   每帧先读 audio_clock.position_us()，算 diff：
+                    //     · 视频超前  → 睡到该显示的时刻再送显
+                    //     · 视频落后  → 立即送显，靠后续帧自然追平
+                    //                  （落后太多时直接跳帧，见下面 300ms 分支）
+                    //
+                    //   绝不能让视频自己走内部时钟：解码器一有抖动
+                    //   （尤其是硬解队列排满时）就会与声音漂移，
+                    //   几分钟后能差出好几秒。
+                    //
+                    // 没有音频时：
+                    //   退回原来的"首帧基准 + 单调时钟"方案，保证 1.0x 速度。
                     if pts_us >= 0 {
-                        if first_pts.is_none() {
-                            first_pts = Some(pts_us);
-                            start_instant = Some(std::time::Instant::now());
-                        } else if let (Some(base_pts), Some(start_t)) = (first_pts, start_instant) {
-                            let target_elapsed_us = pts_us - base_pts;
-                            let actual_elapsed_us = start_t.elapsed().as_micros() as i64;
-                            let diff_us = target_elapsed_us - actual_elapsed_us;
+                        if let Some(ref ac) = clock {
+                            let audio_pos = ac.position_us();
+                            // 视频 PTS 与音频位置在同一时间轴上比较。
+                            // 两者都来自同一条 DASH 的时间原点，可直接相减。
+                            let diff_us = pts_us - audio_pos;
 
-                            if diff_us > 0 {
-                                if diff_us <= 80_000 {
-                                    // 正常帧间隔等待（最多休眠 80ms，杜绝任何假死卡顿）
-                                    std::thread::sleep(Duration::from_micros(diff_us as u64));
-                                } else {
-                                    // 差值过大说明视频流发生时间戳跳变或切片断层，重新校准基准时基
+                            if diff_us > 5_000 {
+                                // 视频超前：等到该显示的时刻。
+                                // 上限 100ms，避免异常大间隔把线程睡死。
+                                let wait = diff_us.min(100_000) as u64;
+                                std::thread::sleep(Duration::from_micros(wait));
+                            } else if diff_us < -300_000 {
+                                // 视频落后超过 300ms：直接丢弃这一帧。
+                                // 这是"追帧"而不是"慢放"，观感更接近正常播放。
+                                codec.release_output_buffer(buf, false).ok();
+                                continue;
+                            }
+                        } else {
+                            // 无音频：使用内部时钟
+                            if first_pts.is_none() {
+                                first_pts = Some(pts_us);
+                                start_instant = Some(std::time::Instant::now());
+                            } else if let (Some(base_pts), Some(start_t)) = (first_pts, start_instant) {
+                                let target_elapsed_us = pts_us - base_pts;
+                                let actual_elapsed_us = start_t.elapsed().as_micros() as i64;
+                                let diff_us = target_elapsed_us - actual_elapsed_us;
+
+                                if diff_us > 0 {
+                                    if diff_us <= 80_000 {
+                                        std::thread::sleep(Duration::from_micros(diff_us as u64));
+                                    } else {
+                                        first_pts = Some(pts_us);
+                                        start_instant = Some(std::time::Instant::now());
+                                    }
+                                } else if diff_us < -150_000 {
                                     first_pts = Some(pts_us);
                                     start_instant = Some(std::time::Instant::now());
                                 }
-                            } else if diff_us < -150_000 {
-                                // 解码落后超过 150ms，重设时钟追赶，杜绝持续慢放
-                                first_pts = Some(pts_us);
-                                start_instant = Some(std::time::Instant::now());
                             }
                         }
                     }
@@ -550,7 +586,7 @@ fn decode_loop(
         }
 
         codec.stop().ok();
-        extractor::AMediaExtractor_delete(ex);
+        raw_extractor::AMediaExtractor_delete(ex);
     }
 
     Ok(())

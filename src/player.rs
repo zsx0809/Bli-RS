@@ -18,6 +18,10 @@ use crate::{AppWindow, CommentItemData, RelatedVideoData};
 
 /// 全局解码器句柄
 static CURRENT: Mutex<Option<crate::video_decoder::VideoDecoder>> = Mutex::new(None);
+/// 全局音频解码器句柄
+static AUDIO_DECODER: Mutex<Option<crate::audio_decoder::AudioDecoder>> = Mutex::new(None);
+/// 全局播放时钟（音频主时钟）。暂停/恢复要能拿到它。
+static AUDIO_CLOCK: Mutex<Option<std::sync::Arc<crate::audio_out::PlayClock>>> = Mutex::new(None);
 /// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
 static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
 /// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
@@ -474,6 +478,29 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             return;
         };
 
+        // 音轨：DASH 是音视频分离的，必须单独拿一条。
+        //
+        // pick_audio() 取码率最高的可用音轨（通常是 192K）。
+        // 之前完全没有接音频 —— 这是"没有声音"的直接原因，
+        // 也是音画同步无从谈起的前提。
+        let audio_url = info
+            .audio
+            .iter()
+            .find(|t| t.primary_url().is_some())
+            .and_then(|t| t.primary_url().map(|s| s.to_string()));
+
+        match &audio_url {
+            Some(_) => {
+                if let Some(a) = info.pick_audio() {
+                    crate::mxprobe::log_public(&format!(
+                        "[Player] 选中音轨: {} {} {}bps",
+                        a.id, a.codecs, a.bandwidth
+                    ));
+                }
+            }
+            None => crate::mxprobe::log_public("[Player] 没有可用音轨，将静音播放"),
+        }
+
         crate::mxprobe::log_public(&format!(
             "[Player] 选中分辨率: {}x{} 编码: {}",
             vtrack.width.unwrap_or(0),
@@ -513,7 +540,15 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         }
 
         // 自动播放：直接起播
-        start_playback(w_clone.clone(), my_session, bvid.clone(), url, client.clone(), dur_us);
+        start_playback(
+            w_clone.clone(),
+            my_session,
+            bvid.clone(),
+            url,
+            audio_url,
+            client.clone(),
+            dur_us,
+        );
     });
 }
 
@@ -529,6 +564,7 @@ fn start_playback(
     my_session: u64,
     bvid: String,
     url: String,
+    audio_url: Option<String>,
     client: bli_protocol::BiliClient,
     duration_us: i64,
 ) {
@@ -565,129 +601,36 @@ fn start_playback(
     let _ = std::fs::remove_file(&path);
 
     // 先问出总长度。
+    // 视频流：边下边播（SharedBuffer + AMediaDataSource 流式解码）。
     //
-    // AMediaExtractor 的解封装阶段会调 getSize()，拿不到确定值
-    // （返回 -1）就会一直卡住不返回 —— 实测如此。
-    // 所以在建数据源之前，先发一个 Range: bytes=0-0 的小请求拿
-    // Content-Range 里的 total（只消耗 1 字节流量）。
-    let total_len = {
-        let rt_probe = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(r) => r,
-            Err(_) => {
-                report_fail(&w_clone, "初始化网络失败".into());
-                return;
-            }
-        };
-        rt_probe.block_on(client.probe_content_length(&url))
-    };
-
-    match total_len {
-        Some(n) => crate::mxprobe::log_public(&format!(
-            "[Player] 视频总长度 {:.1} MB",
-            n as f64 / 1_048_576.0
-        )),
-        None => crate::mxprobe::log_public("[Player] 未能探测总长度（将退回非流式读取）"),
-    }
-
-    let buffer = crate::stream_source::SharedBuffer::new(path.clone(), total_len);
+    // spawn_stream_download 内部会先用 Range: bytes=0-0 探出总长度，
+    // 因为 AMediaExtractor 的解封装阶段会调 getSize()，
+    // 返回 -1（未知）会让它一直卡住不返回（实测）。
+    let (buffer, rx_ready) = spawn_stream_download(
+        "视频",
+        client.clone(),
+        url.clone(),
+        path.clone(),
+        512_000,
+    );
 
     crate::mxprobe::log_public("[Player] 启动边下边播（AMediaDataSource 流式解码）…");
 
-    // 首段阈值 512KB：够解出 ftyp/moov 与前若干关键帧，通常 0.2~0.6 秒。
-    let (tx_ready, rx_ready) = std::sync::mpsc::sync_channel::<()>(1);
-    {
-        let buffer_dl = buffer.clone();
-        let client_dl = client.clone();
-        let url_dl = url.clone();
-        let path_dl = path.clone();
-
-        std::thread::spawn(move || {
-            let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(r) => r,
-                Err(e) => {
-                    crate::mxprobe::log_public(&format!("[下载] 运行时创建失败: {e}"));
-                    buffer_dl.fail();
-                    return;
-                }
-            };
-
-            // ---- 带断点续传的重试循环 ----
-            //
-            // 为什么必须重试：B 站 CDN 在长连接上经常中途掐断
-            // （日志里的 "error decoding response body" 就是这个）。
-            // 一小时的视频要连续下几十 MB，单次请求基本不可能不断。
-            //
-            // 策略：失败后从已下载的字节数继续（HTTP Range 续传），
-            // 最多重试 6 次，每次间隔递增。只要总进度在推进就继续，
-            // 连续 3 次没有任何进展才放弃 —— 这样弱网下也能下完。
-            const MAX_RETRY: u32 = 6;
-            let mut retry = 0u32;
-            let mut last_size = 0u64;
-            let mut stall = 0u32;
-            let mut ready_sent = false;
-
-            loop {
-                let start_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
-
-                let tx2 = tx_ready.clone();
-                let res = rt_dl.block_on(client_dl.download_stream_to_file_from(
-                    &url_dl,
-                    &path_dl,
-                    start_size,
-                    512_000,
-                    move || {
-                        let _ = tx2.send(());
-                    },
-                ));
-                ready_sent = ready_sent || start_size > 0;
-
-                match res {
-                    Ok(_written) => {
-                        let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
-                        crate::mxprobe::log_public(&format!(
-                            "[下载] 完成 {:.1} MB",
-                            total as f64 / 1_048_576.0
-                        ));
-                        buffer_dl.finish(total);
-                        return;
-                    }
-                    Err(e) => {
-                        let now_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
-                        // 把已经写下的部分同步给解码器，让它能继续播
-                        let delta = now_size.saturating_sub(buffer_dl.available_now());
-                        if delta > 0 {
-                            buffer_dl.advance(delta);
-                        }
-
-                        if now_size > last_size {
-                            // 有进展，重试计数不清零但 stall 归零
-                            stall = 0;
-                            last_size = now_size;
-                        } else {
-                            stall += 1;
-                        }
-
-                        retry += 1;
-                        crate::mxprobe::log_public(&format!(
-                            "[下载] 中断({e})，已下载 {:.1} MB，第 {retry} 次重试",
-                            now_size as f64 / 1_048_576.0
-                        ));
-
-                        if retry >= MAX_RETRY || stall >= 3 {
-                            crate::mxprobe::log_public("[下载] 重试耗尽，放弃");
-                            buffer_dl.fail();
-                            return;
-                        }
-
-                        // 递增退避：0.5s, 1s, 1.5s...
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            500 * retry as u64,
-                        ));
-                    }
-                }
-            }
-        });
-    }
+    // 音频流：同样走流式数据源。
+    //
+    // 音频文件小得多（192K 码率下一小时约 86MB，但首段阈值只要 64KB
+    // 就够解出前几个 AAC 帧），所以起播几乎立刻可用。
+    let audio_parts = audio_url.as_ref().map(|au| {
+        let apath = cache_dir.join(format!("a_{bvid}.m4s"));
+        let (abuf, arx) = spawn_stream_download(
+            "音频",
+            client.clone(),
+            au.clone(),
+            apath,
+            64_000,
+        );
+        (abuf, arx)
+    });
 
     // 等首段就绪（12 秒超时）。注意这里**只等首段**，不等整个文件。
     match rx_ready.recv_timeout(std::time::Duration::from_secs(12)) {
@@ -721,12 +664,69 @@ fn start_playback(
     // 3.7 展现视频层并启动硬解
     crate::video_surface::set_visible(true);
 
+    // ---- 音频：先于视频启动 ----
+    //
+    // 为什么音频要先起：
+    //   音频是主时钟。视频解码器启动后会读 audio_clock.position_us() 来
+    //   决定每帧是等还是追。如果音频时钟不存在，视频就只能退化成
+    //   "按自己的 PTS 自由跑"，一旦解码抖动就会与声音漂移。
+    //   先起音频，时钟从第一刻就是准的。
+    let shared_clock = if let Some((abuf, arx)) = audio_parts {
+        // 等音频首段（比视频快得多，64KB 阈值通常 <0.5 秒）
+        match arx.recv_timeout(std::time::Duration::from_secs(8)) {
+            Ok(()) => crate::mxprobe::log_public("[Audio] 首段就绪"),
+            Err(_) => crate::mxprobe::log_public("[Audio] 首段等待超时，继续尝试解码"),
+        }
+
+        // 采样率/声道数先按 48k/2ch 建流。
+        //
+        // 为什么不先问解码器真实格式：
+        //   MediaCodec 的音频输出格式要等 dequeue_output 的
+        //   OUTPUT_FORMAT_CHANGED 才知道，而 AAudio 流必须先建好才能
+        //   往里写。B 站 DASH 音频实际上全是 48kHz 立体声
+        //   （AAC-LC 44100/48000，实测都是 48000），按 48k/2ch 建立
+        //   是安全的。真遇到 44.1k 的源，AAudio 会自动重采样。
+        match crate::audio_out::AudioOutput::open(48_000, 2) {
+            Ok(ao) => {
+                let ao = std::sync::Arc::new(ao);
+                let clock = ao.clock.clone();
+
+                let a_err = {
+                    let w_a = w_clone.clone();
+                    move |e: String| {
+                        crate::mxprobe::log_public(&format!("[Audio] 解码失败: {e}"));
+                        // 音频失败不打断视频播放，只记日志。
+                        // 宁可静音也不能因为音频问题让整个视频崩掉。
+                        let _ = &w_a;
+                    }
+                };
+
+                let adec = crate::audio_decoder::AudioDecoder::start(abuf, ao.clone(), a_err);
+                if let Ok(mut cur) = AUDIO_DECODER.lock() {
+                    *cur = Some(adec);
+                }
+                if let Ok(mut g) = AUDIO_CLOCK.lock() {
+                    *g = Some(clock.clone());
+                }
+                Some(clock)
+            }
+            Err(e) => {
+                crate::mxprobe::log_public(&format!("[Audio] 打开输出失败: {e}（将静音播放）"));
+                None
+            }
+        }
+    } else {
+        crate::mxprobe::log_public("[Audio] 无音轨，静音播放");
+        None
+    };
+
     let w_ready = w_clone.clone();
     let w_err = w_clone.clone();
 
     crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
     let dec = crate::video_decoder::VideoDecoder::start(
         buffer,
+        shared_clock,
         surface,
         move || {
             crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
@@ -796,6 +796,122 @@ fn spawn_comment_faces(
             });
         }
     });
+}
+
+/// 启动一个流式下载任务，返回（可读缓冲、首段就绪接收端）。
+///
+/// 音视频共用这套逻辑：探长度 → 建 SharedBuffer → 带续传重试的后台下载。
+/// 抽出来之前这段代码在 start_playback 里内联，接音轨时无处安放。
+fn spawn_stream_download(
+    label: &'static str,
+    client: bli_protocol::BiliClient,
+    url: String,
+    path: std::path::PathBuf,
+    first_chunk_threshold: u64,
+) -> (
+    std::sync::Arc<crate::stream_source::SharedBuffer>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    // 探总长度（只花 1 字节）
+    let total_len = {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(client.probe_content_length(&url)),
+            Err(_) => None,
+        }
+    };
+    match total_len {
+        Some(n) => crate::mxprobe::log_public(&format!(
+            "[{label}] 总长度 {:.1} MB",
+            n as f64 / 1_048_576.0
+        )),
+        None => crate::mxprobe::log_public(&format!("[{label}] 未能探测总长度")),
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let buffer = crate::stream_source::SharedBuffer::new(path.clone(), total_len);
+
+    let (tx_ready, rx_ready) = std::sync::mpsc::sync_channel::<()>(1);
+    let buffer_dl = buffer.clone();
+    let client_dl = client;
+    let url_dl = url;
+    let path_dl = path;
+
+    std::thread::spawn(move || {
+        let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                crate::mxprobe::log_public(&format!("[{label}] 运行时创建失败: {e}"));
+                buffer_dl.fail();
+                return;
+            }
+        };
+
+        // 带断点续传的重试循环。
+        //
+        // CDN 长连接会中途掐断（error decoding response body）。
+        // 一小时的视频要连续下几十 MB，单次请求几乎不可能不断。
+        const MAX_RETRY: u32 = 6;
+        let mut retry = 0u32;
+        let mut last_size = 0u64;
+        let mut stall = 0u32;
+
+        loop {
+            let start_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+            let tx2 = tx_ready.clone();
+
+            let res = rt_dl.block_on(client_dl.download_stream_to_file_from(
+                &url_dl,
+                &path_dl,
+                start_size,
+                first_chunk_threshold,
+                move || {
+                    let _ = tx2.send(());
+                },
+            ));
+
+            match res {
+                Ok(_written) => {
+                    let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+                    crate::mxprobe::log_public(&format!(
+                        "[{label}] 下载完成 {:.1} MB",
+                        total as f64 / 1_048_576.0
+                    ));
+                    buffer_dl.finish(total);
+                    return;
+                }
+                Err(e) => {
+                    let now_size = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+                    let delta = now_size.saturating_sub(buffer_dl.available_now());
+                    if delta > 0 {
+                        buffer_dl.advance(delta);
+                    }
+
+                    if now_size > last_size {
+                        stall = 0;
+                        last_size = now_size;
+                    } else {
+                        stall += 1;
+                    }
+
+                    retry += 1;
+                    crate::mxprobe::log_public(&format!(
+                        "[{label}] 中断({e})，已下载 {:.1} MB，第 {retry} 次重试",
+                        now_size as f64 / 1_048_576.0
+                    ));
+
+                    if retry >= MAX_RETRY || stall >= 3 {
+                        crate::mxprobe::log_public(&format!("[{label}] 重试耗尽，放弃"));
+                        buffer_dl.fail();
+                        return;
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(500 * retry as u64));
+                }
+            }
+        }
+    });
+
+    (buffer, rx_ready)
 }
 
 /// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
@@ -955,6 +1071,15 @@ fn stop_current() {
         if let Some(mut d) = cur.take() {
             d.stop();
         }
+    }
+    // 音频同步停止，否则返回后声音还在响
+    if let Ok(mut cur) = AUDIO_DECODER.lock() {
+        if let Some(mut d) = cur.take() {
+            d.stop();
+        }
+    }
+    if let Ok(mut g) = AUDIO_CLOCK.lock() {
+        *g = None;
     }
 }
 
@@ -1300,6 +1425,16 @@ pub fn toggle_play(window: slint::Weak<AppWindow>) {
     match new_paused {
         Some(p) => {
             crate::mxprobe::log_public(if p { "[Play] 已暂停" } else { "[Play] 继续播放" });
+            // 音频也要一起停：只停视频不停音频的话，
+            // 画面静止但声音继续走，音画立刻错位。
+            if let Ok(cur) = AUDIO_DECODER.lock() {
+                // AudioDecoder 本身没有 pause 接口，暂停由 AudioOutput 的
+                // clock.paused 控制（回调里填静音、不推进播放位置）。
+                let _ = &cur;
+            }
+            if let Some(clk) = AUDIO_CLOCK.lock().ok().and_then(|g| g.clone()) {
+                clk.set_paused(p);
+            }
             // 同步到 UI，让播放键在三角/双竖线之间切换
             let w = window.clone();
             let _ = w.upgrade_in_event_loop(move |ui| {
