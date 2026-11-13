@@ -210,15 +210,37 @@ unsafe extern "C" fn ds_get_available_size(
         return 0;
     }
     let ctx = &*(userdata as *const SourceCtx);
-    let s = match ctx.buf.inner.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
     let off = offset.max(0) as u64;
-    if s.available <= off {
-        0
-    } else {
-        (s.available - off) as isize
+
+    // 关键：这里也要**等**数据到达，不能立刻返回 0。
+    //
+    // 为什么：媒体框架在解封装阶段用 getAvailableSize 判断
+    // "从 offset 起有多少字节能读"。如果文件刚起播、数据还没写到
+    // offset 处，立刻返回 0 会让解析器认为那里什么都没有，
+    // 于是放弃解析 —— 表现为 setDataSourceCustom 长时间不返回（卡住），
+    // 或者直接失败。
+    //
+    // 正确做法与 readAt 一致：等一小段数据出来再回报。
+    // 等待上限 5 秒：真没数据（下载挂了）时也要能返回，不能死等。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let s = match ctx.buf.inner.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if s.available > off {
+                return (s.available - off) as isize;
+            }
+            // 下载已结束且没有更多数据 —— 就该返回 0（真的到头了）
+            if s.finished || s.failed {
+                return 0;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
