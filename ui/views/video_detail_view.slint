@@ -67,6 +67,9 @@ export component VideoDetailView inherits Rectangle {
     callback share_clicked();
     callback follow_clicked();
     callback related_selected(string);
+    /// 点击某条评论的「回复」。参数：被回复者昵称、该评论时间（作为定位标识）。
+    /// 评论输入面板尚未实现，这里只做接口预留与日志。
+    callback reply_clicked(string, string);
 
     // 详情页根背景必须透明：整个组件是 100% 铺满 AppWindow 的，
     // 如果这里填不透明色，播放区的视频（下层 SurfaceView）就看不见了。
@@ -103,6 +106,10 @@ export component VideoDetailView inherits Rectangle {
     // 真正的 seek / 调亮度 / 调音量由 Rust 侧接回调实现（见文件底部 callback）。
     // ----------------------------------------------------------------------
     in-out property <bool> controls_visible: true;
+
+    /// 已加载好但还没起播（自动播放关闭时的状态）。
+    /// 由 Rust 侧在拿到播放地址后置 true；用户点播放后置 false。
+    in-out property <bool> awaiting_play: false;
 
     /// 手势中的浮层提示：none / brightness / volume / seek
     in-out property <string> hud_mode: "";
@@ -453,6 +460,36 @@ export component VideoDetailView inherits Rectangle {
         }
 
         // ==================================================================
+        // 中央播放按钮（自动播放关闭时出现）
+        //
+        // 这是"进详情页只加载、不播放"的起播入口：
+        //   有它，用户明确知道"点这里才开始播"，而不是对着一块黑猜。
+        // ==================================================================
+        if root.awaiting_play : Rectangle {
+            width: 64px;
+            height: 64px;
+            border-radius: 32px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #00000099;
+
+            Text {
+                text: "▶";
+                color: #ffffff;
+                font-size: 26px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            TouchArea {
+                clicked => {
+                    root.awaiting_play = false;
+                    root.toggle_play();
+                }
+            }
+        }
+
+        // ==================================================================
         // 浮层控制条（点击播放区显隐）
         // ==================================================================
         if root.controls_visible && root.detail.load_error == "" : Rectangle {
@@ -646,63 +683,75 @@ export component VideoDetailView inherits Rectangle {
         }
 
         // ------------------------------------------------------------------
-        // 常驻浮层：返回键（左上）+ 日志（右上）
+        // 浮层按钮：返回 + 日志
         //
-        // 这两个曾经被挪出去过，因为当时视频层压在窗口上面（z=0）。
-        // 现在图层反过来了，浮层恢复正常工作。
+        // 两者都跟随控制条显隐（点一下视频出现，4 秒后一起淡出）。
+        // 理由：常驻按钮会一直压在画面上，看视频时是纯干扰；
+        // 而 B 站 / PiliPlus / YouTube 全都是"点一下才出现控制层"。
+        //
+        // 日志按钮保留但只在这里出现 —— 需要看日志的人点一下视频就有了，
+        // 不需要它一直占着画面右上角。
         // ------------------------------------------------------------------
-        back_btn := GestureArea {
-            x: 6px;
-            y: 6px;
-            width: 48px;
-            height: 48px;
+        if root.controls_visible || !root.detail.is_ready || root.detail.load_error != "" : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 56px;
+            background: transparent;
 
-            tap(x, y) => { root.back_clicked(); }
+            back_btn := GestureArea {
+                x: 6px;
+                y: 4px;
+                width: 48px;
+                height: 48px;
 
-            Rectangle {
-                x: 8px;
-                y: 8px;
-                width: 32px;
-                height: 32px;
-                border-radius: 16px;
-                background: back_btn.pressed ? #000000AA : #00000066;
-                animate background { duration: Theme.animation_duration_fast; }
+                tap(x, y) => { root.back_clicked(); }
 
-                IconBack {
-                    x: 4px;
-                    y: 4px;
-                    size: 24px;
-                    tint: #ffffff;
-                }
-            }
-        }
+                Rectangle {
+                    x: 8px;
+                    y: 8px;
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 16px;
+                    background: back_btn.pressed ? #000000AA : #00000066;
+                    animate background { duration: Theme.animation_duration_fast; }
 
-        log_btn := GestureArea {
-            x: parent.width - self.width - 12px;
-            y: 12px;
-            width: 72px;
-            height: 30px;
-
-            tap(x, y) => {
-                root.show_log_dialog = !root.show_log_dialog;
-                if (root.show_log_dialog) {
-                    root.refresh_log_clicked();
+                    IconBack {
+                        x: 4px;
+                        y: 4px;
+                        size: 24px;
+                        tint: #ffffff;
+                    }
                 }
             }
 
-            Rectangle {
-                width: parent.width;
-                height: parent.height;
-                border-radius: 15px;
-                background: log_btn.pressed ? #000000AA : #00000088;
+            log_btn := GestureArea {
+                x: parent.width - self.width - 12px;
+                y: 11px;
+                width: 60px;
+                height: 30px;
 
-                Text {
-                    text: "日志";
-                    color: #ffffff;
-                    font-size: 12px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                tap(x, y) => {
+                    root.show_log_dialog = !root.show_log_dialog;
+                    if (root.show_log_dialog) {
+                        root.refresh_log_clicked();
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    border-radius: 15px;
+                    background: log_btn.pressed ? #000000AA : #00000088;
+
+                    Text {
+                        text: "日志";
+                        color: #ffffff;
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
@@ -1198,6 +1247,13 @@ export component VideoDetailView inherits Rectangle {
                     for comment in root.comments : VerticalLayout {
                         spacing: 0px;
 
+                        // 每条评论独立的楼中楼展开状态。
+                        //
+                        // 为什么放在循环体内：Slint 的 for 每次迭代有自己的
+                        // 实例作用域，property 天然是"每条一个"，不需要
+                        // 用数组去手动维护展开集合。
+                        property <bool> expanded: false;
+
                         Rectangle {
                             height: c_item.preferred-height;
                             width: 100%;
@@ -1243,13 +1299,64 @@ export component VideoDetailView inherits Rectangle {
                                     VerticalLayout {
                                         spacing: 7px;
 
-                                        Text {
-                                            text: comment.user_name;
-                                            color: Theme.on_surface_variant;
-                                            font-size: 13px;
-                                            font-weight: 600;
+                                        // ---- 昵称行：昵称 + LV 徽章 + UP 标 ----
+                                        HorizontalLayout {
+                                            spacing: 5px;
+                                            alignment: start;
+
+                                            Text {
+                                                // 大会员昵称染成 B 站粉
+                                                text: comment.user_name;
+                                                color: comment.is_vip
+                                                    ? #ff6699
+                                                    : Theme.on_surface_variant;
+                                                font-size: 13px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+
+                                            // LV 徽章
+                                            if comment.level > 0 : Rectangle {
+                                                width: lv_txt.preferred-width + 8px;
+                                                height: 13px;
+                                                border-radius: 2px;
+                                                y: (parent.height - self.height) / 2;
+                                                background: comment.level >= 6
+                                                    ? #ff4040
+                                                    : comment.level >= 3
+                                                        ? #ff9a00
+                                                        : #999999;
+
+                                                lv_txt := Text {
+                                                    text: "LV" + (comment.level);
+                                                    color: #ffffff;
+                                                    font-size: 9px;
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                    horizontal-alignment: center;
+                                                }
+                                            }
+
+                                            // UP 标
+                                            if comment.is_up : Rectangle {
+                                                width: up_txt.preferred-width + 8px;
+                                                height: 13px;
+                                                border-radius: 2px;
+                                                y: (parent.height - self.height) / 2;
+                                                background: #fb7299;
+
+                                                up_txt := Text {
+                                                    text: "UP";
+                                                    color: #ffffff;
+                                                    font-size: 9px;
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                    horizontal-alignment: center;
+                                                }
+                                            }
                                         }
 
+                                        // ---- 正文 ----
                                         Text {
                                             text: comment.content;
                                             color: Theme.on_surface;
@@ -1257,19 +1364,101 @@ export component VideoDetailView inherits Rectangle {
                                             wrap: word-wrap;
                                         }
 
+                                        // ---- 楼中楼 ----
+                                        //
+                                        // 接口只在顶层评论里预置前 3 条，
+                                        // 点了"展开"就全显示；更深的线程
+                                        // 需要额外的 detail 接口，暂不请求。
+                                        if comment.sub_replies.length > 0 : Rectangle {
+                                            width: 100%;
+                                            background: Theme.surface_variant.transparentize(60%);
+                                            border-radius: 8px;
+                                            // padding 用内层 VerticalLayout 实现
+                                            height: sub_col.preferred-height;
+
+                                            sub_col := VerticalLayout {
+                                                padding: 10px;
+                                                spacing: 8px;
+
+                                                for sub_text[i] in comment.sub_replies : VerticalLayout {
+                                                    spacing: 3px;
+
+                                                    // 楼中楼默认只展开前 1 条，除非点了"展开"
+                                                    if expanded || i == 0 : VerticalLayout {
+                                                        spacing: 3px;
+
+                                                        Text {
+                                                            text: comment.sub_authors[i] + "：";
+                                                            color: Theme.on_surface_variant;
+                                                            font-size: 12px;
+                                                            font-weight: 600;
+                                                        }
+                                                        Text {
+                                                            text: sub_text;
+                                                            color: Theme.on_surface;
+                                                            font-size: 13px;
+                                                            wrap: word-wrap;
+                                                        }
+                                                    }
+                                                }
+
+                                                // 展开 / 收起
+                                                if comment.sub_replies.length > 1 : Text {
+                                                    text: expanded
+                                                        ? "收起"
+                                                        : "共 " + (comment.reply_count > comment.sub_replies.length
+                                                            ? comment.reply_count
+                                                            : comment.sub_replies.length) + " 条回复";
+                                                    color: Theme.primary;
+                                                    font-size: 11px;
+
+                                                    TouchArea {
+                                                        clicked => { expanded = !expanded; }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // ---- 底栏：时间 • IP属地  赞  回复 ----
                                         HorizontalLayout {
-                                            spacing: 18px;
+                                            spacing: 14px;
                                             alignment: start;
 
                                             Text {
-                                                text: comment.pubtime;
+                                                // 时间与属地拼成一行，
+                                                // 和 B 站/PiliPlus 的显示一致：
+                                                // "1天前 • IP属地：广东"
+                                                text: comment.location == ""
+                                                    ? comment.pubtime
+                                                    : comment.pubtime + " • " + comment.location;
                                                 color: Theme.outline;
                                                 font-size: 11px;
                                             }
+
                                             Text {
                                                 text: "赞 " + comment.likes;
                                                 color: Theme.outline;
                                                 font-size: 11px;
+                                            }
+
+                                            // 回复按钮
+                                            reply_btn := Text {
+                                                text: "回复";
+                                                color: reply_btn_touch.pressed
+                                                    ? Theme.primary
+                                                    : Theme.outline;
+                                                font-size: 11px;
+
+                                                reply_btn_touch := TouchArea {
+                                                    clicked => {
+                                                        // 暂未接入评论输入面板。
+                                                        // 这里先留明确的视觉反馈，
+                                                        // 不假装功能已实现。
+                                                        root.reply_clicked(
+                                                            comment.user_name,
+                                                            comment.pubtime);
+                                                    }
+                                                }
                                             }
                                         }
                                     }

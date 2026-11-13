@@ -6,6 +6,7 @@ pub mod mxprobe;
 pub mod player;
 pub mod video_decoder;
 pub mod video_surface;
+pub mod settings;
 pub mod feed;
 
 slint::include_modules!();
@@ -219,11 +220,33 @@ fn android_main(app: slint::android::AndroidApp) {
     // 点击卡片 → 播放
     {
         let weak = main_window.as_weak();
+        let win_for_auto = main_window.as_weak();
         main_window.on_play_video(move |bvid| {
             let bvid = bvid.to_string();
             if let Some(w) = weak.upgrade() {
-                player::play(w.as_weak(), bvid);
+                // 自动播放是用户设置，每次进详情页都读一次当前值
+                let auto = win_for_auto.upgrade().map(|u| u.get_auto_play()).unwrap_or(true);
+                player::play(w.as_weak(), bvid, auto);
             }
+        });
+    }
+
+    // 自动播放设置持久化
+    {
+        let weak = main_window.as_weak();
+        main_window.on_auto_play_changed(move |v| {
+            settings::set_bool("auto_play", v);
+            log::info!("[设置] 自动播放 -> {v}");
+            let _ = &weak;
+        });
+    }
+
+    // 评论回复：输入面板未实现，这里只落日志，不假装能用
+    {
+        main_window.on_comment_reply_clicked(move |name, t| {
+            crate::mxprobe::log_public(&format!(
+                "[评论] 点击回复 {name}（{t}）—— 输入面板尚未实现"
+            ));
         });
     }
 
@@ -265,8 +288,11 @@ fn android_main(app: slint::android::AndroidApp) {
         });
     }
     {
+        let weak = main_window.as_weak();
         main_window.on_player_toggle_play(move || {
-            player::toggle_play();
+            if let Some(w) = weak.upgrade() {
+                player::toggle_play(w.as_weak());
+            }
         });
     }
 
@@ -315,6 +341,9 @@ fn android_main(app: slint::android::AndroidApp) {
             }
         });
     }
+
+    // 读回持久化的播放设置
+    main_window.set_auto_play(settings::get_bool("auto_play", true));
 
     // 首屏推荐流：真实数据。
     // fresh_idx=0 表示首次进入（语义见 bli_protocol::recommend）。

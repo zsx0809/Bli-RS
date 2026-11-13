@@ -395,6 +395,26 @@ mod imp {
         .unwrap_or(false)
     }
 
+    /// 获取应用私有文件目录 (Context.getFilesDir().getAbsolutePath())
+    ///
+    /// 和 cache_dir 的区别：系统在空间不足时会清理 cacheDir，
+    /// 用户设置这类需要长期保留的数据必须放 filesDir。
+    pub fn files_dir() -> Option<String> {
+        with_env(|env, activity| {
+            let file = env
+                .call_method(activity, "getFilesDir", "()Ljava/io/File;", &[])
+                .and_then(|v| v.l())
+                .ok()?;
+            let path = env
+                .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())
+                .ok()?;
+            let js: &jni::objects::JString = (&path).into();
+            env.get_string(js).ok().map(String::from)
+        })
+        .flatten()
+    }
+
     /// 获取 Android 应用的内部缓存目录 (Context.getCacheDir().getAbsolutePath())
     pub fn cache_dir() -> Option<String> {
         with_env(|env, activity| {
@@ -414,7 +434,7 @@ mod imp {
 }
 
 #[cfg(target_os = "android")]
-pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, init, is_dark, java_vm, set_android_app, set_exclusion, set_translucent_window, status_bar_height_px};
+pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, files_dir, init, is_dark, java_vm, set_android_app, set_exclusion, set_translucent_window, status_bar_height_px};
 
 /// 非 Android 平台（桌面调试）为空实现
 #[cfg(not(target_os = "android"))]
@@ -422,6 +442,11 @@ pub fn init(_vm: *mut std::ffi::c_void, _activity: *mut std::ffi::c_void) {}
 
 #[cfg(not(target_os = "android"))]
 pub fn cache_dir() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn files_dir() -> Option<String> {
     None
 }
 

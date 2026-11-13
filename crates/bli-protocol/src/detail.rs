@@ -212,7 +212,10 @@ impl BiliClient {
     }
 
     /// 拉取视频评论列表 (oid 为 aid)
-    pub async fn video_comments(&self, aid: u64) -> Result<Vec<CommentItem>> {
+    ///
+    /// `owner_mid` 是视频作者 mid，用来给评论打「UP」标。
+    /// 传 0 表示不标注（调用方拿不到作者时）。
+    pub async fn video_comments(&self, aid: u64, owner_mid: u64) -> Result<Vec<CommentItem>> {
         let mut params = BTreeMap::new();
         params.insert("oid".into(), aid.to_string());
         params.insert("type".into(), "1".into());
@@ -225,28 +228,74 @@ impl BiliClient {
             return Ok(Vec::new());
         };
 
-        let mut res = Vec::with_capacity(replies.len());
-        for r in replies {
-            let rpid = r["rpid"].as_u64().unwrap_or(0);
-            let user_name = r["member"]["uname"].as_str().unwrap_or("").to_string();
-            let user_face = r["member"]["avatar"].as_str().unwrap_or("").to_string();
-            let content = r["content"]["message"].as_str().unwrap_or("").to_string();
-            let likes = format_num(r["like"].as_u64().unwrap_or(0));
-            let ctime = r["ctime"].as_i64().unwrap_or(0);
-            let pubtime = format_relative_time(ctime);
-
-            res.push(CommentItem {
-                rpid,
-                user_name,
-                user_face,
-                content,
-                likes,
-                pubtime,
-            });
-        }
+        let res = replies
+            .iter()
+            .map(|r| parse_reply(r, owner_mid))
+            .collect();
 
         Ok(res)
     }
+}
+
+/// 解析单条评论（含楼中楼）。
+///
+/// 字段路径对照 PiliPlus 的 models_new/reply/*.dart：
+///   content.message         正文
+///   member.uname / avatar   昵称 / 头像
+///   member.level_info.current_level   等级
+///   member.vip.vipStatus>0 && vipType==2  有效大会员
+///   reply_control.location  "IP属地：广东"
+///   replies[]               楼中楼（顶层通常预置前 3 条）
+///   count                   总回复数
+fn parse_reply(r: &serde_json::Value, owner_mid: u64) -> CommentItem {
+    let member = &r["member"];
+    let mid = member["mid"].as_u64().unwrap_or(0);
+
+    let vip_status = member["vip"]["vipStatus"].as_u64().unwrap_or(0);
+    let vip_type = member["vip"]["vipType"].as_u64().unwrap_or(0);
+
+    // 属地：接口给的是 "IP属地：广东" 这种整串，前端直接用。
+    // 极少数老数据放在 reply_control.location 之外，这里只认这一个位置。
+    let location = r["reply_control"]["location"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // 楼中楼：接口预置的那几条。它们自己不再带 replies，递归一层就够。
+    let sub_replies = r["replies"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|sub| parse_reply_flat(sub, owner_mid))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    CommentItem {
+        rpid: r["rpid"].as_u64().unwrap_or(0),
+        user_name: member["uname"].as_str().unwrap_or("").to_string(),
+        user_face: member["avatar"].as_str().unwrap_or("").to_string(),
+        content: r["content"]["message"].as_str().unwrap_or("").to_string(),
+        likes: format_num(r["like"].as_u64().unwrap_or(0)),
+        pubtime: format_relative_time(r["ctime"].as_i64().unwrap_or(0)),
+        level: member["level_info"]["current_level"].as_u64().unwrap_or(0) as u32,
+        // vipType == 2 才是「年度大会员」，其它值只是曾经开过
+        is_vip: vip_status > 0 && vip_type == 2,
+        is_up: owner_mid > 0 && mid == owner_mid,
+        location,
+        reply_count: r["rcount"]
+            .as_u64()
+            .or_else(|| r["count"].as_u64())
+            .unwrap_or(0) as u32,
+        sub_replies,
+    }
+}
+
+/// 楼中楼条目：结构同上，但不再递归解析 replies（B 站只有两层）。
+fn parse_reply_flat(r: &serde_json::Value, owner_mid: u64) -> CommentItem {
+    let mut c = parse_reply(r, owner_mid);
+    c.sub_replies = Vec::new();
+    c
 }
 
 fn format_relative_time(secs: i64) -> String {
@@ -315,6 +364,14 @@ mod tests {
 }
 
 /// 评论区条目
+///
+/// 字段来源（对着 PiliPlus 的 models_new/reply 核对过，不是猜的）：
+///   · 等级   member.level_info.current_level
+///   · 大会员 member.vip.vipStatus / vipType（vipType==2 才是有效大会员）
+///   · UP主标 mid 是否等于视频作者
+///   · 属地   reply_control.location（形如 "IP属地：广东"）
+///   · 楼中楼 replies[] —— 顶层评论里通常预置前 3 条
+///   · 回复数 count
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentItem {
     pub rpid: u64,
@@ -323,6 +380,19 @@ pub struct CommentItem {
     pub content: String,
     pub likes: String,
     pub pubtime: String,
+
+    /// 用户等级 0~6
+    pub level: u32,
+    /// 是否大会员
+    pub is_vip: bool,
+    /// 是否视频作者（UP 主）
+    pub is_up: bool,
+    /// IP 属地，原始形如 "IP属地：广东"；空串表示接口没给
+    pub location: String,
+    /// 该评论的总回复数（含楼中楼）
+    pub reply_count: u32,
+    /// 楼中楼（接口通常只带前 3 条）
+    pub sub_replies: Vec<CommentItem>,
 }
 
 fn format_num(n: u64) -> String {

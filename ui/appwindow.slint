@@ -178,6 +178,16 @@ export component AppWindow inherits Window {
     // --------------------------------------------------------------------------
     // 播放进度（由 Rust 侧按解码 PTS 回填）
     // --------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // 播放设置（持久化在 Rust 侧，启动时读回）
+    // --------------------------------------------------------------------------
+    /// true：进入详情页就开始下载并自动起播
+    /// false：只加载详情，等用户点播放键
+    in-out property <bool> auto_play: true;
+
+    /// 已拿到播放地址、但还没起播（自动播放关闭时的状态）
+    in-out property <bool> awaiting_play: false;
+
     in-out property <float> play_progress: 0.0;
     in property <string> play_time_total: "00:00";
     in property <string> play_time_current: "00:00";
@@ -186,6 +196,12 @@ export component AppWindow inherits Window {
     callback player_brightness(float);
     callback player_volume(float);
     callback player_toggle_play();
+    callback comment_reply_clicked(string, string);
+    callback auto_play_changed(bool);
+
+    // 注意：这里刻意**不用** `changed auto_play` 去触发持久化。
+    //   原因：Rust 侧启动时 set_auto_play(读回的值) 也会触发 changed，
+    //   于是每次启动都白写一次盘。改由 UI 点击处显式调用回调。
     callback toggle_like();
     callback toggle_coin();
     callback toggle_fav();
@@ -404,8 +420,12 @@ export component AppWindow inherits Window {
         coin_clicked => { root.toggle_coin(); }
         fav_clicked => { root.toggle_fav(); }
         related_selected(bvid) => { root.play_video(bvid); }
+        reply_clicked(name, t) => {
+            root.comment_reply_clicked(name, t);
+        }
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
+        awaiting_play: root.awaiting_play;
         time_total: root.play_time_total;
         time_current: root.play_time_current;
         progress: root.play_progress;
@@ -422,6 +442,8 @@ export component AppWindow inherits Window {
     NavigationDrawer {
         is_open <=> root.drawer_open;
         safe_top: root.safe_top;
+        auto_play <=> root.auto_play;
+        auto_play_toggled(v) => { root.auto_play_changed(v); }
         close_drawer => {
             root.drawer_open = false;
             root.drawer_changed();

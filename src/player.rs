@@ -63,6 +63,13 @@ struct RawComment {
     content: String,
     likes: String,
     pubtime: String,
+    level: u32,
+    is_vip: bool,
+    is_up: bool,
+    location: String,
+    reply_count: u32,
+    sub_authors: Vec<String>,
+    sub_contents: Vec<String>,
 }
 
 
@@ -99,8 +106,12 @@ pub fn stop_play() {
     crate::video_surface::hide_surface();
 }
 
-/// 播放指定 bvid 并切换到二级页面
-pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
+/// 播放指定 bvid 并切换到二级页面。
+///
+/// `auto_play == false` 时：只拉详情 + 封面 + 评论 + 相关推荐 + 播放地址，
+/// **不启动下载、不碰 Surface、不创建解码器**，界面停在封面 + 播放按钮。
+/// 用户点播放后再走 `start_playback()`，体验和 B 站网页版一致。
+pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
     let my_session = PLAY_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
     // 新会话先把时长清零：seek 在时长未知时会安全忽略，
     // 总比拿上一个视频的时长算出一个荒谬的跳转点强。
@@ -117,6 +128,8 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
     let bvid_initial = bvid.clone();
     let _ = window.upgrade_in_event_loop(move |w| {
         w.set_app_mode(1);
+        // 新视频进来先把"等待起播"清掉，避免沿用上一个视频的状态
+        w.set_awaiting_play(false);
         let mut detail = w.get_current_detail();
         detail.bvid = bvid_initial.into();
         detail.title = "正在获取视频数据…".into();
@@ -161,10 +174,11 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
 
         // 3.1 拉取视频详情
         let detail_res = rt.block_on(client.video_detail(&bvid));
-        let (aid, cid, _is_vertical, face_url, pic_url) = match detail_res {
+        let (aid, cid, _is_vertical, face_url, pic_url, owner_mid) = match detail_res {
             Ok(d) => {
                 let aid = d.aid;
                 let cid = d.cid;
+                let owner_mid = d.owner_mid;
                 let is_vert = d.is_vertical;
                 let face = d.owner_face.clone();
                 let pic = d.pic.clone();
@@ -208,7 +222,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 // 按横竖屏自适应调整 SurfaceView 尺寸 (横屏 16:9 / 竖屏 48%)
                 crate::video_surface::set_adaptive_layout(is_vert);
 
-                (aid, cid, is_vert, face, pic)
+                (aid, cid, is_vert, face, pic, owner_mid)
             }
             Err(e) => {
                 report_fail(&w_clone, format!("获取视频信息失败: {e}"));
@@ -263,27 +277,47 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                     Ok(r) => r,
                     Err(_) => return,
                 };
-                if let Ok(comments) = rt_c.block_on(client_c.video_comments(aid)) {
+                if let Ok(comments) = rt_c.block_on(client_c.video_comments(aid, owner_mid)) {
                     let raw_comments: Vec<RawComment> = comments
                         .into_iter()
                         .map(|c| RawComment {
+                            sub_authors: c.sub_replies.iter().map(|s| s.user_name.clone()).collect(),
+                            sub_contents: c.sub_replies.iter().map(|s| s.content.clone()).collect(),
                             user_name: c.user_name,
                             user_face: c.user_face,
                             content: c.content,
                             likes: c.likes,
                             pubtime: c.pubtime,
+                            level: c.level,
+                            is_vip: c.is_vip,
+                            is_up: c.is_up,
+                            location: c.location,
+                            reply_count: c.reply_count,
                         })
                         .collect();
 
                     let _ = w_comment.upgrade_in_event_loop(move |w| {
                         let ui_comments: Vec<CommentItemData> = raw_comments
                             .into_iter()
-                            .map(|c| CommentItemData {
-                                user_name: c.user_name.into(),
-                                user_face: Image::default(),
-                                content: c.content.into(),
-                                likes: c.likes.into(),
-                                pubtime: c.pubtime.into(),
+                            .map(|c| {
+                                let sub_authors: Vec<slint::SharedString> =
+                                    c.sub_authors.iter().map(|s| s.as_str().into()).collect();
+                                let sub_replies: Vec<slint::SharedString> =
+                                    c.sub_contents.iter().map(|s| s.as_str().into()).collect();
+                                CommentItemData {
+                                    user_name: c.user_name.into(),
+                                    user_face: Image::default(),
+                                    content: c.content.into(),
+                                    likes: c.likes.into(),
+                                    pubtime: c.pubtime.into(),
+                                    level: c.level as i32,
+                                    is_vip: c.is_vip,
+                                    is_up: c.is_up,
+                                    location: c.location.into(),
+                                    reply_count: c.reply_count as i32,
+                                    sub_replies: ModelRc::new(VecModel::from(sub_replies)),
+                                    sub_authors: ModelRc::new(VecModel::from(sub_authors)),
+                                }
                             })
                             .collect();
                         w.set_video_comments(ModelRc::new(Rc::new(VecModel::from(ui_comments))));
@@ -409,119 +443,164 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         DURATION_US.store(dur_us, Ordering::SeqCst);
         crate::mxprobe::log_public(&format!("[Player] 总时长: {}s", info.duration));
 
-        // 3.5 边下边播：流式写入缓存，首段 1.5MB 就绪后即刻起播，杜绝整段漫长等待
-        let cache_dir = crate::android_window::cache_dir()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                let p = std::path::PathBuf::from("/data/data/com.bli.rs/cache");
-                if p.exists() || std::fs::create_dir_all(&p).is_ok() {
-                    p
-                } else {
-                    std::env::temp_dir()
-                }
+        // ---- 自动播放开关 ----
+        //
+        // 关闭时不下载视频流：这是"进入详情页但不播放"的核心 ——
+        // 既不浪费流量，也不会占着解码器。播放地址已经拿到并缓存在下面，
+        // 用户点播放时直接用，不需要再请求一次 playurl。
+        if !auto_play {
+            crate::mxprobe::log_public("[Player] 自动播放已关闭，等待用户手动起播");
+            // 把地址存起来，供 start_playback 使用
+            if let Ok(mut pending) = PENDING_STREAM.lock() {
+                *pending = Some(PendingStream {
+                    session: my_session,
+                    url: url.clone(),
+                    bvid: bvid.clone(),
+                    duration_us: dur_us,
+                });
+            }
+            // 显示中央播放按钮：封面已垫底，用户看到的是"封面 + 大播放键"，
+            // 语义清楚，不需要对着黑屏猜。
+            let w_wait = w_clone.clone();
+            let _ = w_wait.upgrade_in_event_loop(move |w| {
+                w.set_awaiting_play(true);
             });
-        let _ = std::fs::create_dir_all(&cache_dir);
-        let path = cache_dir.join(format!("v_{bvid}.m4s"));
-        let path_str = path.to_string_lossy().to_string();
+            return;
+        }
 
-        if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 500_000 {
-            crate::mxprobe::log_public("[Player] 启动边下边播流式拉取…");
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let client_dl = client.clone();
-            let url_dl = url.clone();
-            let path_dl = path.clone();
+        // 自动播放：直接起播
+        start_playback(w_clone.clone(), my_session, bvid.clone(), url, client.clone(), dur_us);
+    });
+}
 
-            std::thread::spawn(move || {
-                let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        let _ = tx.send(false);
-                        return;
-                    }
-                };
+/// 真正启动播放：下载视频流 → 等 Surface → 起解码器 → 回填进度。
+///
+/// 从 `play()` 里抽出来，是因为「自动播放关闭」时需要在**用户点击之后**
+/// 才走这条路。抽出来之前它是内联在 play 的闭包里的，没法二次调用。
+///
+/// 参数 `client` 要传进来而不是内部新建：playurl 已经拿过一次，
+/// 这里直接用同一份 client 下载流，省掉重复的 WBI 签名握手。
+fn start_playback(
+    window: slint::Weak<AppWindow>,
+    my_session: u64,
+    bvid: String,
+    url: String,
+    client: bli_protocol::BiliClient,
+    duration_us: i64,
+) {
+    let w_clone = window.clone();
+    // 3.5 边下边播：流式写入缓存，首段 1.5MB 就绪后即刻起播，杜绝整段漫长等待
+    let cache_dir = crate::android_window::cache_dir()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let p = std::path::PathBuf::from("/data/data/com.bli.rs/cache");
+            if p.exists() || std::fs::create_dir_all(&p).is_ok() {
+                p
+            } else {
+                std::env::temp_dir()
+            }
+        });
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let path = cache_dir.join(format!("v_{bvid}.m4s"));
+    let path_str = path.to_string_lossy().to_string();
 
-                let res = rt_dl.block_on(client_dl.download_stream_to_file(
-                    &url_dl,
-                    &path_dl,
-                    1_500_000, // 首段阈值 1.5MB（包含 ftyp/moov 与前几秒关键帧，通常只需 0.1~0.3 秒）
-                    move || {
-                        let _ = tx.send(true);
-                    },
-                ));
+    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 500_000 {
+        crate::mxprobe::log_public("[Player] 启动边下边播流式拉取…");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let client_dl = client.clone();
+        let url_dl = url.clone();
+        let path_dl = path.clone();
 
-                if let Err(e) = res {
-                    crate::mxprobe::log_public(&format!("[流式下载错误] {e}"));
+        std::thread::spawn(move || {
+            let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = tx.send(false);
+                    return;
                 }
-            });
+            };
 
-            // 等待首批 1.5MB 就绪信号，放行起播
-            match rx.recv_timeout(std::time::Duration::from_secs(12)) {
-                Ok(true) => {
-                    crate::mxprobe::log_public("[Player] 首段数据缓冲完毕，即刻进入播放！");
-                }
-                _ => {
-                    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 300_000 {
-                        report_fail(&w_clone, "缓冲视频流超时，请检查网络".into());
-                        return;
-                    }
+            let res = rt_dl.block_on(client_dl.download_stream_to_file(
+                &url_dl,
+                &path_dl,
+                1_500_000, // 首段阈值 1.5MB（包含 ftyp/moov 与前几秒关键帧，通常只需 0.1~0.3 秒）
+                move || {
+                    let _ = tx.send(true);
+                },
+            ));
+
+            if let Err(e) = res {
+                crate::mxprobe::log_public(&format!("[流式下载错误] {e}"));
+            }
+        });
+
+        // 等待首批 1.5MB 就绪信号，放行起播
+        match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+            Ok(true) => {
+                crate::mxprobe::log_public("[Player] 首段数据缓冲完毕，即刻进入播放！");
+            }
+            _ => {
+                if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 300_000 {
+                    report_fail(&w_clone, "缓冲视频流超时，请检查网络".into());
+                    return;
                 }
             }
-        } else {
-            crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
         }
+    } else {
+        crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
+    }
 
-        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
-            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，退出"));
-            return;
-        }
+    if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+        crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，退出"));
+        return;
+    }
 
-        // 3.6 等 Surface 就绪
-        let Some(surface) = wait_surface() else {
-            report_fail(&w_clone, "等待渲染表面超时".into());
-            return;
-        };
-        crate::mxprobe::log_public(&format!("[Player] Surface 就绪: {surface:?}"));
+    // 3.6 等 Surface 就绪
+    let Some(surface) = wait_surface() else {
+        report_fail(&w_clone, "等待渲染表面超时".into());
+        return;
+    };
+    crate::mxprobe::log_public(&format!("[Player] Surface 就绪: {surface:?}"));
 
-        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
-            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，放弃起播"));
-            return;
-        }
+    if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+        crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，放弃起播"));
+        return;
+    }
 
-        // 3.7 展现视频层并启动硬解
-        crate::video_surface::set_visible(true);
+    // 3.7 展现视频层并启动硬解
+    crate::video_surface::set_visible(true);
 
-        let w_ready = w_clone.clone();
-        let w_err = w_clone.clone();
+    let w_ready = w_clone.clone();
+    let w_err = w_clone.clone();
 
-        crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
-        let dec = crate::video_decoder::VideoDecoder::start(
-            path_str,
-            surface,
-            move || {
-                crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
-                let _ = w_ready.upgrade_in_event_loop(|w| {
-                    let mut d = w.get_current_detail();
-                    d.is_ready = true;
-                    w.set_current_detail(d);
-                });
-            },
-            move |e| {
-                crate::mxprobe::log_public(&format!("[Player] 解码失败通知: {e}"));
-                report_fail(&w_err, format!("视频解码失败: {e}"));
-            },
-        );
+    crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
+    let dec = crate::video_decoder::VideoDecoder::start(
+        path_str,
+        surface,
+        move || {
+            crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
+            let _ = w_ready.upgrade_in_event_loop(|w| {
+                let mut d = w.get_current_detail();
+                d.is_ready = true;
+                w.set_current_detail(d);
+            });
+        },
+        move |e| {
+            crate::mxprobe::log_public(&format!("[Player] 解码失败通知: {e}"));
+            report_fail(&w_err, format!("视频解码失败: {e}"));
+        },
+    );
 
-        if let Ok(mut cur) = CURRENT.lock() {
-            *cur = Some(dec);
-        }
+    if let Ok(mut cur) = CURRENT.lock() {
+        *cur = Some(dec);
+    }
 
-        // ---- 进度回填 ----
-        //
-        // 解码线程每帧更新 last_pts_us，这里用 250ms 定时器搬运到 UI。
-        // 为什么不每帧推：30fps 意味着每秒 30 次跨线程 event_loop 调用，
-        // 在低端机上会和渲染抢 UI 线程。进度条人眼只需要 ~4Hz。
-        spawn_progress_poller(w_clone.clone(), my_session, dur_us);
-    });
+    // ---- 进度回填 ----
+    //
+    // 解码线程每帧更新 last_pts_us，这里用 250ms 定时器搬运到 UI。
+    // 为什么不每帧推：30fps 意味着每秒 30 次跨线程 event_loop 调用，
+    // 在低端机上会和渲染抢 UI 线程。进度条人眼只需要 ~4Hz。
+    spawn_progress_poller(w_clone.clone(), my_session, duration_us);
 }
 
 /// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
@@ -806,7 +885,23 @@ pub fn seek_to(frac: f32) {
 }
 
 /// 播放 / 暂停切换。
-pub fn toggle_play() {
+///
+/// 三种情形：
+///   1. 还没有解码器（自动播放关闭，界面停在封面）→ 真正起播
+///   2. 解码器在跑 → 暂停
+///   3. 解码器已暂停 → 继续
+pub fn toggle_play(window: slint::Weak<AppWindow>) {
+    // 情形 1：需要从「待播」状态启动
+    let has_decoder = CURRENT
+        .lock()
+        .map(|c| c.is_some())
+        .unwrap_or(false);
+
+    if !has_decoder {
+        start_pending(window);
+        return;
+    }
+
     if let Ok(cur) = CURRENT.lock() {
         if let Some(dec) = cur.as_ref() {
             let now = !dec.controls.is_paused();
@@ -815,8 +910,44 @@ pub fn toggle_play() {
                 "[Play] {}",
                 if now { "已暂停" } else { "继续播放" }
             ));
-        } else {
-            crate::mxprobe::log_public("[Play] 当前没有解码器实例");
         }
     }
+}
+
+/// 用暂存的播放地址启动播放（自动播放关闭后的手动起播）。
+fn start_pending(window: slint::Weak<AppWindow>) {
+    let pending = PENDING_STREAM.lock().ok().and_then(|mut p| p.take());
+
+    let Some(p) = pending else {
+        crate::mxprobe::log_public("[Play] 没有待播流（可能还在加载播放地址）");
+        return;
+    };
+
+    // 会话已经切换（用户返回或点了别的视频），这份待播流作废
+    if PLAY_SESSION.load(Ordering::SeqCst) != p.session {
+        crate::mxprobe::log_public("[Play] 待播流属于旧会话，丢弃");
+        return;
+    }
+
+    crate::mxprobe::log_public(&format!("[Play] 用户手动起播 {}", p.bvid));
+
+    // 先让 UI 进入"加载中"，同时收起中央播放按钮
+    let w_ui = window.clone();
+    let _ = w_ui.upgrade_in_event_loop(move |w| {
+        w.set_awaiting_play(false);
+        let mut d = w.get_current_detail();
+        d.is_ready = false;
+        d.load_error = "".into();
+        w.set_current_detail(d);
+    });
+
+    let client = match bli_protocol::BiliClient::new() {
+        Ok(c) => c,
+        Err(e) => {
+            report_fail(&window, format!("初始化网络失败: {e}"));
+            return;
+        }
+    };
+
+    start_playback(window, p.session, p.bvid, p.url, client, p.duration_us);
 }

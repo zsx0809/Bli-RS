@@ -75,6 +75,21 @@ export struct CommentItemData {
     content: string,
     likes: string,
     pubtime: string,
+
+    /// 用户等级 0~6，UI 画 LV 徽章
+    level: int,
+    /// 大会员：昵称染成粉色
+    is_vip: bool,
+    /// 视频作者：昵称后挂 UP 标
+    is_up: bool,
+    /// IP 属地，原始形如 "IP属地：广东"。空串时不显示
+    location: string,
+    /// 总回复数（含楼中楼）。>0 时显示"共 N 条回复"
+    reply_count: int,
+    /// 楼中楼内容，展开后显示
+    sub_replies: [string],
+    /// 楼中楼作者名，与 sub_replies 一一对应
+    sub_authors: [string],
 }
 
 /// 全局布局度量 (Layout Metrics)

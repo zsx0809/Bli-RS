@@ -77,15 +77,29 @@ jobs:
         env:
           # CI 用官方 NDK 链接，DT_NEEDED 已正确，不需要 patchelf
           SKIP_PATCHELF: "1"
+          CI_DEBUG_KEYSTORE: ${{ secrets.CI_DEBUG_KEYSTORE }}
         run: |
           LIBCXX=$(find ${{ steps.ndk.outputs.ndk-path }} -name 'libc++_shared.so' -path '*aarch64-linux-android*' | head -1)
           echo "libc++_shared: $LIBCXX"
 
+          # 固定 keystore：从仓库 secret 还原。
+          #
+          # 为什么不能用 keytool 每次现生成：每次 run 生成的密钥都不同，
+          # 签名不一致会导致 `pm install -r` 直接报
+          # INSTALL_FAILED_UPDATE_INCOMPATIBLE，必须卸载重装（丢数据）。
+          # CI_DEBUG_KEYSTORE 是 base64 后的 keystore 内容。
           mkdir -p ~/.android
-          keytool -genkeypair -v -keystore ~/.android/debug.keystore \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          if [ -n "${CI_DEBUG_KEYSTORE:-}" ]; then
+            echo "使用仓库固定 keystore"
+            echo "$CI_DEBUG_KEYSTORE" | base64 -d > ~/.android/debug.keystore
+          else
+            echo "::warning::未配置 CI_DEBUG_KEYSTORE，本次使用随机密钥，"
+            echo "::warning::将导致无法覆盖安装（需先卸载旧版本）。"
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
           LIBCXX_SO="$LIBCXX" bash scripts/package_apk.sh
 

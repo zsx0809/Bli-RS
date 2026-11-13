@@ -57,6 +57,10 @@ export component NavigationDrawer inherits Rectangle {
     in-out property <bool> is_open: false;
     in property <length> safe_top: 0px;
 
+    /// 播放设置：进入详情页是否自动起播（持久化在 Rust 侧）
+    in-out property <bool> auto_play: true;
+    callback auto_play_toggled(bool);
+
     callback close_drawer();
     callback navigate_settings();
     callback navigate_history();
@@ -226,6 +230,60 @@ export component NavigationDrawer inherits Rectangle {
                 highlighted: true;
                 clicked => { root.navigate_settings(); }
                 IconThermostat { }
+            }
+
+            // --------------------------------------------------------------
+            // 自动播放开关
+            //
+            // 直接放在抽屉里而不是藏进独立的设置页：
+            //   这是一个高频切换的偏好（流量 vs 便利），
+            //   点开抽屉就能改，比"进设置页找第三项"顺手得多。
+            //   等设置页做起来之后可以再挪。
+            // --------------------------------------------------------------
+            auto_play_row := Rectangle {
+                height: 44px;
+                background: transparent;
+
+                Text {
+                    x: 10px;
+                    y: (parent.height - self.height) / 2;
+                    text: "自动播放";
+                    color: Theme.on_surface;
+                    font-size: 14px;
+                }
+
+                // 开关本体：44x24 圆角轨道 + 滑动圆点
+                Rectangle {
+                    x: parent.width - self.width - 14px;
+                    y: (parent.height - self.height) / 2;
+                    width: 44px;
+                    height: 24px;
+                    border-radius: 12px;
+                    background: root.auto_play ? Theme.primary : Theme.surface_variant;
+
+                    Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        y: 3px;
+                        x: root.auto_play ? parent.width - self.width - 3px : 3px;
+                        border-radius: 9px;
+                        background: #ffffff;
+
+                        animate x {
+                            duration: Theme.animation_duration_fast;
+                            easing: ease-out;
+                        }
+                    }
+
+                    TouchArea {
+                        clicked => {
+                            root.auto_play = !root.auto_play;
+                            // 显式通知外部持久化（不用 changed 是为了避开
+                            // 启动时 Rust set_ 初值造成的无意义写盘）
+                            root.auto_play_toggled(root.auto_play);
+                        }
+                    }
+                }
             }
 
             // 弹性留白：把「设置 + 版本号」压到抽屉底部
