@@ -297,6 +297,76 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         }
     }
 
+    /// 强制 SurfaceView 重新走一遍 attach 流程，让 Surface 重新创建。
+    ///
+    /// 为什么需要这个：alpha=0 能保住"活着"的 Surface，但一旦它被系统
+    /// 在某个时机销毁（切后台、Activity 重建、某些 ROM 的内存回收），
+    /// 单纯 setVisibility(VISIBLE) **不会**重建它 —— Surface 的创建
+    /// 只由 surfaceCreated 回调驱动，而回调只在 View attach 到 window
+    /// 时触发。
+    ///
+    /// 做法：从父容器移除再重新加回去。这是唯一能可靠触发 attach 的手段，
+    /// 效果等价于"把这块 View 重新装进窗口"。
+    pub fn force_reattach() {
+        let Some(vm) = android_window::java_vm() else {
+            return;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return;
+        };
+        let Some(sv) = SURFACE_VIEW.get() else {
+            return;
+        };
+        let Some(activity) = android_window::activity_object() else {
+            return;
+        };
+
+        // 拿 decorView（父容器）
+        let Ok(window) = env
+            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+        let Ok(decor) = env
+            .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+
+        // removeView → addView，用原来那份 LayoutParams
+        let Ok(lp) = env
+            .call_method(sv.as_obj(), "getLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;", &[])
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+
+        let _ = env.call_method(
+            &decor,
+            "removeView",
+            "(Landroid/view/View;)V",
+            &[JValue::Object(sv.as_obj())],
+        );
+        let r = env.call_method(
+            &decor,
+            "addView",
+            "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(sv.as_obj()), JValue::Object(&lp)],
+        );
+
+        let _ = env.call_method(sv.as_obj(), "setVisibility", "(I)V", &[JValue::Int(0)]);
+        let _ = env.call_method(sv.as_obj(), "setAlpha", "(F)V", &[JValue::Float(1.0)]);
+
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            crate::mxprobe::log_public("[Surface] 重新 attach 失败");
+            return;
+        }
+        crate::mxprobe::log_public(&format!("[Surface] 已强制重新 attach -> {}", r.is_ok()));
+    }
+
     /// 是否已创建过 SurfaceView
     pub fn surface_view_exists() -> bool {
         SURFACE_VIEW.get().is_some()
@@ -571,6 +641,14 @@ pub fn set_adaptive_layout(is_vertical: bool) {
     run_on_ui_thread(move || {
         #[cfg(target_os = "android")]
         imp::update_adaptive_layout(is_vertical);
+    });
+}
+
+/// 强制视频层重新 attach（Surface 被系统销毁后用来重建）
+pub fn force_reattach_surface() {
+    run_on_ui_thread(|| {
+        #[cfg(target_os = "android")]
+        imp::force_reattach();
     });
 }
 

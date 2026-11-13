@@ -803,8 +803,22 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
     if duration_us <= 0 {
         return;
     }
+    let total_secs = duration_us / 1_000_000;
+
+    // 总时长立刻上屏。
+    //
+    // 之前是等第一帧 PTS 出来才设，结果解码前的几帧里 UI 一直显示
+    // "00:00 / 00:00"，看起来像是没读到时长。总时长本来就已知，
+    // 没必要等。
+    {
+        let w0 = window.clone();
+        let total_text = fmt_time(total_secs);
+        let _ = w0.upgrade_in_event_loop(move |ui| {
+            ui.set_play_time_total(total_text.into());
+        });
+    }
+
     std::thread::spawn(move || {
-        let total_secs = duration_us / 1_000_000;
         loop {
             if PLAY_SESSION.load(Ordering::SeqCst) != session {
                 return;
@@ -820,7 +834,11 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
                 }
             };
 
-            if pts <= 0 {
+            // 注意：pts == 0 是**合法值**（首帧就从 0 开始），
+            // 不能像之前那样 `pts <= 0` 直接跳过 —— 那会让进度条在
+            // 开播后的前若干帧一直停在 0，看起来像没在走。
+            // 只有负数才是"还没有数据"，那才跳过。
+            if pts < 0 {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
@@ -830,7 +848,6 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
             let _ = window.upgrade_in_event_loop(move |ui| {
                 ui.set_play_progress(frac);
                 ui.set_play_time_current(fmt_time(cur_secs).into());
-                ui.set_play_time_total(fmt_time(total_secs as i64).into());
             });
 
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -918,7 +935,14 @@ fn wait_surface() -> Option<*mut std::ffi::c_void> {
         if let Some(s) = crate::video_surface::acquire_native_window() {
             return Some(s);
         }
-        if i == 5 || i == 15 || i == 25 {
+
+        // 到第 5 次（约 0.75 秒）还是拿不到，说明 Surface 已经被系统销毁
+        // 而 setVisibility 不会重建它 —— 必须强制重新 attach 走一遍
+        // surfaceCreated 回调。这是"第二次进详情页黑屏"的修法。
+        if i == 5 {
+            crate::mxprobe::log_public("[Surface] 未就绪，强制重新 attach");
+            crate::video_surface::force_reattach_surface();
+        } else if i == 15 || i == 25 || i == 35 {
             crate::video_surface::set_visible(true);
         }
         std::thread::sleep(std::time::Duration::from_millis(150));

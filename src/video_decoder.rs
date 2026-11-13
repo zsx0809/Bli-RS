@@ -126,7 +126,6 @@ impl SendPtr {
 ///   · 连续拖动进度条会连发几十次 seek，只有最后一次有意义
 ///   · 暂停/播放是幂等的布尔量
 /// 队列会把它们全部排队执行，反而卡顿与积压。
-#[derive(Default)]
 pub struct Controls {
     /// 暂停标志。true 时循环不再送输入、不再 release 输出，原地等待。
     paused: AtomicBool,
@@ -139,6 +138,17 @@ pub struct Controls {
     ///   通知 Slint，会把 UI 线程压满。UI 侧用 200ms 定时器来轮询，
     ///   刷新率对人眼足够，代价可以忽略。
     last_pts_us: AtomicI64,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            seek_target_us: Mutex::new(None),
+            // -1 = "还没有任何帧送显"，与 PTS 0（首帧）区分开
+            last_pts_us: AtomicI64::new(-1),
+        }
+    }
 }
 
 impl Controls {
