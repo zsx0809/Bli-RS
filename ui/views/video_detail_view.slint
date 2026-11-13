@@ -77,6 +77,17 @@ export component VideoDetailView inherits Rectangle {
     // 需要实底的部分（Tab 栏 / 内容区 / 状态栏占位）各自单独填色。
     background: transparent;
 
+    // [诊断] 打印本组件的实时尺寸，确认横屏后是否更新
+    changed width => {
+        root.dbg_size(root.width / 1px, root.height / 1px);
+    }
+    changed height => {
+        root.dbg_size(root.width / 1px, root.height / 1px);
+    }
+    init => {
+        root.dbg_size(root.width / 1px, root.height / 1px);
+    }
+
     // ----------------------------------------------------------------------
     // 播放区几何
     //
@@ -166,6 +177,7 @@ export component VideoDetailView inherits Rectangle {
     callback seek_by(float);
     /// 切换全屏。Rust 侧据此同步 SurfaceView 的真实几何。
     callback toggle_fullscreen();
+    callback dbg_size(float, float);
     callback set_brightness(float);
     callback set_volume(float);
     callback toggle_play();
