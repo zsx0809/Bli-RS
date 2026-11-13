@@ -228,6 +228,29 @@ impl BiliClient {
             return Ok(Vec::new());
         };
 
+        // 一次性诊断：确认这条链路上到底有没有 reply_control.location。
+        //
+        // 背景：PiliPlus 的做法是走 gRPC（reply_item_grpc.dart），
+        // 而 Web 端点 /x/v2/reply/wbi/main 的字段集并不完全一致。
+        // 不实测就只能猜，猜错的表现是"IP 属地永远不显示"且没有任何报错。
+        if let Some(first) = replies.first() {
+            let has_rc = first.get("reply_control").is_some();
+            let loc = first["reply_control"]["location"].as_str().unwrap_or("");
+            // 用 eprintln 而不是 log::info!：宿主的 Android 入口没有装
+            // logger，log crate 的宏不会产生任何输出。eprintln 在 Android 上
+            // 会进 logcat（tag 由 std 固定），至少能被抓到。
+            eprintln!(
+                "[reply] 首条顶层键数={} 有reply_control={} location={:?} 全部键={:?}",
+                first.as_object().map(|o| o.len()).unwrap_or(0),
+                has_rc,
+                loc,
+                first
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
+        }
+
         let res = replies
             .iter()
             .map(|r| parse_reply(r, owner_mid))
