@@ -171,13 +171,10 @@ fn android_main(app: slint::android::AndroidApp) {
     slint::android::init(app.clone()).unwrap();
 
     // 登记 JVM / Activity，用于系统手势排除区
-    // SAFETY: 指针由 android-activity 提供，生命周期覆盖本次 android_main
-    unsafe {
-        android_window::init(app.vm_as_ptr(), app.activity_as_ptr());
-        // 同时登记 AndroidApp 本身：创建 SurfaceView 必须在 Java 主线程，
-        // 需要借它的 run_on_java_main_thread。
-        android_window::set_android_app(app.clone());
-    }
+    android_window::init(app.vm_as_ptr(), app.activity_as_ptr());
+    // 同时登记 AndroidApp 本身：创建 SurfaceView 必须在 Java 主线程，
+    // 需要借它的 run_on_java_main_thread。
+    android_window::set_android_app(app.clone());
 
     let main_window = create_app().unwrap();
 
@@ -255,6 +252,28 @@ fn android_main(app: slint::android::AndroidApp) {
         let weak = main_window.as_weak();
         main_window.on_toggle_fav(move || {
             player::toggle_fav(weak.clone());
+        });
+    }
+
+    // 诊断日志刷新
+    {
+        let weak = main_window.as_weak();
+        main_window.on_refresh_log(move || {
+            let logs = crate::mxprobe::get_recent_logs();
+            if let Some(w) = weak.upgrade() {
+                w.set_log_text(logs.into());
+            }
+        });
+    }
+
+    // 诊断日志清空
+    {
+        let weak = main_window.as_weak();
+        main_window.on_clear_log(move || {
+            crate::mxprobe::clear_logs();
+            if let Some(w) = weak.upgrade() {
+                w.set_log_text("".into());
+            }
         });
     }
 

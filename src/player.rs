@@ -8,14 +8,23 @@
 // 5. 拉取 DASH playurl -> 下载流 -> MediaCodec 硬解送显 + PTS 时间戳帧同步
 // ==============================================================================
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
-use crate::{AppWindow, CommentItemData, RelatedVideoData, VideoDetailData};
+use crate::{AppWindow, CommentItemData, RelatedVideoData};
 
 /// 全局解码器句柄
 static CURRENT: Mutex<Option<crate::video_decoder::VideoDecoder>> = Mutex::new(None);
+/// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
+static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// 相关推荐视频模型句柄（仅在 UI 线程访问，杜绝跨线程 Send 冲突）
+    static RELATED_MODEL: RefCell<Option<Rc<VecModel<RelatedVideoData>>>> = const { RefCell::new(None) };
+}
 
 /// 纯数据详情包装，满足跨线程 Send 契约
 struct RawDetail {
@@ -71,12 +80,14 @@ fn report_fail(window: &slint::Weak<AppWindow>, msg: String) {
 
 /// 停止当前播放并隐藏视频层
 pub fn stop_play() {
+    PLAY_SESSION.fetch_add(1, Ordering::SeqCst);
     stop_current();
     crate::video_surface::hide_surface();
 }
 
 /// 播放指定 bvid 并切换到二级页面
 pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
+    let my_session = PLAY_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
     stop_current();
 
     // 注意：这里**不**解除系统手势排除区。
@@ -110,7 +121,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
 
     // 3. 后台请求与播放编排
     std::thread::spawn(move || {
-        crate::mxprobe::log_public(&format!("=== 开启二级详情与播放 {bvid} ==="));
+        crate::mxprobe::log_public(&format!("=== 开启二级详情与播放 session={my_session} {bvid} ==="));
 
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -133,7 +144,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
 
         // 3.1 拉取视频详情
         let detail_res = rt.block_on(client.video_detail(&bvid));
-        let (aid, cid, is_vertical, face_url, pic_url) = match detail_res {
+        let (aid, cid, _is_vertical, face_url, pic_url) = match detail_res {
             Ok(d) => {
                 let aid = d.aid;
                 let cid = d.cid;
@@ -280,25 +291,68 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 })
                 .collect();
 
+            let covers_to_download: Vec<(usize, String)> = raw_rel
+                .iter()
+                .enumerate()
+                .take(12)
+                .filter(|(_, r)| !r.cover_url.is_empty())
+                .map(|(i, r)| (i, r.cover_url.clone()))
+                .collect();
+
             let w_rel = w_clone.clone();
             let _ = w_rel.upgrade_in_event_loop(move |w| {
                 let ui_list: Vec<RelatedVideoData> = raw_rel
                     .into_iter()
                     .map(|r| RelatedVideoData {
-                        bvid: r.bvid.into(),
-                        title: r.title.into(),
-                        author: r.author.into(),
-                        views: r.views.into(),
-                        danmaku: r.danmaku.into(),
-                        duration: r.duration.into(),
+                        bvid: r.bvid.as_str().into(),
+                        title: r.title.as_str().into(),
+                        author: r.author.as_str().into(),
+                        views: r.views.as_str().into(),
+                        danmaku: r.danmaku.as_str().into(),
+                        duration: r.duration.as_str().into(),
                         cover: Image::default(),
-                        cover_url: r.cover_url.into(),
+                        cover_url: r.cover_url.as_str().into(),
                     })
                     .collect();
 
                 let model = Rc::new(VecModel::from(ui_list));
-                w.set_related_videos(ModelRc::new(model));
+                w.set_related_videos(ModelRc::new(model.clone()));
+                RELATED_MODEL.with(|m| *m.borrow_mut() = Some(model));
             });
+
+            if !covers_to_download.is_empty() {
+                let w_cov_ui = w_clone.clone();
+                std::thread::spawn(move || {
+                    let rt_cov = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    for (idx, url) in covers_to_download {
+                        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+                            return;
+                        }
+                        if let Some((w, h, rgba)) = rt_cov.block_on(download_raw_image(&url)) {
+                            let w_ui = w_cov_ui.clone();
+                            let _ = w_ui.upgrade_in_event_loop(move |_| {
+                                RELATED_MODEL.with(|cell| {
+                                    if let Some(ref m) = *cell.borrow() {
+                                        if let Some(mut row) = m.row_data(idx) {
+                                            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                                            row.cover = Image::from_rgba8(buf);
+                                            m.set_row_data(idx, row);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，退出"));
+            return;
         }
 
         // 3.4 拿播放地址与媒体流
@@ -309,6 +363,11 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 return;
             }
         };
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，退出"));
+            return;
+        }
 
         // 优先 720P / 480P，移动端秒级快速下载，杜绝 1080P 超大体积与限速导致长时间卡在加载中
         let Some(vtrack) = info.pick_video(Some(720)) else {
@@ -321,7 +380,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         };
 
         crate::mxprobe::log_public(&format!(
-            "选中 {}x{} {}",
+            "[Player] 选中分辨率: {}x{} 编码: {}",
             vtrack.width.unwrap_or(0),
             vtrack.height.unwrap_or(0),
             vtrack.codecs
@@ -343,7 +402,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         let path_str = path.to_string_lossy().to_string();
 
         if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 500_000 {
-            crate::mxprobe::log_public("启动边下边播流式拉取…");
+            crate::mxprobe::log_public("[Player] 启动边下边播流式拉取…");
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let client_dl = client.clone();
             let url_dl = url.clone();
@@ -375,7 +434,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             // 等待首批 1.5MB 就绪信号，放行起播
             match rx.recv_timeout(std::time::Duration::from_secs(12)) {
                 Ok(true) => {
-                    crate::mxprobe::log_public("首段数据缓冲完毕，即刻进入播放！");
+                    crate::mxprobe::log_public("[Player] 首段数据缓冲完毕，即刻进入播放！");
                 }
                 _ => {
                     if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 300_000 {
@@ -385,7 +444,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 }
             }
         } else {
-            crate::mxprobe::log_public("使用已缓存视频流");
+            crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
+        }
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，退出"));
+            return;
         }
 
         // 3.6 等 Surface 就绪
@@ -393,7 +457,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             report_fail(&w_clone, "等待渲染表面超时".into());
             return;
         };
-        crate::mxprobe::log_public(&format!("Surface 就绪: {surface:?}"));
+        crate::mxprobe::log_public(&format!("[Player] Surface 就绪: {surface:?}"));
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+            crate::mxprobe::log_public(&format!("[Session] 会话 {my_session} 已失效，放弃起播"));
+            return;
+        }
 
         // 3.7 展现视频层并启动硬解
         crate::video_surface::set_visible(true);
@@ -401,11 +470,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         let w_ready = w_clone.clone();
         let w_err = w_clone.clone();
 
+        crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
         let dec = crate::video_decoder::VideoDecoder::start(
             path_str,
             surface,
             move || {
-                // 首帧成功送显到 SurfaceView，淡出封面占位图
+                crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
                 let _ = w_ready.upgrade_in_event_loop(|w| {
                     let mut d = w.get_current_detail();
                     d.is_ready = true;
@@ -413,6 +483,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
                 });
             },
             move |e| {
+                crate::mxprobe::log_public(&format!("[Player] 解码失败通知: {e}"));
                 report_fail(&w_err, format!("视频解码失败: {e}"));
             },
         );

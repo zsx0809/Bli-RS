@@ -289,8 +289,17 @@ mod imp {
         );
     }
 
+    static LAST_LAYOUT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
     /// 更新 SurfaceView 的高宽与顶部边距（在主线程运行）
     pub fn update_layout(height_px: i32, top_px: i32) {
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            if *lock == Some((height_px, top_px)) {
+                return; // 尺寸与位置未改变，绝不重复调用 setLayoutParams 导致 Surface 销毁重建
+            }
+            *lock = Some((height_px, top_px));
+        }
+
         let Some(vm) = android_window::java_vm() else {
             return;
         };
@@ -300,6 +309,8 @@ mod imp {
         let Some(sv) = SURFACE_VIEW.get() else {
             return;
         };
+
+        crate::mxprobe::log_public(&format!("[Surface] 更新 SurfaceView 布局: h={height_px}, top={top_px}"));
 
         // new FrameLayout.LayoutParams(-1, height_px)
         let Ok(lp) = env.new_object(
@@ -469,13 +480,12 @@ pub fn set_adaptive_layout(is_vertical: bool) {
     });
 }
 
-/// 隐藏视频 Surface 并把尺寸清零
+/// 隐藏视频 Surface（保持几何尺寸，杜绝 Surface 销毁重建）
 pub fn hide_surface() {
     run_on_ui_thread(|| {
         #[cfg(target_os = "android")]
         {
             imp::set_visible(false);
-            imp::update_layout(0, 0);
         }
     });
 }

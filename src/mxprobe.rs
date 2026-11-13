@@ -43,9 +43,70 @@ extern "C" {
     fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
 }
 
-/// 供其他模块复用的日志出口
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+static LOG_BUFFER: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
+const MAX_LOG_LINES: usize = 400;
+
+/// 供其他模块复用的全链路日志出口：落盘 + 内存环形缓存 + logcat
 pub fn log_public(msg: &str) {
-    alog(msg);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let h = (secs / 3600 + 8) % 24; // 转换东八区北京时间
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    let line = format!("[{h:02}:{m:02}:{s:02}.{millis:03}] {msg}");
+
+    // 1. Android Logcat
+    alog(&line);
+
+    // 2. 内存环形缓冲（供 UI 弹窗实时查看）
+    if let Ok(mut lock) = LOG_BUFFER.lock() {
+        let buf = lock.get_or_insert_with(|| VecDeque::with_capacity(MAX_LOG_LINES));
+        if buf.len() >= MAX_LOG_LINES {
+            buf.pop_front();
+        }
+        buf.push_back(line.clone());
+    }
+
+    // 3. 文件落盘（追加到 /data/data/com.bli.rs/cache/bli.log）
+    append_log_file(&line);
+}
+
+fn append_log_file(line: &str) {
+    use std::io::Write;
+    let log_path = std::path::PathBuf::from("/data/data/com.bli.rs/cache/bli.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// 获取最近收集的所有日志，供 UI 实时展示
+pub fn get_recent_logs() -> String {
+    if let Ok(mut lock) = LOG_BUFFER.lock() {
+        let buf = lock.get_or_insert_with(|| VecDeque::with_capacity(MAX_LOG_LINES));
+        if buf.is_empty() {
+            return "暂无日志记录".into();
+        }
+        buf.iter().cloned().collect::<Vec<_>>().join("\n")
+    } else {
+        "日志缓冲区忙".into()
+    }
+}
+
+/// 清空日志
+pub fn clear_logs() {
+    if let Ok(mut lock) = LOG_BUFFER.lock() {
+        if let Some(buf) = lock.as_mut() {
+            buf.clear();
+        }
+    }
+    let log_path = std::path::PathBuf::from("/data/data/com.bli.rs/cache/bli.log");
+    let _ = std::fs::write(log_path, "");
 }
 
 fn alog(msg: &str) {

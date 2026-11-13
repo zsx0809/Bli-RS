@@ -157,6 +157,10 @@ export component AppWindow inherits Window {
     in-out property <[RelatedVideoData]> related_videos: [];
     in-out property <[CommentItemData]> video_comments: [];
 
+    in-out property <string> log_text: "";
+    callback refresh_log();
+    callback clear_log();
+
     callback exit_detail_view();
     callback toggle_like();
     callback toggle_coin();
@@ -365,6 +369,9 @@ export component AppWindow inherits Window {
         detail: root.current_detail;
         related_list: root.related_videos;
         comments: root.video_comments;
+        log_text: root.log_text;
+        refresh_log_clicked => { root.refresh_log(); }
+        clear_log_clicked => { root.clear_log(); }
         back_clicked => {
             root.app_mode = 0;
             root.exit_detail_view();

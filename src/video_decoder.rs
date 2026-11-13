@@ -18,7 +18,6 @@
 //   停止通过 Arc<AtomicBool> 通知，不用 join 等待（避免卡 UI）。
 // ==============================================================================
 
-use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,44 +230,57 @@ fn decode_loop(
             .map(|s| s.to_string())
             .unwrap_or_else(|| "video/avc".into());
 
-        // ---- 2. 建解码器 ----
-        let Some(codec) = MediaCodec::from_decoder_type(&mime) else {
-            extractor::AMediaExtractor_delete(ex);
-            return Err(format!("找不到 {mime} 的解码器"));
-        };
-
-        // ---- 3. 配置到 Surface ----
-        // 我们自己声明的 ANativeWindow 是不透明结构体，转成 ndk_sys 的类型。
-        // 若底层 Surface 处于过渡重绘阶段，自动获取最新有效句柄重试，杜绝 ErrorUnknown
-        let mut configured = false;
+        // ---- 2. 建解码器 与 3. 配置到 Surface ----
+        // 注意：若某次 configure 失败，codec 状态即被损坏，必须用全新实例重试；
+        // 同时轮询获取最新有效的 ANativeWindow，彻底杜绝 Surface 过渡导致的 ErrorUnknown。
+        let mut active_codec = None;
         let mut last_err = None;
 
-        for attempt in 0..4 {
-            let active_surface = if attempt == 0 {
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            let Some(fresh_codec) = MediaCodec::from_decoder_type(&mime) else {
+                last_err = Some(format!("找不到 {mime} 解码器"));
+                continue;
+            };
+
+            let cur_surface = if attempt == 0 {
                 surface
             } else {
-                std::thread::sleep(Duration::from_millis(80));
                 crate::video_surface::acquire_native_window().unwrap_or(surface)
             };
 
-            if let Some(nn) = std::ptr::NonNull::new(active_surface as *mut ndk_sys::ANativeWindow) {
+            if let Some(nn) = std::ptr::NonNull::new(cur_surface as *mut ndk_sys::ANativeWindow) {
                 let win = NativeWindow::from_ptr(nn);
-                match codec.configure(&format, Some(&win), MediaCodecDirection::Decoder) {
+                match fresh_codec.configure(&format, Some(&win), MediaCodecDirection::Decoder) {
                     Ok(_) => {
-                        configured = true;
+                        crate::mxprobe::log_public(&format!(
+                            "[Decoder] configure 成功 (attempt={attempt}, surface={cur_surface:?})"
+                        ));
+                        active_codec = Some(fresh_codec);
                         break;
                     }
                     Err(e) => {
+                        crate::mxprobe::log_public(&format!(
+                            "[Decoder] configure 尝试 {attempt} 失败: {e:?}"
+                        ));
                         last_err = Some(format!("{e:?}"));
                     }
                 }
+            } else {
+                last_err = Some("Surface 句柄为空".into());
             }
         }
 
-        if !configured {
+        let Some(codec) = active_codec else {
             extractor::AMediaExtractor_delete(ex);
-            return Err(format!("configure 失败: {}", last_err.unwrap_or_else(|| "无法连接渲染表面".into())));
-        }
+            return Err(format!(
+                "configure 失败: {}",
+                last_err.unwrap_or_else(|| "无法连接渲染表面".into())
+            ));
+        };
 
         codec.start().map_err(|e| format!("start 失败: {e:?}"))?;
 
