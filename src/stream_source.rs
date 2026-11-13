@@ -189,8 +189,14 @@ unsafe extern "C" fn ds_read_at(
 
     let slice = std::slice::from_raw_parts_mut(buffer as *mut u8, to_read);
     match file.read_at(slice, offset) {
-        Ok(n) => n as isize,
-        Err(_) => -1,
+        Ok(n) => {
+            eprintln!("[ds] readAt(off={offset}, size={size}) -> {n}");
+            n as isize
+        }
+        Err(_) => {
+            eprintln!("[ds] readAt(off={offset}) 读失败");
+            -1
+        }
     }
 }
 
@@ -203,15 +209,12 @@ unsafe extern "C" fn ds_get_size(userdata: *mut std::ffi::c_void) -> isize {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    // 优先用 HTTP Content-Length（下载前就问到了）；
-    // 退而求其次用下载完成后记录的真实长度。
-    // 绝不返回 -1：实测会让 AMediaExtractor 卡死在解封装阶段。
-    match s.known_total.or(s.total) {
+    let result = match s.known_total.or(s.total) {
         Some(t) => t as isize,
-        // 走到这里说明连 Content-Length 都没拿到，属于异常路径。
-        // 返回 0 让框架立即报错，好过永久挂起。
         None => 0,
-    }
+    };
+    eprintln!("[ds] getSize -> {result}");
+    result
 }
 
 unsafe extern "C" fn ds_get_available_size(
