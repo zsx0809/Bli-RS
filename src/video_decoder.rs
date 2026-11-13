@@ -67,7 +67,12 @@ mod extractor {
         ) -> c_int;
 
         /// 用 AMediaDataSource 作数据源（流式读取，支持边下边播）。
-        pub fn AMediaExtractor_setDataSource(
+        ///
+        /// **注意函数名**：是 setDataSourceCustom，不是 setDataSource。
+        /// setDataSource 收的是文件路径字符串（const char*），
+        /// 把 AMediaDataSource 指针传给它会返回 -10002（UNKNOWN_ERROR）——
+        /// 实测踩过这个坑。
+        pub fn AMediaExtractor_setDataSourceCustom(
             e: *mut AMediaExtractor,
             ds: *mut ndk_sys::AMediaDataSource,
         ) -> c_int;
@@ -241,11 +246,11 @@ fn decode_loop(
             return Err("创建 AMediaDataSource 失败".into());
         }
 
-        let r = extractor::AMediaExtractor_setDataSource(ex, ds);
+        let r = extractor::AMediaExtractor_setDataSourceCustom(ex, ds);
         if r != 0 {
             extractor::AMediaExtractor_delete(ex);
             ndk_sys::AMediaDataSource_delete(ds);
-            return Err(format!("setDataSource(AMediaDataSource) 失败: {r}"));
+            return Err(format!("setDataSourceCustom 失败: {r}"));
         }
 
         let tracks = extractor::AMediaExtractor_getTrackCount(ex);
