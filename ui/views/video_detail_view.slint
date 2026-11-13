@@ -112,7 +112,7 @@ export component VideoDetailView inherits Rectangle {
     /// 0.0 ~ 1.0
     in-out property <float> volume: 0.6;
 
-    /// 进度：0.0 ~ 1.0
+    /// 进度：0.0 ~ 1.0。由 Rust 侧根据解码 PTS 持续回填（见 changed progress）。
     in-out property <float> progress: 0.0;
     /// 拖动进度时的预览值（负数表示不在拖动）
     in-out property <float> seek_preview: -1.0;

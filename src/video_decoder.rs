@@ -18,7 +18,7 @@
 //   停止通过 Arc<AtomicBool> 通知，不用 join 等待（避免卡 UI）。
 // ==============================================================================
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,9 +107,54 @@ impl SendPtr {
     }
 }
 
+/// 解码器外部控制通道。
+///
+/// 为什么需要它：解码循环是死循环式的顺序消费，外部（UI 线程）要能
+/// 在**不打断循环**的前提下改变它的行为。用 `Mutex<Option<...>>` 而不是
+/// 消息队列，是因为控制指令天然"只关心最新值"：
+///   · 连续拖动进度条会连发几十次 seek，只有最后一次有意义
+///   · 暂停/播放是幂等的布尔量
+/// 队列会把它们全部排队执行，反而卡顿与积压。
+#[derive(Default)]
+pub struct Controls {
+    /// 暂停标志。true 时循环不再送输入、不再 release 输出，原地等待。
+    paused: AtomicBool,
+    /// 待执行的 seek 目标（微秒）。Some 时循环会消费并清空。
+    seek_target_us: Mutex<Option<i64>>,
+    /// 最近一次送显的 PTS（微秒）。UI 线程读它来刷新进度条。
+    ///
+    /// 为什么用 AtomicI64 而不是回调 UI：
+    ///   解码线程每帧都会更新它（30fps = 每秒 30 次），若每帧都跨线程
+    ///   通知 Slint，会把 UI 线程压满。UI 侧用 200ms 定时器来轮询，
+    ///   刷新率对人眼足够，代价可以忽略。
+    last_pts_us: AtomicI64,
+}
+
+impl Controls {
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+    pub fn last_pts_us(&self) -> i64 {
+        self.last_pts_us.load(Ordering::Relaxed)
+    }
+    pub fn request_seek(&self, pts_us: i64) {
+        if let Ok(mut t) = self.seek_target_us.lock() {
+            *t = Some(pts_us);
+        }
+    }
+    /// 取出并清空待处理 seek
+    fn take_seek(&self) -> Option<i64> {
+        self.seek_target_us.lock().ok().and_then(|mut t| t.take())
+    }
+}
+
 /// 视频解码器。持有 extractor、codec 与停止标志。
 pub struct VideoDecoder {
     stop: Arc<AtomicBool>,
+    pub controls: Arc<Controls>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -126,6 +171,8 @@ impl VideoDecoder {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
+        let controls = Arc::new(Controls::default());
+        let controls_for_thread = controls.clone();
         let sp = SendPtr(surface);
 
         let handle = std::thread::spawn(move || {
@@ -133,13 +180,20 @@ impl VideoDecoder {
             // 若在外部 `sp.0` 提前取出，裸指针会被捕获进闭包，
             // 编译期就会因为 *mut c_void 不是 Send 而报错。
             let surface_ptr = sp.get();
-            if let Err(e) = decode_loop(&path, surface_ptr, on_first_frame, &stop_for_thread) {
+            if let Err(e) = decode_loop(
+                &path,
+                surface_ptr,
+                on_first_frame,
+                &stop_for_thread,
+                &controls_for_thread,
+            ) {
                 on_error(e);
             }
         });
 
         Self {
             stop,
+            controls,
             handle: Some(handle),
         }
     }
@@ -158,6 +212,7 @@ fn decode_loop(
     surface: *mut std::ffi::c_void,
     on_first_frame: impl FnOnce(),
     stop: &AtomicBool,
+    controls: &Controls,
 ) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
@@ -294,8 +349,52 @@ fn decode_loop(
         let mut start_instant: Option<std::time::Instant> = None;
         let mut first_frame_sent = false;
         let mut on_first_frame = Some(on_first_frame);
+        // seek 后需要丢弃到目标 PTS 为止的帧（extractor 只能跳到关键帧）
+        let mut seek_drop_until_us: Option<i64> = None;
 
         while !output_done && !stop.load(Ordering::Relaxed) {
+            // ---- 外部控制：暂停 ----
+            //
+            // 暂停时**不能**继续 dequeue 输入：MediaCodec 的输入/输出缓冲
+            // 是有限资源，暂停期间持续灌数据会填满内部队列，恢复后先猛冲
+            // 一大段旧帧。所以暂停就老老实实睡，什么都不做。
+            if controls.is_paused() {
+                std::thread::sleep(Duration::from_millis(20));
+                // 暂停会冻结 PTS 时钟基准，否则恢复瞬间会因为
+                // "已流逝的时间" 远超 "已解码的 PTS" 而触发追赶重置。
+                first_pts = None;
+                start_instant = None;
+                continue;
+            }
+
+            // ---- 外部控制：seek ----
+            //
+            // 实现要点：AMediaExtractor_seekTo 是 SEEK_TO_PREVIOUS_SYNC，
+            // 即它会跳到目标时间**之前最近的关键帧**，不可能精确到帧。
+            // 因此必须把 seek 之后、目标 PTS 之前的帧全部丢弃，
+            // 否则画面会先闪回上一段关键帧再跳到目标位置。
+            //
+            // SEEK_TO_CLOSEST_SYNC = 2，SEEK_TO_PREVIOUS_SYNC = 0
+            if let Some(target_us) = controls.take_seek() {
+                const SEEK_TO_CLOSEST_SYNC: i32 = 2;
+                let r = extractor::AMediaExtractor_seekTo(ex, target_us, SEEK_TO_CLOSEST_SYNC);
+                crate::mxprobe::log_public(&format!(
+                    "[Seek] extractor.seekTo({target_us}us) -> {r}"
+                ));
+                if r == 0 {
+                    // 解码器内部仍有旧的参考帧/未来帧，必须 flush 掉，
+                    // 否则 seek 后第一批输出是 seek 前的残帧。
+                    codec.flush().ok();
+                    // 输入还没结束，允许继续送
+                    input_done = false;
+                    // 重置 PTS 基准：seek 后的第一帧就是新起点
+                    first_pts = None;
+                    start_instant = None;
+                    // 记下丢弃阈值
+                    seek_drop_until_us = Some(target_us);
+                }
+            }
+
             // 送输入
             if !input_done {
                 match codec.dequeue_input_buffer(timeout) {
@@ -351,6 +450,21 @@ fn decode_loop(
                     let eos = buf.info().flags() & BUFFER_FLAG_END_OF_STREAM != 0;
                     let pts_us = buf.info().presentation_time_us();
 
+                    // seek 落点校正：extractor 只能 seek 到关键帧，
+                    // 目标时间之前的帧必须丢弃，否则会先闪回一段旧内容。
+                    // render=false 让这些帧直接不进入合成器。
+                    if let Some(target) = seek_drop_until_us {
+                        if pts_us >= 0 && pts_us < target {
+                            codec.release_output_buffer(buf, false).ok();
+                            continue;
+                        }
+                        // 到达或越过目标点，结束丢弃阶段
+                        seek_drop_until_us = None;
+                        crate::mxprobe::log_public(&format!(
+                            "[Seek] 落点到达 pts={pts_us}us（目标 {target}us）"
+                        ));
+                    }
+
                     // PTS 帧同步：根据视频实际时间戳（微秒）休眠，实现恒定 1.0x 正常速度播放
                     if pts_us >= 0 {
                         if first_pts.is_none() {
@@ -380,6 +494,11 @@ fn decode_loop(
 
                     // render=true → 交给 Surface 显示。
                     codec.release_output_buffer(buf, true).ok();
+
+                    // 记下当前播放位置，UI 线程轮询它刷新进度条
+                    if pts_us >= 0 {
+                        controls.last_pts_us.store(pts_us, Ordering::Relaxed);
+                    }
 
                     // 首帧已送达 SurfaceView，通知 UI 淡出封面占位图
                     if !first_frame_sent {

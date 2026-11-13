@@ -175,6 +175,13 @@ export component AppWindow inherits Window {
     callback clear_log();
 
     callback exit_detail_view();
+    // --------------------------------------------------------------------------
+    // 播放进度（由 Rust 侧按解码 PTS 回填）
+    // --------------------------------------------------------------------------
+    in-out property <float> play_progress: 0.0;
+    in property <string> play_time_total: "00:00";
+    in property <string> play_time_current: "00:00";
+
     callback player_seek(float);
     callback player_brightness(float);
     callback player_volume(float);
@@ -399,6 +406,10 @@ export component AppWindow inherits Window {
         related_selected(bvid) => { root.play_video(bvid); }
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
+        time_total: root.play_time_total;
+        time_current: root.play_time_current;
+        progress: root.play_progress;
+
         seek_to(frac) => { root.player_seek(frac); }
         set_brightness(v) => { root.player_brightness(v); }
         set_volume(v) => { root.player_volume(v); }

@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
@@ -20,6 +20,9 @@ use crate::{AppWindow, CommentItemData, RelatedVideoData};
 static CURRENT: Mutex<Option<crate::video_decoder::VideoDecoder>> = Mutex::new(None);
 /// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
 static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
+/// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
+/// 0 表示未知（此时 seek 直接忽略，避免跳到片头）。
+static DURATION_US: AtomicI64 = AtomicI64::new(0);
 
 thread_local! {
     /// 相关推荐视频模型句柄（仅在 UI 线程访问，杜绝跨线程 Send 冲突）
@@ -99,6 +102,9 @@ pub fn stop_play() {
 /// 播放指定 bvid 并切换到二级页面
 pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
     let my_session = PLAY_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
+    // 新会话先把时长清零：seek 在时长未知时会安全忽略，
+    // 总比拿上一个视频的时长算出一个荒谬的跳转点强。
+    DURATION_US.store(0, Ordering::SeqCst);
     stop_current();
 
     // 注意：这里**不**解除系统手势排除区。
@@ -397,6 +403,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             vtrack.codecs
         ));
 
+        // 记录总时长（playurl 给的是秒，内部统一用微秒）。
+        // UI 的手势进度是 0.0~1.0，seek 时要用它换算成 PTS。
+        let dur_us = info.duration.saturating_mul(1_000_000) as i64;
+        DURATION_US.store(dur_us, Ordering::SeqCst);
+        crate::mxprobe::log_public(&format!("[Player] 总时长: {}s", info.duration));
+
         // 3.5 边下边播：流式写入缓存，首段 1.5MB 就绪后即刻起播，杜绝整段漫长等待
         let cache_dir = crate::android_window::cache_dir()
             .map(std::path::PathBuf::from)
@@ -502,7 +514,64 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         if let Ok(mut cur) = CURRENT.lock() {
             *cur = Some(dec);
         }
+
+        // ---- 进度回填 ----
+        //
+        // 解码线程每帧更新 last_pts_us，这里用 250ms 定时器搬运到 UI。
+        // 为什么不每帧推：30fps 意味着每秒 30 次跨线程 event_loop 调用，
+        // 在低端机上会和渲染抢 UI 线程。进度条人眼只需要 ~4Hz。
+        spawn_progress_poller(w_clone.clone(), my_session, dur_us);
     });
+}
+
+/// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
+fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_us: i64) {
+    if duration_us <= 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let total_secs = duration_us / 1_000_000;
+        loop {
+            if PLAY_SESSION.load(Ordering::SeqCst) != session {
+                return;
+            }
+
+            let pts = {
+                match CURRENT.lock() {
+                    Ok(cur) => match cur.as_ref() {
+                        Some(d) => d.controls.last_pts_us(),
+                        None => return,
+                    },
+                    Err(_) => return,
+                }
+            };
+
+            if pts <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+
+            let frac = (pts as f64 / duration_us as f64).clamp(0.0, 1.0) as f32;
+            let cur_secs = (pts / 1_000_000).max(0);
+            let _ = window.upgrade_in_event_loop(move |ui| {
+                ui.set_play_progress(frac);
+                ui.set_play_time_current(fmt_time(cur_secs).into());
+                ui.set_play_time_total(fmt_time(total_secs as i64).into());
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
+/// 秒 → mm:ss（超过 1 小时用 h:mm:ss）
+fn fmt_time(secs: i64) -> String {
+    let s = secs.max(0);
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
 }
 
 /// 点赞状态切换 (即时乐观更新)
@@ -711,24 +780,41 @@ pub fn set_volume(v: f32) {
     }
 }
 
-/// 跳转到进度（0.0~1.0）。当前仅记录，见文件末尾的说明。
+/// 跳转到进度（0.0~1.0）。
+///
+/// 归一化进度 × 总时长 = 目标 PTS，交给解码线程执行
+/// AMediaExtractor_seekTo + 丢帧校正（见 video_decoder::decode_loop）。
 pub fn seek_to(frac: f32) {
-    crate::mxprobe::log_public(&format!("[Seek] 请求进度 {:.1}%", frac * 100.0));
+    let dur = DURATION_US.load(Ordering::SeqCst);
+    if dur <= 0 {
+        crate::mxprobe::log_public("[Seek] 总时长未知，忽略本次跳转");
+        return;
+    }
+    let target_us = (dur as f64 * frac.clamp(0.0, 1.0) as f64) as i64;
+    crate::mxprobe::log_public(&format!(
+        "[Seek] 请求 {:.1}% -> {}us",
+        frac * 100.0,
+        target_us
+    ));
     if let Ok(cur) = CURRENT.lock() {
-        if cur.is_some() {
-            // TODO: 需要 video_decoder 暴露 seek(pts_us) 并在解码循环里
-            //       用 AMediaExtractor_seekTo + 丢帧到目标 PTS 实现。
-            crate::mxprobe::log_public("[Seek] 解码器暂不支持跳转（待实现状态机）");
+        if let Some(dec) = cur.as_ref() {
+            dec.controls.request_seek(target_us);
+        } else {
+            crate::mxprobe::log_public("[Seek] 当前没有解码器实例");
         }
     }
 }
 
-/// 播放 / 暂停切换。当前仅记录，见文件末尾的说明。
+/// 播放 / 暂停切换。
 pub fn toggle_play() {
     if let Ok(cur) = CURRENT.lock() {
         if let Some(dec) = cur.as_ref() {
-            let _ = dec;
-            crate::mxprobe::log_public("[Play] 暂停/继续 —— 解码器尚未暴露该控制");
+            let now = !dec.controls.is_paused();
+            dec.controls.set_paused(now);
+            crate::mxprobe::log_public(&format!(
+                "[Play] {}",
+                if now { "已暂停" } else { "继续播放" }
+            ));
         } else {
             crate::mxprobe::log_public("[Play] 当前没有解码器实例");
         }

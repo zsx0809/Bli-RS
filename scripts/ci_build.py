@@ -157,10 +157,35 @@ def download_apk(owner, repo, token, run_id):
 
     DIST.mkdir(parents=True, exist_ok=True)
     zip_path = DIST / f"{art['name']}.zip"
-    req = urllib.request.Request(art["archive_download_url"])
-    req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=300) as r:
-        zip_path.write_bytes(r.read())
+
+    # artifact 下载会 302 到 objects.githubusercontent.com（预签名 URL）。
+    # 那里**不能**再带 Authorization —— 签名 URL 不认 Bearer token，
+    # 多带一个头反而被 S3 判为签名不匹配返回 401。
+    # urllib 默认会把自定义头原样带到重定向目标，所以这里自己跟跳转，
+    # 只在第一跳（api.github.com）带 token。
+    url = art["archive_download_url"]
+    for _ in range(5):
+        req = urllib.request.Request(url)
+        if "api.github.com" in url:
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Accept", "application/vnd.github+json")
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            with opener.open(req, timeout=300) as r:
+                zip_path.write_bytes(r.read())
+                break
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                url = e.headers["Location"]
+                continue
+            sys.exit(f"[!] 下载 artifact 失败: {e.code} {e.reason}")
+    else:
+        sys.exit("[!] artifact 下载重定向次数过多")
 
     apk_path = DIST / "Bli-RS-arm64-v8a.apk"
     with zipfile.ZipFile(zip_path) as z:
@@ -231,7 +256,7 @@ def main():
     concl, run = watch(owner, repo, token, run["id"])
 
     if concl == "success":
-        print(f"\n[+] 构建成功 ({int(run.get('updated_at') is not None)} )")
+        print("\n[+] 构建成功")
         p = download_apk(owner, repo, token, run["id"])
         if p:
             print(f"[+] APK: {p}")
