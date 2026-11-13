@@ -194,36 +194,28 @@ fn android_main(app: slint::android::AndroidApp) {
             // 而且每一行都写盘 + 进 logcat，白耗 IO。
             //
             // 用 discriminant 式的短名字既可读又便宜。
+            // 只关心这几类，其余一律忽略。
+            //
+            // 为什么不用 match 全枚举变体：android-activity 的 MainEvent
+            // 标了 #[non_exhaustive]，空结构体变体必须写 `{ .. }`，
+            // 而变体列表也不保证稳定。与其跟着版本改，不如只判断
+            // 我们真正要处理的那几个。
+            //
+            // 这也是之前 E0638 的来源：写成 `{}` 会被要求补 `..`。
+            use slint::android::android_activity::MainEvent;
             let kind: &'static str = match ev {
-                slint::android::android_activity::MainEvent::Start => "Start",
-                slint::android::android_activity::MainEvent::Resume { .. } => "Resume",
-                slint::android::android_activity::MainEvent::Pause => "Pause",
-                slint::android::android_activity::MainEvent::Stop => "Stop",
-                slint::android::android_activity::MainEvent::Destroy => "Destroy",
-                slint::android::android_activity::MainEvent::InitWindow {} => "InitWindow",
-                slint::android::android_activity::MainEvent::TerminateWindow {} => "TerminateWindow",
-                slint::android::android_activity::MainEvent::SaveState { .. } => "SaveState",
-                slint::android::android_activity::MainEvent::InputAvailable => "InputAvailable",
-                slint::android::android_activity::MainEvent::ConfigChanged {} => "ConfigChanged",
-                slint::android::android_activity::MainEvent::WindowResized {} => "WindowResized",
-                slint::android::android_activity::MainEvent::RedrawNeeded {} => "RedrawNeeded",
-                slint::android::android_activity::MainEvent::ContentRectChanged {} => "ContentRectChanged",
-                slint::android::android_activity::MainEvent::GainedFocus => "GainedFocus",
-                slint::android::android_activity::MainEvent::LostFocus => "LostFocus",
-                slint::android::android_activity::MainEvent::LowMemory => "LowMemory",
-                _ => "Other",
+                MainEvent::Start => "Start",
+                MainEvent::Resume { .. } => "Resume",
+                MainEvent::Pause => "Pause",
+                MainEvent::Stop => "Stop",
+                MainEvent::Destroy => "Destroy",
+                MainEvent::InitWindow { .. } => "InitWindow",
+                MainEvent::TerminateWindow { .. } => "TerminateWindow",
+                _ => return,
             };
 
-            // 只有生命周期相关的事件值得记日志 + 触发播放器逻辑；
-            // InputAvailable / RedrawNeeded 这类每帧都可能来，绝不打日志。
-            match kind {
-                "Start" | "Resume" | "Pause" | "Stop" | "Destroy" | "InitWindow"
-                | "TerminateWindow" => {
-                    crate::mxprobe::log_public(&format!("[Lifecycle] {kind}"));
-                    crate::player::on_lifecycle(kind);
-                }
-                _ => {}
-            }
+            crate::mxprobe::log_public(&format!("[Lifecycle] {kind}"));
+            crate::player::on_lifecycle(kind);
         }
     })
     .unwrap();
