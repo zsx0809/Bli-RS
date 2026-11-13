@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
@@ -1032,6 +1032,16 @@ pub fn set_brightness(v: f32) {
             crate::mxprobe::log_public(
                 "[亮度] 写入被拒（需要用户在系统设置里授予「修改系统设置」权限）",
             );
+            // 首次被拒时拉一次系统授权页，用户点一下"允许"就能永久生效。
+            //
+            // 为什么只能这样：WRITE_SETTINGS 是 AppOps 特殊权限，
+            // 不能用 requestPermissions 弹运行时对话框，
+            // 唯一合法路径是 ACTION_MANAGE_WRITE_SETTINGS。
+            // 只在第一次被拒时跳，避免用户每拖一下亮度就弹一次设置页。
+            static PROMPTED: AtomicBool = AtomicBool::new(false);
+            if !PROMPTED.swap(true, Ordering::SeqCst) {
+                open_write_settings_page();
+            }
             return;
         }
         if r.is_ok() {
@@ -1041,6 +1051,76 @@ pub fn set_brightness(v: f32) {
     #[cfg(not(target_os = "android"))]
     {
         let _ = v;
+    }
+}
+
+/// 拉起系统的「修改系统设置」授权页。
+///
+/// ACTION_MANAGE_WRITE_SETTINGS = "android.settings.action.MANAGE_WRITE_SETTINGS"
+/// 需要附带 package: 的 data URI，否则会打开列表页而不是本应用的详情。
+fn open_write_settings_page() {
+    #[cfg(target_os = "android")]
+    {
+        let Some(vm) = crate::android_window::java_vm() else { return };
+        let Ok(mut env) = vm.attach_current_thread() else { return };
+        let Some(activity) = crate::android_window::activity_object() else { return };
+
+        let Ok(intent_cls) = env.find_class("android/content/Intent") else { return };
+        let Ok(action) = env.new_string("android.settings.action.MANAGE_WRITE_SETTINGS") else {
+            return;
+        };
+        let Ok(intent) = env.new_object(
+            &intent_cls,
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(&action)],
+        ) else {
+            return;
+        };
+
+        // setData(Uri.parse("package:" + packageName))
+        let Ok(pkg) = env
+            .call_method(&activity, "getPackageName", "()Ljava/lang/String;", &[])
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+        let pkg_str: String = {
+            let js: &jni::objects::JString = (&pkg).into();
+            match env.get_string(js) {
+                Ok(s) => s.into(),
+                Err(_) => return,
+            }
+        };
+        let Ok(uri_cls) = env.find_class("android/net/Uri") else { return };
+        let Ok(uri_str) = env.new_string(format!("package:{pkg_str}")) else { return };
+        let Ok(uri) = env
+            .call_method(
+                &uri_cls,
+                "parse",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[jni::objects::JValue::Object(&uri_str)],
+            )
+            .and_then(|v| v.l())
+        else {
+            return;
+        };
+        let _ = env.call_method(
+            &intent,
+            "setData",
+            "(Landroid/net/Uri;)Landroid/content/Intent;",
+            &[jni::objects::JValue::Object(&uri)],
+        );
+
+        let _ = env.call_method(
+            &activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[jni::objects::JValue::Object(&intent)],
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        crate::mxprobe::log_public("[亮度] 已拉起系统授权页");
     }
 }
 

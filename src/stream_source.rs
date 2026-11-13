@@ -189,7 +189,6 @@ unsafe extern "C" fn ds_read_at(
         // 直接把 setDataSourceCustom 打成失败(-10000)，连已经解出来的
         // 部分都保不住。返回 0 至少让解码器把手上已有的数据播完再结束，
         // 比硬失败体验好。
-        eprintln!("[ds] readAt: 下载失败，按 EOF 处理");
         return 0;
     }
     if offset >= avail {
@@ -217,14 +216,8 @@ unsafe extern "C" fn ds_read_at(
 
     let slice = std::slice::from_raw_parts_mut(buffer as *mut u8, to_read);
     match file.read_at(slice, offset) {
-        Ok(n) => {
-            eprintln!("[ds] readAt(off={offset}, size={size}) -> {n}");
-            n as isize
-        }
-        Err(_) => {
-            eprintln!("[ds] readAt(off={offset}) 读失败");
-            -1
-        }
+        Ok(n) => n as isize,
+        Err(_) => -1,
     }
 }
 
@@ -241,7 +234,6 @@ unsafe extern "C" fn ds_get_size(userdata: *mut std::ffi::c_void) -> isize {
         Some(t) => t as isize,
         None => 0,
     };
-    eprintln!("[ds] getSize -> {result}");
     result
 }
 

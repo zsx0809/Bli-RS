@@ -531,9 +531,9 @@ export component VideoDetailView inherits Rectangle {
             // ---- 底部蒙版：从下到上渐隐，托住进度条与时间 ----
             Rectangle {
                 x: 0px;
-                y: parent.height - 64px;
+                y: parent.height - 76px;
                 width: parent.width;
-                height: 64px;
+                height: 76px;
                 background: @linear-gradient(0deg, #000000cc 0%, #00000000 100%);
             }
 
@@ -587,9 +587,9 @@ export component VideoDetailView inherits Rectangle {
             progress_bar := GestureArea {
                 property <float> bar_frac: root.seek_preview >= 0.0 ? root.seek_preview : root.progress;
                 x: 0px;
-                y: parent.height - 30px;
+                y: parent.height - 38px;
                 width: parent.width;
-                height: 20px;
+                height: 18px;
                 tap_slop: 3px;
                 axis_ratio: 2.0;
                 vertical_enabled: false;
@@ -664,9 +664,9 @@ export component VideoDetailView inherits Rectangle {
             //   不会孤立在画面正中。
             Rectangle {
                 x: 0px;
-                y: parent.height - 28px;
+                y: parent.height - 34px;
                 width: parent.width;
-                height: 24px;
+                height: 26px;
                 background: transparent;
 
                 // 左：当前时间 / 总时长
