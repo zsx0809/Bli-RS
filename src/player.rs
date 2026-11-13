@@ -36,6 +36,7 @@ struct PendingStream {
     session: u64,
     bvid: String,
     url: String,
+    audio_url: Option<String>,
     duration_us: i64,
 }
 
@@ -525,8 +526,9 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             if let Ok(mut pending) = PENDING_STREAM.lock() {
                 *pending = Some(PendingStream {
                     session: my_session,
-                    url: url.clone(),
                     bvid: bvid.clone(),
+                    url: url.clone(),
+                    audio_url: audio_url.clone(),
                     duration_us: dur_us,
                 });
             }
@@ -691,14 +693,10 @@ fn start_playback(
                 let ao = std::sync::Arc::new(ao);
                 let clock = ao.clock.clone();
 
-                let a_err = {
-                    let w_a = w_clone.clone();
-                    move |e: String| {
-                        crate::mxprobe::log_public(&format!("[Audio] 解码失败: {e}"));
-                        // 音频失败不打断视频播放，只记日志。
-                        // 宁可静音也不能因为音频问题让整个视频崩掉。
-                        let _ = &w_a;
-                    }
+                let a_err = move |e: String| {
+                    crate::mxprobe::log_public(&format!("[Audio] 解码失败: {e}"));
+                    // 音频失败不打断视频播放，只记日志。
+                    // 宁可静音也不能因为音频问题让整个视频崩掉。
                 };
 
                 let adec = crate::audio_decoder::AudioDecoder::start(abuf, ao.clone(), a_err);
@@ -1480,5 +1478,13 @@ fn start_pending(window: slint::Weak<AppWindow>) {
         }
     };
 
-    start_playback(window, p.session, p.bvid, p.url, client, p.duration_us);
+    start_playback(
+        window,
+        p.session,
+        p.bvid,
+        p.url,
+        p.audio_url,
+        client,
+        p.duration_us,
+    );
 }

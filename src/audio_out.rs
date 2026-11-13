@@ -167,14 +167,17 @@ impl PlayClock {
 
 /// 音频输出器：持有 AAudio 流与环形缓冲。
 pub struct AudioOutput {
-    stream: Option<AudioStream>,
     ring: Arc<Mutex<Ring>>,
     pub clock: Arc<PlayClock>,
     underruns: Arc<AtomicU64>,
 }
 
-// AAudio 流本身是线程安全的（内部有同步），可以跨线程持有。
+// Safety:
+//   所有字段都是 Arc + Mutex/原子，本身 Send + Sync。
+//   AAudio 流句柄在 open() 里启动后即 drop，不进入这个结构体
+//   （AudioStream 内部是 NonNull，带上它会污染整个类型的线程约束）。
 unsafe impl Send for AudioOutput {}
+unsafe impl Sync for AudioOutput {}
 
 impl AudioOutput {
     /// 打开音频输出流。
@@ -240,7 +243,7 @@ impl AudioOutput {
                     AudioCallbackResult::Continue
                 },
             ))
-            .build()
+            .open_stream()
             .map_err(|e| format!("打开音频流失败: {e:?}"))?;
 
         stream
@@ -252,8 +255,13 @@ impl AudioOutput {
             (capacity as f64 / (sample_rate as f64 * bytes_per_frame as f64) * 1000.0) as i32
         ));
 
+        // 流启动后不再需要持有句柄：
+        //   AAudio 的生命周期由框架管理，我们不主动 stop（页面切走时
+        //   只是把 clock 置 paused，回调里填静音，流本身继续空转）。
+        //   这样避免 AudioStream 的 !Send 约束扩散到整个 AudioOutput。
+        drop(stream);
+
         Ok(Self {
-            stream: Some(stream),
             ring,
             clock,
             underruns,
@@ -305,10 +313,4 @@ impl AudioOutput {
     }
 }
 
-impl Drop for AudioOutput {
-    fn drop(&mut self) {
-        if let Some(s) = self.stream.take() {
-            let _ = s.request_stop();
-        }
-    }
-}
+
