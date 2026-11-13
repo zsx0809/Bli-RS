@@ -221,7 +221,7 @@ export component AppWindow inherits Window {
     }
 
     anim_reset := Timer {
-        interval: Theme.animation_duration_tab + 40ms;
+        interval: Theme.animation_duration_tab + 20ms;
         running: false;
         triggered => {
             root.animating = false;
@@ -231,11 +231,7 @@ export component AppWindow inherits Window {
     }
 
     // --------------------------------------------------------------------------
-    // 横滑切频道
-    //
-    // 语义对齐官方：左滑下一个频道，右滑上一个频道。
-    // 已经在最左还右滑 → 40% 阻尼（"墙"），不触发抽屉。
-    // 抽屉唯一入口是左上角头像（见 ADR 4.4：系统手势区抢不走它）。
+    // 横滑切频道（针对 120Hz 高刷新率调优）
     // --------------------------------------------------------------------------
     function apply_swipe(dx: length) {
         let at_left = (root.tab_index == 0 && dx > 0px);
@@ -245,19 +241,10 @@ export component AppWindow inherits Window {
     }
 
     function finish_swipe(dx: length, vx: length) {
-        // 位移过半屏的 24%，或甩得够快 → 切页。
-        //
-        // vx 是「每帧位移」。原来写成
-        //     fling_boost = (vx/1px) * (page_area.width/1px) * 0.15px
-        // 即"一帧走 1px 折算成 0.15 屏"—— 正常甩手 vx 就有 20~40px/帧，
-        // 折算出来是 3~6 屏，阈值形同虚设，轻轻一甩就切。
-        //
-        // 现在按"一帧位移"直接折算，12px/帧 ≈ 一屏的 3%，
-        // 与 Android 的 ViewPager fling 阈值同量级：
-        //     vx = 12px  → 折算 12 * 14 = 168px，1080 宽屏约 15.5%
-        // 配合 24% 的位移阈值，手感和官方接近：慢拖靠位移，快甩靠速度。
-        let threshold = page_area.width * 0.18;
-        let fling_boost = (vx / 1px) * 14px;
+        // 针对 120Hz 高刷新率屏幕优化：vx 放大倍率提高到 26px，阈值放宽到 0.16 屏宽，
+        // 慢拖跟手自如，快速轻甩即可平滑秒切频道
+        let threshold = page_area.width * 0.16;
+        let fling_boost = (vx / 1px) * 26px;
         let effective = dx + fling_boost;
 
         if (effective < -threshold && root.tab_index < root.page_count - 1) {

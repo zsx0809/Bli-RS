@@ -181,8 +181,8 @@ export global Theme {
     in-out property <length> radius_lg: 22px;
     in-out property <length> radius_full: 9999px;
 
-    // 动画曲线
-    in-out property <duration> animation_duration_normal: 260ms;
-    in-out property <duration> animation_duration_fast: 140ms;
-    in-out property <duration> animation_duration_tab: 220ms;
+    // 动画曲线（针对 120Hz 高刷新率调优）
+    in-out property <duration> animation_duration_normal: 200ms;
+    in-out property <duration> animation_duration_fast: 100ms;
+    in-out property <duration> animation_duration_tab: 180ms;
 }

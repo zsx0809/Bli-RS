@@ -90,10 +90,10 @@ export component VideoDetailView inherits Rectangle {
     out property <length> max_scroll: Math.max(0px, root.content_h - root.viewport_h);
 
     fling_timer := Timer {
-        interval: 10ms;
+        interval: 8ms;
         running: false;
         triggered => {
-            if (Math.abs(root.fling_vel) < 0.5px) {
+            if (Math.abs(root.fling_vel) < 0.4px) {
                 root.fling_vel = 0px;
                 self.running = false;
                 return;
@@ -112,7 +112,7 @@ export component VideoDetailView inherits Rectangle {
                 return;
             }
             root.scroll_y = next;
-            root.fling_vel = root.fling_vel * 0.95;
+            root.fling_vel = root.fling_vel * 0.965;
         }
     }
 
@@ -147,18 +147,18 @@ export component VideoDetailView inherits Rectangle {
     function pan_end(dx: length, dy: length, vx: length, vy: length) {
         if (root.active_axis == PanAxis.Vertical) {
             let v = -vy;
-            if ((v / 1px) > 2.5) {
-                root.fling_vel = Math.min(v, 60px);
+            let scaled_v = v * 1.6;
+            if ((v / 1px) > 1.2) {
+                root.fling_vel = Math.min(scaled_v, 75px);
                 fling_timer.start();
-            } else if ((v / 1px) < -2.5) {
-                root.fling_vel = Math.max(v, -60px);
+            } else if ((v / 1px) < -1.2) {
+                root.fling_vel = Math.max(scaled_v, -75px);
                 fling_timer.start();
             }
         } else if (root.active_axis == PanAxis.Horizontal) {
-            // 位移过半屏的 22%，或甩得够快，就切。
-            // vx 是 px / move 事件，折算成"一帧位移 ≈ 12px 就够快"。
-            let threshold = root.width * 0.22;
-            let boost = (vx / 1px) * 12px;
+            // 针对 120Hz 高刷新率调优：boost 适度放大，轻甩即可平滑切换「简介/评论」Tab
+            let threshold = root.width * 0.18;
+            let boost = (vx / 1px) * 22px;
             let effective = root.tab_dx + boost;
 
             let go_comment = (effective < -threshold && root.active_tab == 0);
@@ -893,7 +893,7 @@ export component VideoDetailView inherits Rectangle {
         pan_finished(dx, dy, vx, vy) => {
             root.left_edge_active = false;
             root.left_edge_dx = 0px;
-            if (dx > 25px || (vx / 1px) > 1.5) {
+            if (dx > 20px || (vx / 1px) > 0.8) {
                 root.back_clicked();
             }
         }
@@ -925,7 +925,7 @@ export component VideoDetailView inherits Rectangle {
         pan_finished(dx, dy, vx, vy) => {
             root.right_edge_active = false;
             root.right_edge_dx = 0px;
-            if (dx < -25px || (vx / 1px) < -1.5) {
+            if (dx < -20px || (vx / 1px) < -0.8) {
                 root.back_clicked();
             }
         }

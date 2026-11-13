@@ -115,15 +115,14 @@ export component RecommendView inherits Rectangle {
 
     function pan_end(dx: length, dy: length, vx: length, vy: length) {
         if (root.active_axis == PanAxis.Vertical) {
-            // v 是 px / move 事件。fling_timer 每 10ms 推一次，
-            // 触摸采样在 90Hz 下约 11ms 一帧，比值 ≈ 0.9，直接取 1.0 即可。
-            // 上限 60px/帧：再快就是失控，肉眼也分辨不出来。
+            // 针对 120Hz 高刷新率屏幕调优：高刷下 move 采样频率翻倍，单个采样 vy 较小
             let v = -vy;
-            if ((v / 1px) > 2.5) {
-                root.fling_vel = Math.min(v, 60px);
+            let scaled_v = v * 1.6;
+            if ((v / 1px) > 1.2) {
+                root.fling_vel = Math.min(scaled_v, 75px);
                 fling_timer.start();
-            } else if ((v / 1px) < -2.5) {
-                root.fling_vel = Math.max(v, -60px);
+            } else if ((v / 1px) < -1.2) {
+                root.fling_vel = Math.max(scaled_v, -75px);
                 fling_timer.start();
             } else {
                 root.fling_vel = 0px;
@@ -144,12 +143,13 @@ export component RecommendView inherits Rectangle {
         root.active_axis = PanAxis.None;
     }
 
-    // 惯性滑行。10ms ≈ 90Hz 一帧，撞边界立即停。
+    // 惯性滑行：8ms 定时器精准对齐 120Hz 物理刷新帧率 (约 8.33ms/帧)
+    // 0.965 衰减系数杜绝高刷下的剧烈衰减与滞涩阻滞感
     fling_timer := Timer {
-        interval: 10ms;
+        interval: 8ms;
         running: false;
         triggered => {
-            if (Math.abs(root.fling_vel) < 0.5px) {
+            if (Math.abs(root.fling_vel) < 0.4px) {
                 root.fling_vel = 0px;
                 self.running = false;
                 return;
@@ -168,7 +168,7 @@ export component RecommendView inherits Rectangle {
                 return;
             }
             root.scroll_y = next;
-            root.fling_vel = root.fling_vel * 0.95;
+            root.fling_vel = root.fling_vel * 0.965;
         }
     }
 
