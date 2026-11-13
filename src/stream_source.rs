@@ -40,6 +40,12 @@ pub struct SharedBuffer {
 }
 
 struct BufState {
+    /// 已知的最终总长度（来自 HTTP Content-Length）。
+    ///
+    /// 为什么必须提前知道：AMediaExtractor 在解封装阶段调用 getSize()，
+    /// 若返回 -1（"长度未知"），实测它会**一直不返回**，整个解码线程卡死
+    /// 在 setDataSourceCustom 里。所以必须先拿到真实总长度。
+    known_total: Option<u64>,
     /// 已落盘并可供读取的字节数
     available: u64,
     /// 下载是否已完成（此时 available 就是最终长度）
@@ -53,9 +59,11 @@ struct BufState {
 }
 
 impl SharedBuffer {
-    pub fn new(path: std::path::PathBuf) -> Arc<Self> {
+    /// `known_total` 是 HTTP Content-Length；必须先向 CDN 问出来。
+    pub fn new(path: std::path::PathBuf, known_total: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(BufState {
+                known_total,
                 available: 0,
                 finished: false,
                 failed: false,
@@ -195,10 +203,14 @@ unsafe extern "C" fn ds_get_size(userdata: *mut std::ffi::c_void) -> isize {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    // 下载中返回 -1（长度未知，流式读取）；下完返回真实长度
-    match s.total {
-        Some(t) if s.finished => t as isize,
-        _ => -1,
+    // 优先用 HTTP Content-Length（下载前就问到了）；
+    // 退而求其次用下载完成后记录的真实长度。
+    // 绝不返回 -1：实测会让 AMediaExtractor 卡死在解封装阶段。
+    match s.known_total.or(s.total) {
+        Some(t) => t as isize,
+        // 走到这里说明连 Content-Length 都没拿到，属于异常路径。
+        // 返回 0 让框架立即报错，好过永久挂起。
+        None => 0,
     }
 }
 

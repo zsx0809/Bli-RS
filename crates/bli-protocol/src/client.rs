@@ -181,6 +181,40 @@ impl BiliClient {
 
     /// 流式下载媒体流到本地文件，并在写入达到 `initial_threshold_bytes`（例如 1.5MB）时触发 `on_ready` 回调，
     /// 从而实现边下载边播放（首段即播，极速秒开）。
+    /// 用 HTTP Range 探测资源的**总长度**（Content-Range 里的 total）。
+    ///
+    /// 为什么必须单独问一次：
+    ///   边下边播要给 AMediaExtractor 一个确定的 getSize()，
+    ///   否则它卡死在解封装阶段（实测）。而下载是一次性的流式写盘，
+    ///   写之前就得知道总长度，所以先发一个 Range: bytes=0-0 的小请求。
+    ///
+    /// 为什么用 `bytes=0-0` 而不是 HEAD：
+    ///   B 站 CDN 对 HEAD 的支持不一致（部分节点 405）。
+    ///   `bytes=0-0` 必定返回 206 + Content-Range: bytes 0-0/TOTAL。
+    ///   代价是只下载 1 字节。
+    pub async fn probe_content_length(&self, url: &str) -> Option<u64> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+
+        let resp = client
+            .get(url)
+            .header("user-agent", api::BROWSER_UA_PC)
+            .header("referer", api::REFERER)
+            .header("accept-encoding", "identity")
+            .header("range", "bytes=0-0")
+            .send()
+            .await
+            .ok()?;
+
+        // Content-Range: bytes 0-0/12345678
+        let cr = resp.headers().get("content-range")?.to_str().ok()?;
+        let total = cr.rsplit('/').next()?.trim();
+        total.parse::<u64>().ok()
+    }
+
     pub async fn download_stream_to_file<F>(
         &self,
         url: &str,

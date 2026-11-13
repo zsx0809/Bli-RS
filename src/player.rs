@@ -564,7 +564,32 @@ fn start_playback(
     // 残留的半截文件必须删掉：它会被当成完整视频解析。
     let _ = std::fs::remove_file(&path);
 
-    let buffer = crate::stream_source::SharedBuffer::new(path.clone());
+    // 先问出总长度。
+    //
+    // AMediaExtractor 的解封装阶段会调 getSize()，拿不到确定值
+    // （返回 -1）就会一直卡住不返回 —— 实测如此。
+    // 所以在建数据源之前，先发一个 Range: bytes=0-0 的小请求拿
+    // Content-Range 里的 total（只消耗 1 字节流量）。
+    let total_len = {
+        let rt_probe = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(_) => {
+                report_fail(&w_clone, "初始化网络失败".into());
+                return;
+            }
+        };
+        rt_probe.block_on(client.probe_content_length(&url))
+    };
+
+    match total_len {
+        Some(n) => crate::mxprobe::log_public(&format!(
+            "[Player] 视频总长度 {:.1} MB",
+            n as f64 / 1_048_576.0
+        )),
+        None => crate::mxprobe::log_public("[Player] 未能探测总长度（将退回非流式读取）"),
+    }
+
+    let buffer = crate::stream_source::SharedBuffer::new(path.clone(), total_len);
 
     crate::mxprobe::log_public("[Player] 启动边下边播（AMediaDataSource 流式解码）…");
 
