@@ -8,7 +8,10 @@
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| UI 骨架（Slint + Material 3 + Monet） | ✅ 完成 | 双列网格、胶囊 Tab、抽屉、手势 |
+| UI 骨架（Slint + Material 3 + Monet） | ✅ 完成 | 双列网格、胶囊 Tab、抽屉 |
+| 手势系统（GestureArea） | ✅ 完成 | 自判位移，tap/pan 严格互斥 |
+| 二级页（详情 + 播放） | ✅ 跑通 | 简介/评论 Tab、五联条、相关推荐 |
+| 边缘返回 / 系统返回键 | ✅ 完成 | 左边缘归 App，返回键按栈序消费 |
 | 推荐流真实数据 | ✅ 完成 | Wbi 签名 + 分页加载 + 封面懒加载 |
 | 视频播放（画面） | ✅ 跑通 | 真实 B 站视频出画面，零拷贝硬解 |
 | 视频播放（音频） | ⬜ 未做 | 需要 AAudio + 音频轨解码 |
@@ -25,7 +28,7 @@
 - **网络**：reqwest 0.12 + rustls（纯 Rust TLS，交叉编译不需要 OpenSSL）
 - **媒体**：Android NDK 原生 —— `AMediaExtractor` / `AMediaCodec` / `SurfaceView`
 - **异步**：tokio（每个后台任务自建 current_thread runtime）
-- **构建**：`aapt2` + `zipalign` + `apksigner`，无 Gradle，无 DEX，0 行 Java
+- **构建**：GitHub Actions（NDK r26d）+ `aapt2`/`zipalign`/`apksigner`，无 Gradle，无 DEX，0 行 Java
 
 ---
 
@@ -163,27 +166,50 @@ NOT Send  : AppWindow, Image, ModelRc, VecModel, Rc<...>
 在 `main_window.run()` 之前建 Timer 不会触发。
 现在的做法：在第一次 `set_rows` 的 `upgrade_in_event_loop` 闭包里启动。
 
-### 10. 滚动不能用 Flickable
+### 10. `TouchArea.clicked` 不判位移（两个手势 bug 的总根因）
 
-`Flickable` 在触摸滚动路径里会调 `content_y.remove_binding()`
-抢走绑定（`flickable.rs:514`），外部双向绑定被拆掉。
-表现为「下拉能刷新、上滑完全不动」。
+`input_items.rs` 的 `Released` 分支只检查「pressed && 抬起点在自己范围内」，
+**中间滑了多远完全不管**。
 
-现在的做法：`Flickable` 换成普通 `Rectangle` 只做裁剪，
-纵向位移由 `scroll_y` 完全自管。
+后果：在列表上侧滑时，起点与终点通常在同一张卡片内，
+于是一次侧滑被翻译成一次点击 —— 表现为「右滑直接切到下一个视频」。
 
-### 11. 手势层会吞掉卡片点击
+另外，任何铺满页面的 `TouchArea` 都会吃掉内部元素的 `press`，
+使卡片内的按钮（评论点赞、Tab）永久失效 —— 这是「评论区点不动」。
 
-手势层的 `TouchArea` 盖在最上层，`press` 先到它手里，
-卡片上的 `TouchArea` 收不到。
+**现在的做法**：`ui/gesture.slint` 的 `GestureArea`。
+继承 `TouchArea` 但不用它的 `clicked`，只接管 `pointer-event`：
 
-现在的做法：手势层判定「无位移 = 点击」，转发给 `RecommendView`
-做坐标命中测试。
+- 位移 < `tap_slop`(8px) → `tap`
+- 位移 ≥ `tap_slop` → 锁定主轴，只发 `pan_*`，**永不发 tap**
+- 锁定在单次手势内不可逆
 
-**这是个权宜之计**——以后卡片内如果有独立按钮（点赞、更多），
-这套方案会很别扭，需要重新设计。
+`pan` 沿组件树冒泡：纵向 → 自己滚，横向 → 冒泡到 `AppWindow` 切频道。
+**没有任何覆盖层**，谁被按下谁处理。
 
-### 12. 帧率必须按真实刷新率对齐
+### 11. 左边缘侧滑不能交还系统
+
+进二级页时若调 `set_exclusion(32, false)`，左边缘就归系统了，
+边缘侧滑 = 系统返回 = `finish()` 掉 `NativeActivity` = **App 直接退出**。
+
+现在的做法：排除区全程生效；详情页的左边缘返回由自己的 `EdgeBack`
+手势处理（从 `x=0` 起手，`vertical_enabled: false`，>32px 才返回）。
+
+系统返回键则由 `AppWindow` 上的 `FocusScope` 接住，
+按栈序消费（抽屉 → 详情页 → 交还系统）。
+
+### 12. 滚动不用 Flickable
+
+`Flickable` 的 press 是 `DelayForwarding(100ms)`：按下先扣住，
+100ms 内没移动才交给子元素。内部按钮的按下反馈会**发粘**；
+快速横滑时子元素**根本收不到 down**。
+
+它也的确会 `content_y.remove_binding()`，外部别绑它的 `content-y`。
+
+现在的做法：位移由 `scroll_y` 自管，拖动中 `duration: 0ms` 严格跟手，
+抬手后惯性用 8ms Timer 推进（8ms < 90Hz 的 11.1ms，每帧都有新内容）。
+
+### 13. 帧率必须按真实刷新率对齐
 
 这台设备支持 60/90/120Hz，系统会动态切换。
 手动逐帧累加惯性时，`Timer(16ms)` 在 90Hz 下会让 1/3 的帧没有新内容，
@@ -196,33 +222,45 @@ NOT Send  : AppWindow, Image, ModelRc, VecModel, Rc<...>
 
 ## 编译与打包
 
-### chroot / 交叉编译（推荐）
+### GitHub Actions（现行方案）
+
+本机是 Termux 原生环境，chroot 已卸载，`rustup` 无可用 toolchain，
+Skia 也不适合在设备上现编。**构建全部交给 CI**：
 
 ```bash
-bash scripts/build.sh          # 编译 + 打包
-bash scripts/build.sh --lib    # 只编译 .so
+git push origin main     # 自动触发
+# 产物：Actions → 最新 run → Artifacts → Bli-RS-arm64-v8a
 ```
 
-**为什么这样搭：**
+workflow 用官方 NDK r26d + `dtolnay/rust-toolchain`，
+打包仍走 `scripts/package_apk.sh`（aapt2 + zipalign + apksigner，无 Gradle、无 DEX）。
 
-1. Google 官方 NDK 只有 `linux-x86_64` 版本，没有 aarch64 host。
-2. Termux 自带的 clang 二进制本身就是 `Target: aarch64-unknown-linux-android24`，
-   天然面向 Android 的 bionic，且能在 chroot 内直接执行。
-3. Rust 侧用 rustup 的 `aarch64-linux-android` std（`rustup target add aarch64-linux-android`）。
-4. Skia 的 build.rs 硬编码 `host_tag = "linux-x86_64"`，
-   需要一个 NDK 目录桩骗过它（脚本会自动创建 `/tmp/ndk-shim-r29`）。
+三个已踩过的 CI 坑：
 
-Skia 的预编译包缓存在 `target/*/build/skia-bindings-*/out/skia/`（25M），
-会被自动复用，不需要重新下载。
+1. **`.cargo/config.toml` 不能写死 Termux 的 linker 路径**
+   （会报 `failed to find tool "aarch64-linux-android-clang"`）。
+   linker 走 `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` 环境变量。
+2. **cc-rs 需要 `CC_` / `AR_`**
+   （`ring` 之类 C 依赖自己不会去 NDK 里找 clang）：
+   ```
+   CC_aarch64_linux_android=<ndk>/bin/aarch64-linux-android26-clang
+   AR_aarch64_linux_android=<ndk>/bin/llvm-ar
+   ```
+3. **`${{ env.ANDROID_HOME }}` 取不到 runner 的 SDK 路径**，
+   要在 shell 里解析后写进 `$GITHUB_ENV`。
 
-### Termux 原生编译（备选）
+`scripts/package_apk.sh` 支持环境变量覆盖（`AAPT2` / `ZIPALIGN` / `APKSIGNER` /
+`ANDROID_JAR` / `KEYSTORE` / `LIBCXX_SO` / `SKIP_PATCHELF`），
+所以同一个脚本在 Termux 与 CI 上都能跑。
+
+### Termux 本地（仅限已有工具链时）
 
 ```bash
-export PATH=/data/data/com.termux/files/usr/bin:$PATH
 export ANDROID_HOME=/data/data/com.termux/files/home/Android/Sdk
 export ANDROID_JAR=$ANDROID_HOME/platforms/android-35/android.jar
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=/data/data/com.termux/files/usr/bin/clang
 export RUSTFLAGS="-L ./fake_libs"
-cargo build --lib --release
+cargo build --lib --release --target aarch64-linux-android
 bash scripts/package_apk.sh
 ```
 

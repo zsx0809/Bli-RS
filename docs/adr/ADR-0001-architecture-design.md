@@ -260,14 +260,28 @@ VISIBLE(0)   → 正常  ✓
 在 `main_window.run()` 之前建 Timer 不会触发。
 当前做法：在第一次 `set_rows` 的 `upgrade_in_event_loop` 闭包里启动（幂等）。
 
-### 5.11 纵向滚动不能用 `Flickable`
+### 5.11 纵向滚动：自管 `scroll_y`，不用 `Flickable`（已重写）
 
-`Flickable` 在触摸滚动路径里会调 `content_y.remove_binding()`
-（`i-slint-core/items/flickable.rs:514`），把外部双向绑定拆掉。
-表现为「下拉能刷新、上滑完全不动」。
+> **2026-11 重写**：本节旧结论「Flickable 会 remove_binding 所以不能用」
+> 只对了一半。真正的约束来自**与之配套的手势层**，见下面 5.13 的重写说明。
 
-当前方案：`Flickable` 换成普通 `Rectangle`，只负责裁剪；
-纵向位移完全由 `scroll_y` 自管，惯性交给 `animate y` 插值。
+`Flickable` 确实会在触摸路径里调 `content_y.remove_binding()`
+（`i-slint-core/items/flickable.rs`，press 与 wheel 两个分支都有），
+把外部双向绑定拆掉。所以**外部不要再绑定它的 content-y**。
+
+但更关键的是它的 press 转发策略：
+`input_event_filter_before_children` 对 `MouseEvent::Pressed` 返回
+`DelayForwarding(100ms)` —— 按下后先扣住，100ms 内没有移动才把 press
+交给子元素；一旦移动超过 8px 且该轴可滚，就自己接管并给子元素补一个 Exit。
+
+即：内部的 `TouchArea.clicked` 会有 **100ms 的按下延迟**，
+快速横滑时子元素**根本收不到 down**。
+
+当前方案（推荐流与详情页统一）：
+- 不用 `Flickable`，纵向位移完全由 `scroll_y` 自管
+- 拖动中 `duration: 0ms` 严格跟手；抬手后惯性用 8ms Timer 逐帧推进
+  （8ms < 90Hz 的 11.1ms，每帧都有新内容）
+- 点击与拖动由 `GestureArea` 区分（见 5.13）
 
 ### 5.12 帧率必须按真实刷新率对齐
 
@@ -280,18 +294,93 @@ VISIBLE(0)   → 正常  ✓
 - 抬手后算出目标位置，置 `true` 走 260ms `ease-out`
 - 由渲染引擎按真实 vsync 插值
 
-### 5.13 手势层会吞掉卡片点击
+### 5.13 手势：`TouchArea.clicked` 不判位移 —— 这是两个 bug 的总根因
 
-统一手势层的 `TouchArea` 盖在最上层，`press` 先到它手里，
+> **2026-11 全量重写**。旧的「全屏手势层 + `tap_at` 坐标反推」方案已彻底删除。
+
+**根因一：`clicked` 只看起终点，不看路径。**
+
+`i-slint-core/items/input_items.rs` 的 `MouseEvent::Released` 分支只做两件事：
+
+```rust
+if *button == Left
+    && Rect::new(Point::default(), geometry.size).contains(*position)
+    && self.pressed()
+{
+    self.clicked().call(&());
+}
+```
+
+没有位移判断。在列表上侧滑时，手指起点与终点通常落在**同一张卡片**内，
+于是一次侧滑被翻译成一次点击 —— 表现为「右滑直接切到下一个视频」。
+
+**根因二：覆盖层会吃掉内部的 down。**
+
+旧的统一手势层是个铺满页面的 `TouchArea`，`press` 先到它手里，
 卡片自己的 `TouchArea` 完全收不到 `clicked`。
+为了绕开，旧代码让手势层判定「无位移 = 点击」并把坐标转发给
+`RecommendView::tap_at()` 按行列公式反推命中了哪张卡。这套做法有三处硬伤：
 
-当前方案：手势层判定「无位移 = 点击」，转发坐标给
-`RecommendView::tap_at()` 做行列命中测试。
+1. **卡片内任何独立控件都不可能工作** —— 评论区的点赞、更多菜单、
+   Tab 按钮全被这一层挡住，这是「评论区点不动」的直接原因。
+2. 反推公式假设「窗口坐标 == 内容坐标」，列表滚动过 / 页面横移过之后
+   两个坐标系不重合，命中必然错位。
+3. 按压反馈、滑动取消、抬手命中是三套手工同步的状态，必然错位。
 
-**这是权宜之计**。卡片内一旦出现独立按钮（点赞、更多），
-这套坐标反推会很难维护，届时应重新设计事件分发。
+**当前方案：`ui/gesture.slint` 的 `GestureArea`，没有任何覆盖层。**
 
-### 5.14 构建：chroot 交叉编译的完整方案
+```slint
+export component GestureArea inherits TouchArea { ... }
+```
+
+继承 `TouchArea` 但**不使用它的 `clicked`**，只接管 `pointer-event` 原始事件：
+
+| 条件 | 结果 |
+|---|---|
+| 位移全程 < `tap_slop`（8px） | 发 `tap(x, y)` |
+| 位移 ≥ `tap_slop` | 锁定主轴，此后只发 `pan_*`，**永不发 `tap`** |
+| 长按计时到点且未锁定 | 发 `long_press` |
+
+锁定在单次手势内**不可逆**：判定成拖动就再也不会变成点击，
+判定成纵向就不会翻成横向。
+
+**事件路由：谁被按下谁处理，`pan` 沿组件树往上冒泡。**
+
+```
+VideoCard.GestureArea ──tap──→ 打开视频
+                      ──pan──→ RecommendView
+                                  ├─ Vertical   → 自己滚动 + 惯性
+                                  └─ Horizontal → 冒泡到 AppWindow 切频道
+```
+
+事件在哪一层开始就在那一层结束，没有跨层抢 grab，没有 100ms 延迟。
+
+### 5.13b 左边缘侧滑不能交还系统
+
+进入二级页时曾调 `set_exclusion(32, false)`，把左边缘 32dp 还给了系统手势区。
+结果：边缘侧滑 = 系统返回 = `finish()` 掉 `NativeActivity` = **App 直接退出**。
+
+当前方案：
+- 排除区**全程生效**，不随页面切换解除
+- 详情页的左边缘返回由 `EdgeBack`（`GestureArea`）自己处理，
+  从真正的 `x=0` 起手，`vertical_enabled: false`（竖向起手放弃，不抢滚动），
+  位移 > 32px 才返回
+
+### 5.13c 系统返回键必须有 `FocusScope` 接住
+
+`android-activity` 把 `Keycode.Back` 映射成 `Key.Back` 交给 Slint
+（`androidwindowadapter.rs` 的 `map_key_code`）。若无人 `accept`，
+它返回 `InputStatus::Unhandled` → 走 fallback → `finish` 掉 Activity。
+
+所以 `AppWindow` 上挂了 `forward-focus` 到一个 `FocusScope`，
+按栈序消费：抽屉打开 → 关抽屉；详情页 → 回首页；否则 `reject` 交还系统。
+
+注意 Slint 的 callback 返回值是**最后一个表达式**，不能写 `return accept;`。
+
+### 5.14 构建：chroot 交叉编译（已废弃，改用 GitHub Actions）
+
+> **2026-11 更新**：本机 chroot 已卸载，以下方案**不再可用**，仅作历史记录。
+> 现行方案见 5.15。
 
 Google 官方 NDK 只有 `linux-x86_64` host，没有 aarch64 版本。
 但 Termux 自带的 clang 二进制本身就是
@@ -306,3 +395,65 @@ Google 官方 NDK 只有 `linux-x86_64` host，没有 aarch64 版本。
 注意：**不要把 Termux 的 bin 加到 PATH 前面**。
 否则宿主的 build script / proc-macro 编译也会用那个 clang，
 去链接 bionic 的 libc，报 `unable to find library -lgcc_s`。
+
+### 5.15 构建：GitHub Actions（现行方案）
+
+本机是 Termux 原生环境，chroot 已卸载，`rustup` 没有可用 toolchain，
+Skia 也无法在设备上现编。因此构建全部交给 CI：
+
+- workflow: `.github/workflows/android.yml`
+- 用官方 NDK r26d + `dtolnay/rust-toolchain`
+- 打包仍走 `scripts/package_apk.sh`（aapt2 + zipalign + apksigner，无 Gradle）
+
+踩过的三个 CI 坑：
+
+1. **`.cargo/config.toml` 不能写死 Termux 的 linker 绝对路径**。
+   那会让 CI 报 `failed to find tool "aarch64-linux-android-clang"`。
+   现在该文件只留 net/http 配置，linker 通过
+   `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` 环境变量给。
+
+2. **cc-rs 需要 `CC_` / `AR_` 环境变量**。
+   rustc 只知道 linker；`ring` 这类 C 依赖由 cc-rs 驱动，
+   它自己不会去 NDK 目录里找 clang。必须显式给：
+
+   ```
+   CC_aarch64_linux_android=<ndk>/bin/aarch64-linux-android26-clang
+   AR_aarch64_linux_android=<ndk>/bin/llvm-ar
+   ```
+
+3. **`${{ env.ANDROID_HOME }}` 取不到 runner 的 SDK 路径**。
+   `env` 上下文只含 workflow/job/step 里定义的值，不含 runner 环境变量。
+   必须在 shell 里解析后写进 `$GITHUB_ENV`。
+
+`scripts/package_apk.sh` 也因此改成可被环境变量覆盖：
+
+| 变量 | 用途 |
+|---|---|
+| `AAPT2` / `ZIPALIGN` / `APKSIGNER` | 工具路径，默认走 PATH |
+| `ANDROID_JAR` | 平台 jar |
+| `KEYSTORE` | 签名用 keystore |
+| `LIBCXX_SO` | libc++_shared.so 来源 |
+| `SKIP_PATCHELF=1` | CI 上跳过 patchelf（NDK 已正确链接 DT_NEEDED） |
+
+### 5.16 Slint 语法坑（编译器实测报错，不是猜的）
+
+| 写法 | 报错 | 正确写法 |
+|---|---|---|
+| `property <real>` | `Unknown type 'real'` | `property <float>` |
+| `dx + vx * 80px` | `Cannot convert (px²) to length` | 先 `/ 1px` 降到 float 域再乘 |
+| `(scroll_y / 1px) - Spacing.page_margin` | `Cannot convert float to length` | `- (Spacing.page_margin / 1px)` |
+| `return accept;` | — | callback 用最后一个表达式作返回值 |
+
+### 5.17 真机验证记录（2026-11-13，1240x2772 @408dpi，Android 14）
+
+修完后逐条实测：
+
+| 操作 | 结果 |
+|---|---|
+| 首页正常渲染、封面加载 | ✅ |
+| 点击卡片进详情页 | ✅ |
+| 详情页纵向滚动（在相关卡片上拖也一样） | ✅ |
+| 详情页点「评论」Tab 切换 | ✅ |
+| 详情页左上返回按钮 | ✅ |
+| **左边缘右滑返回首页，App 不退出** | ✅ |
+| **在相关视频列表上右滑，不误切视频** | ✅ |
