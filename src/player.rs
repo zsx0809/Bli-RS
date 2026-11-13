@@ -56,6 +56,8 @@ struct RawDetail {
     shares: String,
     pubdate: String,
     is_vertical: bool,
+    up_fans: String,
+    up_videos: String,
 }
 
 /// 纯数据相关视频包装
@@ -196,6 +198,9 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                 let face = d.owner_face.clone();
                 let pic = d.pic.clone();
 
+                // 粉丝数 / 投稿数：单独请求，失败就不显示（不拖累播放）
+                let (follower, video_cnt) = rt.block_on(client.up_stat(d.owner_mid));
+
                 let raw = RawDetail {
                     views: d.views_str(),
                     danmaku: d.danmaku_str(),
@@ -209,6 +214,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                     desc: d.desc,
                     author: d.owner_name,
                     is_vertical: is_vert,
+                    up_fans: follower
+                        .map(|n| format!("{}粉", fmt_count(n)))
+                        .unwrap_or_default(),
+                    up_videos: video_cnt
+                        .map(|n| format!("{}视频", fmt_count(n)))
+                        .unwrap_or_default(),
                 };
 
                 let w_detail = w_clone.clone();
@@ -226,6 +237,8 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                     cur.shares = raw.shares.into();
                     cur.pubdate = raw.pubdate.into();
                     cur.is_vertical = raw.is_vertical;
+                    cur.up_fans = raw.up_fans.into();
+                    cur.up_videos = raw.up_videos.into();
                     cur.is_liked = false;
                     cur.is_coined = false;
                     cur.is_favorited = false;
@@ -353,10 +366,6 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                     //   接口一页就是 20 条，再往下要翻页 —— 翻页功能还没做，
                     //   预先下载屏幕外的头像纯属浪费流量。
                     spawn_comment_faces(w_face_list, face_urls, my_session);
-                }
-            });
-        }
-
                 }
             });
         }
@@ -526,27 +535,18 @@ fn start_playback(
     let w_clone = window.clone();
 
     // ==================================================================
-    // 下载策略：**下完再播**，不再边下边播
+    // 边下边播（真正的流式解码）
     // ==================================================================
     //
-    // 为什么放弃边下边播（这是"播到一半卡住"的根因）：
+    // 关键：数据源不再是一个固定长度的 fd，而是 AMediaDataSource +
+    // 自定义 readAt 回调（见 src/stream_source.rs）。
     //
-    //   AMediaExtractor 通过 setDataSourceFd(fd, 0, len) 绑定数据源，
-    //   `len` 在**打开那一刻**就固定了。原先的做法是等文件涨到 1.5MB
-    //   就立刻起播 —— 此时 len=1.5MB，extractor 眼里整个视频只有 1.5MB。
-    //   后台虽然还在继续写文件，但 extractor 读到自己记录的 EOF 就返回
-    //   -1（输入结束），解码器发 EOS，画面冻结。文件变大它看不见。
+    //   · 下载线程边下边写文件，同时推进 SharedBuffer.available
+    //   · 解码线程的 readAt 要数据时，如果还没下到那里就阻塞等待
+    //   · getSize() 在下载中返回 -1（长度未知），下完返回真实长度
     //
-    //   日志里那句「[流式下载错误] error decoding response body」是另一个
-    //   独立问题（CDN 中途断连），但即使下载完全正常，边下边播也必定在
-    //   1.5MB 处停住。
-    //
-    //   要真正实现边下边播，得改用 AMediaDataSource（自定义 readAt 回调），
-    //   那是另一套 API 绑定工作。当前阶段先保证"能完整播完"，用下完再播。
-    //
-    //   代价：起播要等多几秒（480P 几 MB，通常 2~5 秒）。
-    //   收益：拖动进度条可靠（len 是真实长度）、不会中途冻结、
-    //         解码器不用处理文件增长的不确定状态。
+    // 于是解码器"跟着下载进度走"：下载慢它等，下载快它追。
+    // 一小时的视频也能在首段就绪后立即起播，不需要等整段下完。
     let cache_dir = crate::android_window::cache_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -561,22 +561,17 @@ fn start_playback(
     let path = cache_dir.join(format!("v_{bvid}.m4s"));
     let path_str = path.to_string_lossy().to_string();
 
-    // 缓存命中就直接用；否则完整下载后再起播
-    let cached_ok = path
-        .exists()
-        && path.metadata().map(|m| m.len()).unwrap_or(0) > 500_000;
+    // 残留的半截文件必须删掉：它会被当成完整视频解析。
+    let _ = std::fs::remove_file(&path);
 
-    if cached_ok {
-        crate::mxprobe::log_public(&format!("[Player] 使用已缓存视频流: {path_str}"));
-    } else {
-        // 先清掉可能存在的半截文件：
-        //   上次边下边播失败会留下 1.5MB 的残缺 m4s，
-        //   若不清掉，下次 AMediaExtractor 会把残片当完整文件解析，
-        //   表现为"有画面但播几秒就断"。
-        let _ = std::fs::remove_file(&path);
+    let buffer = crate::stream_source::SharedBuffer::new(path.clone());
 
-        crate::mxprobe::log_public("[Player] 开始完整下载视频流…");
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    crate::mxprobe::log_public("[Player] 启动边下边播（AMediaDataSource 流式解码）…");
+
+    // 首段阈值 512KB：够解出 ftyp/moov 与前若干关键帧，通常 0.2~0.6 秒。
+    let (tx_ready, rx_ready) = std::sync::mpsc::sync_channel::<()>(1);
+    {
+        let buffer_dl = buffer.clone();
         let client_dl = client.clone();
         let url_dl = url.clone();
         let path_dl = path.clone();
@@ -585,52 +580,47 @@ fn start_playback(
             let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("初始化运行时失败: {e}")));
+                    crate::mxprobe::log_public(&format!("[下载] 运行时创建失败: {e}"));
+                    buffer_dl.fail();
                     return;
                 }
             };
 
-            // 阈值传 u64::MAX：on_ready 在整个文件下完后才回调一次，
-            // 我们据此判定"下载完成"。这是复用现有 API 最省事的办法，
-            // 比在协议层再开一个 download_whole 要稳。
             let res = rt_dl.block_on(client_dl.download_stream_to_file(
                 &url_dl,
                 &path_dl,
-                u64::MAX,
-                || {},
+                512_000,
+                move || {
+                    let _ = tx_ready.send(());
+                },
             ));
 
-            let _ = tx.send(match res {
-                Ok(()) => Ok(()),
-                Err(e) => Err(format!("{e}")),
-            });
-        });
-
-        // 等待下载完成。超时给足 90 秒：
-        //   480P 几 MB，正常 2~5 秒；弱网下 30 秒也可能。
-        //   超时就明确报错，而不是让用户对着"加载中"干等。
-        match rx.recv_timeout(std::time::Duration::from_secs(90)) {
-            Ok(Ok(())) => {
-                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                crate::mxprobe::log_public(&format!(
-                    "[Player] 下载完成: {:.1} MB",
-                    size as f64 / 1_048_576.0
-                ));
-                if size < 100_000 {
-                    report_fail(&w_clone, "视频流下载为空，请重试".into());
-                    return;
+            match res {
+                Ok(()) => {
+                    let total = path_dl.metadata().map(|m| m.len()).unwrap_or(0);
+                    crate::mxprobe::log_public(&format!(
+                        "[下载] 完成 {:.1} MB",
+                        total as f64 / 1_048_576.0
+                    ));
+                    buffer_dl.finish(total);
+                }
+                Err(e) => {
+                    crate::mxprobe::log_public(&format!("[下载] 失败: {e}"));
+                    buffer_dl.fail();
                 }
             }
-            Ok(Err(e)) => {
-                let _ = std::fs::remove_file(&path);
-                report_fail(&w_clone, format!("视频下载失败: {e}"));
-                return;
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&path);
-                report_fail(&w_clone, "视频下载超时，请检查网络".into());
-                return;
-            }
+        });
+    }
+
+    // 等首段就绪（12 秒超时）。注意这里**只等首段**，不等整个文件。
+    match rx_ready.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(()) => {
+            crate::mxprobe::log_public("[Player] 首段就绪，立即起播（后台继续下载）");
+        }
+        Err(_) => {
+            // 首段没等到：可能是弱网，也可能彻底失败。让解码器自己再等一会，
+            // 这里只记录，不直接判死 —— readAt 会继续阻塞等待下载推进。
+            crate::mxprobe::log_public("[Player] 首段等待超时，交由解码器流式等待");
         }
     }
 
@@ -659,7 +649,7 @@ fn start_playback(
 
     crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
     let dec = crate::video_decoder::VideoDecoder::start(
-        path_str,
+        buffer,
         surface,
         move || {
             crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
@@ -769,6 +759,17 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
+}
+
+/// 大数字转中文习惯写法（12.3万 / 1.2亿）
+fn fmt_count(n: u64) -> String {
+    if n >= 100_000_000 {
+        format!("{:.1}亿", n as f64 / 100_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}万", n as f64 / 10_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// 秒 → mm:ss（超过 1 小时用 h:mm:ss）

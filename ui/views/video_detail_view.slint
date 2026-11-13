@@ -965,8 +965,23 @@ export component VideoDetailView inherits Rectangle {
                                         font-weight: 600;
                                     }
 
+                                    // 粉丝数 · 投稿数
+                                    //
+                                    // 原来这里是硬编码的"UP主 · 优质创作者" ——
+                                    // 那个「优质创作者」标签其实来自认证信息，
+                                    // 绝大多数 UP 主并没有，属于无意义文案。
+                                    // 换成真实数据：粉丝数与已发布视频数，
+                                    // 这才对用户有判断价值（判断这号值不值得关注）。
+                                    //
+                                    // 两者任一为空就自动省略，不显示孤立的分隔点。
                                     Text {
-                                        text: "UP主 · 优质创作者";
+                                        text: root.detail.up_fans == "" && root.detail.up_videos == ""
+                                            ? ""
+                                            : (root.detail.up_fans == ""
+                                                ? root.detail.up_videos
+                                                : (root.detail.up_videos == ""
+                                                    ? root.detail.up_fans
+                                                    : root.detail.up_fans + " · " + root.detail.up_videos));
                                         color: Theme.on_surface_variant;
                                         font-size: 10px;
                                     }

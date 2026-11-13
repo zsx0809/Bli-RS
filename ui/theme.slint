@@ -54,6 +54,10 @@ export struct VideoDetailData {
     is_favorited: bool,
     /// 播放链路失败的原因。非空时播放器区域显示错误，不再显示"加载中"。
     load_error: string,
+    /// UP 主粉丝数文案（如 "12.3万粉"）。空串则不显示。
+    up_fans: string,
+    /// UP 主投稿数文案（如 "456视频"）。空串则不显示。
+    up_videos: string,
 }
 
 /// 相关推荐单列横向卡片数据

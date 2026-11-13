@@ -66,6 +66,12 @@ mod extractor {
             length: u64,
         ) -> c_int;
 
+        /// 用 AMediaDataSource 作数据源（流式读取，支持边下边播）。
+        pub fn AMediaExtractor_setDataSource(
+            e: *mut AMediaExtractor,
+            ds: *mut ndk_sys::AMediaDataSource,
+        ) -> c_int;
+
         pub fn AMediaExtractor_getTrackCount(e: *mut AMediaExtractor) -> usize;
         pub fn AMediaExtractor_getTrackFormat(
             e: *mut AMediaExtractor,
@@ -164,7 +170,7 @@ impl VideoDecoder {
     /// `path` 是已经下载好的 fMP4 分段（B 站的 .m4s）。
     /// 返回后解码在后台线程进行，`stop()` 可停止。
     pub fn start(
-        path: String,
+        buffer: std::sync::Arc<crate::stream_source::SharedBuffer>,
         surface: *mut std::ffi::c_void,
         on_first_frame: impl FnOnce() + Send + 'static,
         on_error: impl Fn(String) + Send + 'static,
@@ -174,6 +180,7 @@ impl VideoDecoder {
         let controls = Arc::new(Controls::default());
         let controls_for_thread = controls.clone();
         let sp = SendPtr(surface);
+        let buffer_for_thread = buffer.clone();
 
         let handle = std::thread::spawn(move || {
             // 在闭包内（已成为新线程的栈）才解包指针。
@@ -181,8 +188,8 @@ impl VideoDecoder {
             // 编译期就会因为 *mut c_void 不是 Send 而报错。
             let surface_ptr = sp.get();
             if let Err(e) = decode_loop(
-                &path,
                 surface_ptr,
+                buffer_for_thread,
                 on_first_frame,
                 &stop_for_thread,
                 &controls_for_thread,
@@ -208,31 +215,37 @@ impl VideoDecoder {
 
 /// 解码主循环
 fn decode_loop(
-    path: &str,
     surface: *mut std::ffi::c_void,
+    buffer: std::sync::Arc<crate::stream_source::SharedBuffer>,
     on_first_frame: impl FnOnce(),
     stop: &AtomicBool,
     controls: &Controls,
 ) -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::File::open(path).map_err(|e| format!("打开 {path} 失败: {e}"))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("取文件长度失败: {e}"))?
-        .len();
-
     unsafe {
         // ---- 1. 解封装 ----
+        //
+        // 数据源走 AMediaDataSource（自定义 readAt 回调），**不用** fd。
+        //
+        // 原因见 stream_source.rs 的长注释：setDataSourceFd 的 len 是
+        // 打开瞬间定死的，文件再涨它看不见，必然在那一刻的 EOF 卡死。
+        // AMediaDataSource 让解码器每次要数据都回调我们，我们再去等
+        // 下载线程把这一段写下来 —— 这才是真正的边下边播。
         let ex = extractor::AMediaExtractor_new();
         if ex.is_null() {
             return Err("AMediaExtractor_new 失败".into());
         }
 
-        let r = extractor::AMediaExtractor_setDataSourceFd(ex, file.as_raw_fd(), 0, len);
+        let ds = crate::stream_source::create_data_source(buffer.clone());
+        if ds.is_null() {
+            extractor::AMediaExtractor_delete(ex);
+            return Err("创建 AMediaDataSource 失败".into());
+        }
+
+        let r = extractor::AMediaExtractor_setDataSource(ex, ds);
         if r != 0 {
             extractor::AMediaExtractor_delete(ex);
-            return Err(format!("setDataSourceFd 失败: {r}"));
+            ndk_sys::AMediaDataSource_delete(ds);
+            return Err(format!("setDataSource(AMediaDataSource) 失败: {r}"));
         }
 
         let tracks = extractor::AMediaExtractor_getTrackCount(ex);

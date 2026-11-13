@@ -56,3 +56,15 @@ pub const PLAY_URL: &str = "/x/player/wbi/playurl";
 
 /// fnval 参数值：DASH + 高码率 + 杜比/8K
 pub const FNVAL_DASH_ALL: u32 = 4048;
+
+/// UP 主关系统计（粉丝数）
+///
+/// 不需要 WBI 签名，普通 GET 即可。
+/// 响应：{ "data": { "mid":.., "follower":.., "following":.. } }
+pub const RELATION_STAT: &str = "/x/relation/stat";
+
+/// UP 主投稿数量
+///
+/// 响应：{ "data": { "video":.., "bangumi":.., ... } }
+/// 不需要签名。
+pub const SPACE_NAVNUM: &str = "/x/space/navnum";

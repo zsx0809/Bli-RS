@@ -211,6 +211,49 @@ impl BiliClient {
         Ok(res)
     }
 
+    /// 拉取 UP 主的粉丝数与投稿数。
+    ///
+    /// 为什么要单独请求：/x/web-interface/view 的 owner 节点只有
+    /// mid/name/face，**没有粉丝数**。粉丝数在 /x/relation/stat，
+    /// 投稿数在 /x/space/navnum，两者都不需要 WBI 签名。
+    ///
+    /// 任一失败都返回 (None, None) 而不是整体报错 ——
+    /// UP 主数据是展示性的，取不到就不显示，不该拖累播放。
+    pub async fn up_stat(&self, mid: u64) -> (Option<u64>, Option<u64>) {
+        if mid == 0 {
+            return (None, None);
+        }
+
+        let mut follower = None;
+        let mut videos = None;
+
+        let mut p1 = BTreeMap::new();
+        p1.insert("vmid".to_string(), mid.to_string());
+        if let Ok(json) = self
+            .get_checked(
+                &format!("{}{}", api::API_BASE_URL, api::RELATION_STAT),
+                &p1,
+            )
+            .await
+        {
+            follower = json["data"]["follower"].as_u64();
+        }
+
+        let mut p2 = BTreeMap::new();
+        p2.insert("mid".to_string(), mid.to_string());
+        if let Ok(json) = self
+            .get_checked(
+                &format!("{}{}", api::API_BASE_URL, api::SPACE_NAVNUM),
+                &p2,
+            )
+            .await
+        {
+            videos = json["data"]["video"].as_u64();
+        }
+
+        (follower, videos)
+    }
+
     /// 拉取视频评论列表 (oid 为 aid)
     ///
     /// `owner_mid` 是视频作者 mid，用来给评论打「UP」标。
