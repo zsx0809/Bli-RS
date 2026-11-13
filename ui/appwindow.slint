@@ -197,7 +197,6 @@ export component AppWindow inherits Window {
     callback player_seek(float);
     callback player_seek_by(float);
     callback player_fullscreen_changed(bool);
-    callback log_size(float, float);
     callback player_brightness(float);
     callback player_volume(float);
     callback player_toggle_play();
@@ -433,7 +432,6 @@ export component AppWindow inherits Window {
         awaiting_play: root.awaiting_play;
         paused: root.play_paused;
         is_fullscreen <=> root.is_fullscreen;
-        dbg_size(w, h) => { root.log_size(w, h); }
         toggle_fullscreen => {
             root.is_fullscreen = !root.is_fullscreen;
             root.player_fullscreen_changed(root.is_fullscreen);

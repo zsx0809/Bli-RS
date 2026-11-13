@@ -323,11 +323,6 @@ fn android_main(app: slint::android::AndroidApp) {
     // 全屏：UI 层已经改了几何，但视频是**独立的原生图层**，
     // 必须同步改 SurfaceView 的真实尺寸，否则会"UI 全屏了、视频还在顶部"。
     {
-        main_window.on_log_size(move |w, h| {
-            crate::mxprobe::log_public(&format!("[Size] detail view = {w}x{h}"));
-        });
-    }
-    {
         main_window.on_player_fullscreen_changed(move |fs| {
             player::set_fullscreen(fs);
         });
