@@ -111,6 +111,7 @@ impl SendPtr {
 /// 视频解码器。持有 extractor、codec 与停止标志。
 pub struct VideoDecoder {
     stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl VideoDecoder {
@@ -128,7 +129,7 @@ impl VideoDecoder {
         let stop_for_thread = stop.clone();
         let sp = SendPtr(surface);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             // 在闭包内（已成为新线程的栈）才解包指针。
             // 若在外部 `sp.0` 提前取出，裸指针会被捕获进闭包，
             // 编译期就会因为 *mut c_void 不是 Send 而报错。
@@ -138,11 +139,17 @@ impl VideoDecoder {
             }
         });
 
-        Self { stop }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -231,17 +238,37 @@ fn decode_loop(
         };
 
         // ---- 3. 配置到 Surface ----
-        // 我们自己声明的 ANativeWindow 是不透明结构体，
-        // 这里要转成 ndk_sys 的类型。二者都是 ABI 兼容的裸指针，
-        // 直接 cast 即可。
-        let win = NativeWindow::from_ptr(
-            std::ptr::NonNull::new(surface as *mut ndk_sys::ANativeWindow)
-                .ok_or("Surface 指针为空")?,
-        );
+        // 我们自己声明的 ANativeWindow 是不透明结构体，转成 ndk_sys 的类型。
+        // 若底层 Surface 处于过渡重绘阶段，自动获取最新有效句柄重试，杜绝 ErrorUnknown
+        let mut configured = false;
+        let mut last_err = None;
 
-        codec
-            .configure(&format, Some(&win), MediaCodecDirection::Decoder)
-            .map_err(|e| format!("configure 失败: {e:?}"))?;
+        for attempt in 0..4 {
+            let active_surface = if attempt == 0 {
+                surface
+            } else {
+                std::thread::sleep(Duration::from_millis(80));
+                crate::video_surface::acquire_native_window().unwrap_or(surface)
+            };
+
+            if let Some(nn) = std::ptr::NonNull::new(active_surface as *mut ndk_sys::ANativeWindow) {
+                let win = NativeWindow::from_ptr(nn);
+                match codec.configure(&format, Some(&win), MediaCodecDirection::Decoder) {
+                    Ok(_) => {
+                        configured = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("{e:?}"));
+                    }
+                }
+            }
+        }
+
+        if !configured {
+            extractor::AMediaExtractor_delete(ex);
+            return Err(format!("configure 失败: {}", last_err.unwrap_or_else(|| "无法连接渲染表面".into())));
+        }
 
         codec.start().map_err(|e| format!("start 失败: {e:?}"))?;
 
@@ -269,8 +296,17 @@ fn decode_loop(
                         );
 
                         if n < 0 {
-                            // 输入结束
-                            codec.set_signal_end_of_input_stream().ok();
+                            // 输入结束：向 queue_input_buffer 提交 flags=4 (BUFFER_FLAG_END_OF_STREAM)
+                            const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
+                            codec
+                                .queue_input_buffer(
+                                    buf,
+                                    0,
+                                    0,
+                                    0,
+                                    BUFFER_FLAG_END_OF_STREAM,
+                                )
+                                .ok();
                             input_done = true;
                         } else {
                             let pts = extractor::AMediaExtractor_getSampleTime(ex);

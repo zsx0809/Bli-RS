@@ -179,6 +179,71 @@ impl BiliClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// 流式下载媒体流到本地文件，并在写入达到 `initial_threshold_bytes`（例如 1.5MB）时触发 `on_ready` 回调，
+    /// 从而实现边下载边播放（首段即播，极速秒开）。
+    pub async fn download_stream_to_file<F>(
+        &self,
+        url: &str,
+        dest_path: &std::path::Path,
+        initial_threshold_bytes: u64,
+        on_ready: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        use std::io::Write;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| Error::Network(format!("创建下载客户端失败: {e}")))?;
+
+        let mut resp = client
+            .get(url)
+            .header("user-agent", api::BROWSER_UA_PC)
+            .header("referer", api::REFERER)
+            .header("accept-encoding", "identity")
+            .header("range", "bytes=0-")
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT && !status.is_success() {
+            return Err(Error::Network(format!("HTTP {status}")));
+        }
+
+        let mut file = std::fs::File::create(dest_path)
+            .map_err(|e| Error::Other(format!("创建本地缓存文件失败: {e}")))?;
+
+        let mut downloaded = 0u64;
+        let mut ready_called = false;
+        let mut on_ready_opt = Some(on_ready);
+
+        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Network(e.to_string()))? {
+            file.write_all(&chunk)
+                .map_err(|e| Error::Other(format!("写入缓存文件失败: {e}")))?;
+            downloaded += chunk.len() as u64;
+
+            if !ready_called && downloaded >= initial_threshold_bytes {
+                ready_called = true;
+                file.flush().ok();
+                if let Some(cb) = on_ready_opt.take() {
+                    cb();
+                }
+            }
+        }
+
+        file.flush().ok();
+        if !ready_called {
+            if let Some(cb) = on_ready_opt.take() {
+                cb();
+            }
+        }
+
+        Ok(())
+    }
+
     /// 取 mixin_key，当天有效。
     ///
     /// 关键点：nav 接口在**未登录**时返回 `code: -101`，但 `data.wbi_img`

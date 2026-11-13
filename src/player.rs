@@ -327,7 +327,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
             vtrack.codecs
         ));
 
-        // 3.5 下载到本地内部缓存目录，避免 /data/local/tmp 权限受限 (Permission Denied)
+        // 3.5 边下边播：流式写入缓存，首段 1.5MB 就绪后即刻起播，杜绝整段漫长等待
         let cache_dir = crate::android_window::cache_dir()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -342,20 +342,46 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String) {
         let path = cache_dir.join(format!("v_{bvid}.m4s"));
         let path_str = path.to_string_lossy().to_string();
 
-        if !path.exists() {
-            crate::mxprobe::log_public("下载视频流…");
-            let dl = rt.block_on(client.download_bytes(&url)).map_err(|e| e.to_string());
-            match dl {
-                Ok(bytes) => {
-                    if let Err(e) = std::fs::write(&path, &bytes) {
-                        report_fail(&w_clone, format!("写入缓存失败: {e}"));
+        if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 500_000 {
+            crate::mxprobe::log_public("启动边下边播流式拉取…");
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let client_dl = client.clone();
+            let url_dl = url.clone();
+            let path_dl = path.clone();
+
+            std::thread::spawn(move || {
+                let rt_dl = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = tx.send(false);
                         return;
                     }
-                    crate::mxprobe::log_public(&format!("下载完成 {} 字节 -> {path_str}", bytes.len()));
+                };
+
+                let res = rt_dl.block_on(client_dl.download_stream_to_file(
+                    &url_dl,
+                    &path_dl,
+                    1_500_000, // 首段阈值 1.5MB（包含 ftyp/moov 与前几秒关键帧，通常只需 0.1~0.3 秒）
+                    move || {
+                        let _ = tx.send(true);
+                    },
+                ));
+
+                if let Err(e) = res {
+                    crate::mxprobe::log_public(&format!("[流式下载错误] {e}"));
                 }
-                Err(e) => {
-                    report_fail(&w_clone, format!("下载视频流失败: {e}"));
-                    return;
+            });
+
+            // 等待首批 1.5MB 就绪信号，放行起播
+            match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+                Ok(true) => {
+                    crate::mxprobe::log_public("首段数据缓冲完毕，即刻进入播放！");
+                }
+                _ => {
+                    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) < 300_000 {
+                        report_fail(&w_clone, "缓冲视频流超时，请检查网络".into());
+                        return;
+                    }
                 }
             }
         } else {
@@ -466,7 +492,7 @@ fn wait_surface() -> Option<*mut std::ffi::c_void> {
 
 fn stop_current() {
     if let Ok(mut cur) = CURRENT.lock() {
-        if let Some(d) = cur.take() {
+        if let Some(mut d) = cur.take() {
             d.stop();
         }
     }
