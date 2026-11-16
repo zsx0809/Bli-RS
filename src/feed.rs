@@ -272,6 +272,7 @@ pub fn load_feed(window: slint::Weak<AppWindow>, _fresh_idx: u32) {
 /// 与冷启动的区别：**保留现有列表**，把新拉到的内容插到顶部。
 /// 用户下拉时屏幕上本来就有内容，突然全白再慢慢长出来是最差的体验。
 pub fn refresh_feed(window: slint::Weak<AppWindow>) {
+    crate::mxprobe::log_public("[Feed] refresh_feed() 被调用（下拉刷新）");
     // 刷新从 fresh_idx = 0 重新开始，对应服务端的一批新推荐
     idx_store(0);
 
@@ -289,8 +290,10 @@ pub fn refresh_feed(window: slint::Weak<AppWindow>) {
 pub fn load_more(window: slint::Weak<AppWindow>) {
     // 正在加载就忽略（IN_FLIGHT 是进程级的，这里判断才有效）
     if IN_FLIGHT.load(Ordering::SeqCst) {
+        crate::mxprobe::log_public("[Feed] load_more() 被忽略：已有请求在飞");
         return;
     }
+    crate::mxprobe::log_public(&format!("[Feed] load_more() 发起，游标 {}", idx_load()));
 
     let _ = window.upgrade_in_event_loop(|w| {
         w.set_loading_more(true);
@@ -321,6 +324,7 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        crate::mxprobe::log_public("[Feed] 请求被忽略：已有请求在飞");
         return;
     }
 
