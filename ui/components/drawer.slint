@@ -455,17 +455,29 @@ export component NavigationDrawer inherits Rectangle {
                     border-radius: 12px;
                     background: root.auto_play ? Theme.primary : Theme.surface_variant;
 
-                    Rectangle {
-                        width: 18px;
-                        height: 18px;
-                        y: 3px;
-                        x: root.auto_play ? parent.width - self.width - 3px : 3px;
-                        border-radius: 9px;
-                        background: #ffffff;
+                    // 圆点位置用 HorizontalLayout 的 alignment 表达，
+                    // 不用 `x: parent.width - self.width - 3px`。
+                    //
+                    // 为什么改：那种写法依赖 parent.width，而 parent.width
+                    // 在首帧布局前是 0，于是 x 先被算成 -21px，animate 又从
+                    // 这个错误初值滑到正确位置 —— 截图里能看到白点飞到
+                    // 轨道外面。alignment 由布局器直接给最终位置，没有初值问题。
+                    HorizontalLayout {
+                        width: parent.width;
+                        height: parent.height;
+                        padding: 3px;
+                        alignment: root.auto_play ? end : start;
 
-                        animate x {
-                            duration: Theme.animation_duration_fast;
-                            easing: ease-out;
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+
+                            animate x {
+                                duration: Theme.animation_duration_fast;
+                                easing: ease-out;
+                            }
                         }
                     }
 

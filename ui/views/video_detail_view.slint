@@ -77,6 +77,8 @@ export component VideoDetailView inherits Rectangle {
     // 全部状态都在 Rust 侧（src/login.rs 的 post_comment）。
     // UI 只做：显示输入框 / 收集文本 / 转发提交动作。
     in property <bool> logged_in: false;
+    /// 软键盘高度（物理像素）。>0 时评论输入区要整体上浮到键盘之上。
+    in property <length> ime_height: 0px;
     in-out property <string> comment_text: "";
     in property <string> comment_status: "";
     in property <bool> comment_sending: false;
@@ -1331,12 +1333,16 @@ export component VideoDetailView inherits Rectangle {
                         }
                     }
 
-                    if root.logged_in : Rectangle {
-                        height: input_col.preferred-height;
-                        background: transparent;
-
-                        input_col := VerticalLayout {
-                            spacing: 6px;
+                    // 注意：这里不能用
+                    //   Rectangle { height: input_col.preferred-height;
+                    //               input_col := VerticalLayout {...} }
+                    // 父的 height 依赖子的 preferred-height，子的可用高度
+                    // 又受父约束 —— Slint 在这种循环下取值塌陷，
+                    // 实际表现是"回复提示条画出来了、输入框被压没"。
+                    // 直接把 VerticalLayout 放进来，让它自己撑开。
+                    if root.logged_in : VerticalLayout {
+                        spacing: 6px;
+                        alignment: start;
 
                             // 「回复 @某人」提示条
                             if root.reply_target != "" : Rectangle {
@@ -1432,7 +1438,6 @@ export component VideoDetailView inherits Rectangle {
                                 font-size: 11px;
                             }
                         }
-                    }
 
                     Rectangle { height: 10px; background: transparent; }
 
@@ -1778,6 +1783,72 @@ export component VideoDetailView inherits Rectangle {
     // ======================================================================
     // 实时诊断日志弹层浮窗 (Log Dialog Overlay)
     // ======================================================================
+    // ----------------------------------------------------------------------
+    // 浮动评论输入条（键盘弹出时使用）
+    //
+    // 为什么需要它：Slint 的 android 后端会弹起软键盘，但**不把 IME
+    // 高度告诉 .slint 层**。评论区里的行内输入框在列表顶部，键盘一弹
+    // 就被盖住 —— 用户看不见自己在打什么。
+    //
+    // 这里改成：键盘高度 > 0 时，在键盘正上方浮出一条输入栏。
+    // 它脱离列表布局、绝对定位，不受滚动影响。
+    // ----------------------------------------------------------------------
+    if root.logged_in && root.active_tab == 1 && root.ime_height > 0px && !root.is_fullscreen : Rectangle {
+        x: 0px;
+        y: root.height - root.ime_height - self.height;
+        width: 100%;
+        height: 54px;
+        background: Theme.surface_container;
+        border-top-width: 1px;
+        border-color: Theme.outline_variant;
+
+        TextInput {
+            x: Spacing.page_margin;
+            y: (parent.height - self.height) / 2;
+            width: parent.width - 96px;
+            height: 28px;
+            text <=> root.comment_text;
+            font-size: 14px;
+            color: Theme.on_surface;
+            single-line: true;
+        }
+
+        if root.comment_text == "" : Text {
+            x: Spacing.page_margin;
+            y: (parent.height - self.height) / 2;
+            text: "发一条友善的评论";
+            color: Theme.outline;
+            font-size: 14px;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            x: parent.width - self.width - Spacing.page_margin;
+            y: (parent.height - self.height) / 2;
+            width: 66px;
+            height: 30px;
+            border-radius: Theme.radius_full;
+            background: root.comment_sending
+                ? Theme.outline_variant
+                : Theme.primary;
+
+            Text {
+                text: root.comment_sending ? "发送中" : "发送";
+                color: Theme.on_primary;
+                font-size: 13px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            TouchArea {
+                enabled: !root.comment_sending && root.comment_text != "";
+                clicked => { root.comment_submit(); }
+            }
+        }
+    }
+
+
     if root.show_log_dialog : Rectangle {
         x: 0px;
         y: 0px;

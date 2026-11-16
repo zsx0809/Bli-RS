@@ -190,6 +190,109 @@ mod imp {
     }
 
     /// 获取系统状态栏物理像素高度
+    /// 当前软键盘（IME）占用的高度，单位物理像素。0 表示键盘没弹出。
+    ///
+    /// 为什么要自己取：Slint 的 android 后端会调 show_soft_input，
+    /// 但**不把 IME 高度暴露给 .slint 层**，所以布局完全不知道键盘
+    /// 占了屏幕下半部分 —— 输入框正好被压在键盘底下，用户看不见
+    /// 自己打的字。实测就是这个现象。
+    ///
+    /// API 选择：
+    ///   Android 11+ 用 WindowInsets.Type.ime()
+    ///   Android 10 及以下退化到 systemWindowInsetBottom 与
+    ///   displayFrame 高度差。minSdk 是 26，两条都要有。
+    pub fn ime_height_px() -> i32 {
+        with_env(|env, activity| {
+            let metrics = (|| -> Option<i32> {
+                let res = env
+                    .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let dm = env
+                    .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                env.get_field(&dm, "heightPixels", "I").ok()?.i().ok()
+            })()
+            .unwrap_or(2400);
+
+            // ---- 路径 A：API 30+ WindowInsets.Type.ime() ----
+            let modern = (|| -> Option<i32> {
+                let window = env
+                    .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let decor = env
+                    .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                // getRootWindowInsets() 可能返回 null（还没 attach 完）
+                let insets = env
+                    .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if insets.is_null() {
+                    return None;
+                }
+                // WindowInsets.Type.ime() = 8
+                let cls = env.find_class("android/view/WindowInsets$Type").ok()?;
+                let mask = env
+                    .call_static_method(&cls, "ime", "()I", &[])
+                    .ok()?
+                    .i()
+                    .ok()?;
+                let bottom = env
+                    .call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &[JValue::Int(mask)])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if bottom.is_null() {
+                    return None;
+                }
+                env.get_field(&bottom, "bottom", "I").ok()?.i().ok()
+            })();
+
+            if let Some(h) = modern {
+                return h.max(0);
+            }
+
+            // ---- 路径 B：旧 API，用可见区域高度差估算 ----
+            let visible = (|| -> Option<i32> {
+                let window = env
+                    .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let decor = env
+                    .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let rect = env.new_object("android/graphics/Rect", "()V", &[]).ok()?;
+                env.call_method(
+                    &decor,
+                    "getWindowVisibleDisplayFrame",
+                    "(Landroid/graphics/Rect;)V",
+                    &[JValue::Object(&rect)],
+                )
+                .ok()?;
+                let bottom = env.get_field(&rect, "bottom", "I").ok()?.i().ok()?;
+                Some(bottom)
+            })();
+
+            match visible {
+                Some(vis) => (metrics - vis).max(0),
+                None => 0,
+            }
+        })
+        .unwrap_or(0)
+    }
+
     pub fn status_bar_height_px() -> i32 {
         with_env(|env, activity| {
             let res = env
@@ -434,7 +537,7 @@ mod imp {
 }
 
 #[cfg(target_os = "android")]
-pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, files_dir, init, is_dark, java_vm, set_android_app, set_exclusion, set_translucent_window, status_bar_height_px};
+pub use imp::{activity_object, android_app, cache_dir, display_density, fetch_monet, files_dir, ime_height_px, init, is_dark, java_vm, set_android_app, set_exclusion, set_translucent_window, status_bar_height_px};
 
 /// 非 Android 平台（桌面调试）为空实现
 #[cfg(not(target_os = "android"))]
@@ -462,6 +565,11 @@ pub fn set_translucent_window() -> bool {
 
 #[cfg(not(target_os = "android"))]
 pub fn status_bar_height_px() -> i32 {
+    0
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn ime_height_px() -> i32 {
     0
 }
 
