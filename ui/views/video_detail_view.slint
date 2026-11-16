@@ -635,20 +635,13 @@ export component VideoDetailView inherits Rectangle {
         // （下面 controls_timer 的启动条件里已经算进去了），所以这行字
         // 和播放键一定同时可见。
         // ==================================================================
-        if root.awaiting_play : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: transparent;
-
-            Text {
-                x: 12px;
-                y: parent.height - 78px;
-                text: "点击下方播放键开始播放";
-                color: #ffffffcc;
-                font-size: 12px;
-                vertical-alignment: center;
-            }
-        }
+        // 什么都不画。
+        //
+        // 这里原本有一行"点击下方播放键开始播放"。去掉中央大播放键之后
+        // 再留一行字解释"播放键在哪"，等于把用户当傻子 ——
+        // 控制条上那个三角明摆着就是播放键，不存在看不懂的可能。
+        //
+        // 起播入口仍然保留两条（点画面 / 点控制条播放键），只是不再提示。
 
         // ==================================================================
         // 浮层控制条 —— 极简风格（参考 PiliPlus / B 站客户端）
@@ -927,7 +920,12 @@ export component VideoDetailView inherits Rectangle {
             // 文案直接显示当前档位（"自动" / "1080P" / "720P"），
             // 而不是一个抽象图标 —— 用户点它之前就想知道现在是什么清晰度。
             quality_btn := GestureArea {
-                x: parent.width - self.width - 12px;
+                // 从右边缘让开一段距离。
+                //
+                // 为什么不是 -12px：屏幕右侧有一条系统手势区（返回手势），
+                // 贴边放的按钮有一大半落在那个区域里，点十次中一次。
+                // 让开 56px 之后整个按钮都在安全区内。
+                x: parent.width - self.width - 56px;
                 y: parent.height - 60px;
                 width: q_label.width + 20px;
                 height: 24px;

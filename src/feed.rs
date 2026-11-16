@@ -290,6 +290,16 @@ pub fn load_feed(window: slint::Weak<AppWindow>, _fresh_idx: u32) {
 /// 用户下拉时屏幕上本来就有内容，突然全白再慢慢长出来是最差的体验。
 pub fn refresh_feed(window: slint::Weak<AppWindow>) {
     crate::mxprobe::log_public("[Feed] refresh_feed() 被调用（下拉刷新）");
+
+    // 刷新时把游标归零，同时**清空去重表**。
+    //
+    // 不清会怎样：去重表里攒着前几十个 bvid，刷新拉回来的新一批里
+    // 只要有过见过的就全被丢掉 —— 用户看到的就是"下拉刷新只多一个视频"。
+    // 去重只在**同一次连续翻页**内有意义，刷新是新会话，必须重新计数。
+    if let Ok(mut g) = SEEN_BVIDS.lock() {
+        g.get_or_insert_with(HashSet::new).clear();
+    }
+
     // 刷新从 fresh_idx = 0 重新开始，对应服务端的一批新推荐
     idx_store(0);
 
@@ -369,7 +379,7 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
         // App 端 /x/v2/feed/index 走推荐引擎，idx 每推进一次就是一批
         // 全新内容。PiliPlus 默认也用这个（RcmdSource.app）。
         let result = rt.block_on(async {
-            let client = bli_protocol::BiliClient::new().map_err(|e| e.to_string())?;
+            let client = crate::client().ok_or_else(|| "初始化网络失败".to_string())?;
             client
                 .recommend_feed_app(fresh_idx)
                 .await
@@ -401,6 +411,7 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
                         Err(e) => e.into_inner(),
                     };
                     let seen = guard.get_or_insert_with(HashSet::new);
+
                     for it in page.items {
                         if seen.insert(it.bvid.clone()) {
                             fresh.push(it);

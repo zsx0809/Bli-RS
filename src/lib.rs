@@ -16,6 +16,45 @@ pub mod login;
 
 slint::include_modules!();
 
+// ==============================================================================
+// 全局 BiliClient
+//
+// ★ 这里曾经有一个贯穿全 App 的 bug：每个模块各建一个 BiliClient。
+//
+//   `BiliClient::new()` 会自己生成一个 buvid、自己持有一份 auth。
+//   登录时 login::restore() 只把 Auth 装进了 **它自己那个** client，
+//   其余三个（feed / player / 手动起播）拿到的是全新实例 —— 全是游客。
+//
+//   最刺眼的后果：明明登录了，playurl 只给 360P/480P。
+//   原因是请求根本没带 SESSDATA，服务端按游客下发清晰度。
+//   而且这个 bug 完全无感 —— 不报错、不降级提示，就是档位莫名其妙少。
+//
+//   现在全 App 共用一个实例，登录态、buvid、WBI 密钥缓存全部一处生效。
+//   新代码里**不要再 new**，一律 client()。
+// ==============================================================================
+static GLOBAL_CLIENT: std::sync::OnceLock<bli_protocol::BiliClient> =
+    std::sync::OnceLock::new();
+
+/// 取全局 client。第一次调用时创建。
+///
+/// 返回 Option 而不是 panic：创建失败（极罕见，基本只有 TLS 初始化失败）
+/// 时调用方可以走各自的降级路径，而不是让整个 App 崩掉。
+pub fn client() -> Option<bli_protocol::BiliClient> {
+    if let Some(c) = GLOBAL_CLIENT.get() {
+        return Some(c.clone());
+    }
+    match bli_protocol::BiliClient::new() {
+        Ok(c) => {
+            let _ = GLOBAL_CLIENT.set(c);
+            GLOBAL_CLIENT.get().cloned()
+        }
+        Err(e) => {
+            eprintln!("[Client] 创建全局 client 失败: {e}");
+            None
+        }
+    }
+}
+
 pub fn create_app() -> Result<AppWindow, slint::PlatformError> {
     AppWindow::new()
 }
@@ -443,9 +482,7 @@ fn android_main(app: slint::android::AndroidApp) {
     // 换登录态时 set_auth 会同时清掉 WBI 密钥缓存 —— 游客的 key
     // 拿去签登录态请求会被判 -352。
     // ------------------------------------------------------------------------
-    let login_client = bli_protocol::BiliClient::new()
-        .map_err(|e| eprintln!("[Login] 创建 client 失败: {e}"))
-        .ok();
+    let login_client = client();
 
     // 登记全局窗口弱引用：后台线程（登录轮询、评论回填）要用它写 UI
     login::set_window(main_window.as_weak());

@@ -82,6 +82,17 @@ pub fn restore(client: bli_protocol::BiliClient) {
         a.mid
     ));
 
+    // ★ 先把 cookie 装进 client，再去网络校验。
+    //
+    // 原来只在 fetch_nav 成功之后才 set_auth —— 那意味着启动后
+    // 的头 1~2 秒里所有请求都是**游客身份**。用户如果在这个窗口内
+    // 点进视频，playurl 就按游客下发，清晰度只有 360P/480P。
+    //
+    // 现在先装上：cookie 万一已失效，fetch_nav 会失败并把它清掉，
+    // 代价只是这一次请求白带了 cookie，不影响正确性。
+    client.set_auth(Some(a.clone()));
+
+    let client_for_check = client.clone();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -106,11 +117,14 @@ pub fn restore(client: bli_protocol::BiliClient) {
                         "[Login] 登录态有效: {} (LV{}) —— 回填 UI",
                         a.uname, a.level
                     ));
-                    persist_and_apply(a, client);
+                    persist_and_apply(a, client_for_check);
                 }
                 Err(e) => {
                     crate::mxprobe::log_public(&format!("[Login] 登录态已失效（{e}），清除"));
                     crate::settings::remove(KEY_COOKIE);
+                    // 校验失败要把刚装进去的坏 cookie 摘掉，
+                    // 否则后续请求会一直被风控额外关注
+                    client_for_check.set_auth(None);
                 }
             }
         });

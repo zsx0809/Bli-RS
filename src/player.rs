@@ -328,10 +328,12 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             }
         };
 
-        let client = match bli_protocol::BiliClient::new() {
-            Ok(c) => c,
-            Err(e) => {
-                report_fail(&w_clone, format!("初始化网络失败: {e}"));
+        // 用全局 client —— 它身上带着登录态。
+        // 自己 new 一个就是游客身份，playurl 只会给 360P/480P。
+        let client = match crate::client() {
+            Some(c) => c,
+            None => {
+                report_fail(&w_clone, "初始化网络失败".into());
                 return;
             }
         };
@@ -581,11 +583,16 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         //
         // 优先级：
         //   1. 用户手动指定了 id 且该档位可用 → 用它
-        //   2. 否则自动：默认上限 720P
+        //   2. 否则自动：**该账号能拿到的最高档**（受 max_height 兜底）
         //
-        // 为什么自动档上限是 720P 而不是最高：
-        //   移动端 1080P60 单集动辄 200MB+，起播要等很久，流量也扛不住。
-        //   用户想要更高自己点清晰度菜单，这个决定权交出去。
+        // 自动档的取舍：
+        //   早先写死上限 720P，理由是"1080P60 单集 200MB+，起播慢"。
+        //   但这个上限现在是错的 —— 用户登录了，能拿到 1080P，
+        //   直接砍到 720P 等于白登录。改成取可用的最高档，
+        //   用户嫌慢就自己去清晰度菜单调低。
+        //
+        //   4K/8K 只在账号有对应权限时才会出现在轨道列表里，
+        //   所以"取最高"不会把无权限的用户顶到播不了的档位。
         let desired = DESIRED_QN.load(Ordering::SeqCst);
 
         // 先把候选档位存起来给 UI（无论最后选了哪个）
@@ -606,10 +613,13 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         }
 
         let picked = if desired > 0 {
+            // 指定档位不可用（比如账号没权限）→ 退回自动，别黑屏
             info.pick_video_by_id(desired)
-                .or_else(|| info.pick_video(Some(720)))
+                .or_else(|| info.pick_video(Some(1080)))
         } else {
-            info.pick_video(Some(720))
+            // 自动：优先 1080P（覆盖绝大多数场景且体积可控），
+            // 没有 1080P 就退到可用的最高档
+            info.pick_video(Some(1080))
         };
 
         let Some(vtrack) = picked else {
@@ -2284,10 +2294,10 @@ fn start_pending(window: slint::Weak<AppWindow>) {
         w.set_current_detail(d);
     });
 
-    let client = match bli_protocol::BiliClient::new() {
-        Ok(c) => c,
-        Err(e) => {
-            report_fail(&window, format!("初始化网络失败: {e}"));
+    let client = match crate::client() {
+        Some(c) => c,
+        None => {
+            report_fail(&window, "初始化网络失败".into());
             return;
         }
     };
