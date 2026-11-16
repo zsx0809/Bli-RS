@@ -1489,6 +1489,25 @@ pub fn set_fullscreen(on: bool) {
 
     crate::mxprobe::log_public(&format!("[Fullscreen] -> {on} (video {vw}x{vh})"));
     crate::video_surface::set_fullscreen_surface(on, vw, vh);
+
+    // 退出全屏后必须等屏幕真正转回竖屏，再落一遍几何。
+    //
+    // 为什么不能只靠 set_fullscreen_surface：
+    //   那次调用发生在点击瞬间，屏幕还是横的，getDisplayMetrics 给的
+    //   是横屏尺寸。虽然几何算法已经归一化成短边基准（不会再算错），
+    //   但 View 系统那一刻仍按横屏布局，Surface buffer 有可能被那次
+    //   布局拉回横屏尺寸。
+    //
+    // 打两次：方向切换实测 200~300ms，400ms 覆盖大多数情况；
+    // 900ms 那次兜住旋转动画拖长/系统排队的情况。两次都是幂等的。
+    if !on {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            crate::video_surface::reapply_portrait_layout();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::video_surface::reapply_portrait_layout();
+        });
+    }
 }
 
 /// 相对跳转（秒）。

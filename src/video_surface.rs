@@ -33,6 +33,7 @@ mod imp {
     use jni::objects::{GlobalRef, JObject, JValue};
     use jni::JavaVM;
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use crate::android_window;
@@ -414,6 +415,139 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
 
     static LAST_LAYOUT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
+    /// 当前是否全屏。视频分辨率后到（set_video_size）时要用它决定走哪套几何。
+    static CUR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+    /// 当前视频是否竖屏。
+    static CUR_VERTICAL: AtomicBool = AtomicBool::new(false);
+    /// 当前视频分辨率，旋转后重算几何时要用。
+    static CUR_VIDEO: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+    /// 取当前屏幕物理尺寸与密度。**返回值与旋转方向无关** ——
+    /// 返回 (短边, 长边, density)，调用方永远拿竖屏基准去算。
+    fn screen_metrics(env: &mut jni::JNIEnv<'_>, activity: &JObject<'_>) -> (i32, i32, f32) {
+        let got = (|| -> Option<(i32, i32, f32)> {
+            let res = env
+                .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let dm = env
+                .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            Some((
+                env.get_field(&dm, "widthPixels", "I").ok()?.i().ok()?,
+                env.get_field(&dm, "heightPixels", "I").ok()?.i().ok()?,
+                env.get_field(&dm, "density", "F").ok()?.f().unwrap_or(2.0),
+            ))
+        })();
+        let (w, h, d) = got.unwrap_or((1080, 2400, 2.0));
+        (w.min(h), w.max(h), d)
+    }
+
+    /// 竖屏基准的播放区高度（物理像素）。
+    ///
+    /// 必须用「短边」当竖屏宽度、用「长边」当竖屏高度，**不能**直接读
+    /// widthPixels / heightPixels —— 调用这些函数（进入/退出全屏）的时刻，
+    /// 屏幕**还没转过去**，getDisplayMetrics 给的仍是上一方向的尺寸。
+    ///
+    /// 上一版的 bug 就在这：
+    ///   退出全屏时读到 widthPixels = 2772（横屏宽），
+    ///   算出 height = 2772 * 9/16 = 1559px。
+    ///   但竖屏下屏幕宽度只有 1240px，于是视频层变成 1240x1559 ——
+    ///   比 Slint 的播放区（697px）高一倍多，下半截被不透明 UI 盖住，
+    ///   用户看到的就是「退出全屏了，但画面还是全屏那么大」。
+    ///
+    /// 短边归一化之后，结果与调用时刻的旋转状态完全无关。
+    fn portrait_target_h(short: i32, long: i32, density: f32, is_vertical: bool) -> i32 {
+        if is_vertical {
+            let avail_h = (long - crate::android_window::status_bar_height_px()).max(0);
+            let min_h = (220.0 * density) as i32;
+            let max_h = (380.0 * density) as i32;
+            ((avail_h as f32 * 0.45) as i32).clamp(min_h, max_h)
+        } else {
+            // 与 Slint 的 root.width * 9 / 16 对齐
+            (short as f32 * 9.0 / 16.0) as i32
+        }
+    }
+
+    /// 旋转落定之后，用**新鲜**的 DisplayMetrics 重新落一遍竖屏几何。
+    ///
+    /// 为什么必须有这一步：
+    ///   退出全屏的瞬间屏幕还是横的，我们只能算出"目标竖屏尺寸"，
+    ///   但 View 系统那一刻仍按横屏布局。等系统完成旋转、窗口重新
+    ///   测量布局后，SurfaceView 的 buffer 有可能被那次布局拉回
+    ///   横屏尺寸（match_parent 宽度 + 旧高度缓存）。
+    ///   延迟一次重算能把最终状态钉死在竖屏几何上。
+    ///
+    /// 只改 LayoutParams + setSizeFromLayout，**不碰 setFixedSize**：
+    /// 让 buffer 跟着 View 走，避免在旋转过程中显式改 buffer 尺寸
+    /// 触发一次多余的重配。
+    pub fn reapply_portrait_geometry() {
+        if CUR_FULLSCREEN.load(Ordering::SeqCst) {
+            return; // 已经又进全屏了，别覆盖全屏几何
+        }
+        let Some(vm) = android_window::java_vm() else {
+            return;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return;
+        };
+        let Some(sv) = SURFACE_VIEW.get() else {
+            return;
+        };
+        let Some(activity) = android_window::activity_object() else {
+            return;
+        };
+
+        let (short, long, density) = screen_metrics(&mut env, &activity);
+        let is_video_vertical = CUR_VIDEO
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|(w, h)| h > w)
+            .unwrap_or(CUR_VERTICAL.load(Ordering::SeqCst));
+
+        let h = portrait_target_h(short, long, density, is_video_vertical);
+        let top = crate::android_window::status_bar_height_px();
+
+        let Ok(lp) = env.new_object(
+            "android/widget/FrameLayout$LayoutParams",
+            "(II)V",
+            &[JValue::Int(-1), JValue::Int(h)],
+        ) else {
+            return;
+        };
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top));
+        let _ = env.call_method(
+            sv.as_obj(),
+            "setLayoutParams",
+            "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&lp)],
+        );
+
+        if let Ok(holder) = env
+            .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
+            .and_then(|v| v.l())
+        {
+            let _ = env.call_method(&holder, "setSizeFromLayout", "()V", &[]);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+        }
+
+        // 去重缓存同步成新值，防止下一次 update_layout 因"尺寸相同"而跳过
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            *lock = Some((h, top));
+        }
+
+        crate::mxprobe::log_public(&format!(
+            "[Surface] 旋转后重落竖屏几何 -> 宽=match_parent x 高={h}, top={top}, short={short}, long={long}"
+        ));
+    }
+
     /// 全屏切换：按屏幕物理尺寸重设 LayoutParams，并保持视频宽高比。
     ///
     /// `video_w` / `video_h` 是视频自身的分辨率。传 0 表示未知，
@@ -440,32 +574,16 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             return;
         };
 
-        // 取屏幕真实物理尺寸
-        let (width_px, height_px) = (|| -> Option<(i32, i32)> {
-            let res = env
-                .call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let dm = env
-                .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            Some((
-                env.get_field(&dm, "widthPixels", "I").ok()?.i().ok()?,
-                env.get_field(&dm, "heightPixels", "I").ok()?.i().ok()?,
-            ))
-        })()
-        .unwrap_or((1080, 2400));
+        // 取屏幕真实物理尺寸 —— 归一化成竖屏基准 (短边, 长边, density)
+        let (short, long, density) = screen_metrics(&mut env, &activity);
+        CUR_FULLSCREEN.store(fullscreen, Ordering::SeqCst);
+        if video_w > 0 && video_h > 0 {
+            if let Ok(mut g) = CUR_VIDEO.lock() {
+                *g = Some((video_w, video_h));
+            }
+            CUR_VERTICAL.store(video_h > video_w, Ordering::SeqCst);
+        }
 
-        // 全屏时用 MATCH_PARENT 的宽高，让系统按实际方向布局。
-        //
-        // 为什么不用 height_px：调用此刻屏幕还没转过去，
-        // getDisplayMetrics 给的还是竖屏的尺寸（宽<高）。若直接拿它设
-        // 高度，旋转后视频高度会是错的（比如 2400 而屏幕现在是 1240 高）。
-        // 交给 MATCH_PARENT(-1) 由 View 系统自己跟随窗口尺寸，
-        // 旋转完成后自动铺满，不需要我们再算一次。
         // 全屏时按**视频自身宽高比**算居中矩形，而不是 MATCH_PARENT。
         //
         // 为什么不能直接用 MATCH_PARENT：
@@ -490,11 +608,15 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             0.0
         };
 
+        // 竖屏基准：短边 = 竖屏宽度，长边 = 竖屏高度。
+        // 与调用时刻的旋转方向无关，这是「退出全屏后尺寸还按横屏算」的根治。
+        let is_vertical_video = video_h > video_w;
+
         let (w, h, top, gravity) = if fullscreen {
             if video_ar > 0.0 {
                 // 横屏全屏：宽高取屏幕的较长边/较短边
-                let sw = width_px.max(height_px) as f32;
-                let sh = width_px.min(height_px) as f32;
+                let sw = long as f32;
+                let sh = short as f32;
                 let screen_ar = sw / sh;
 
                 let (dw, dh) = if video_ar > screen_ar {
@@ -516,27 +638,21 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
                 (-1, -1, 0, GRAVITY_CENTER)
             }
         } else {
-            // 退出全屏：恢复成 16:9 + 状态栏下移
+            // 退出全屏：回到竖屏布局。
+            //
+            // 宽度给 MATCH_PARENT —— 竖屏宽度由 View 系统跟随窗口，
+            // 我们只钉高度，避免又一次拿错方向的宽度算错比例。
             (
                 -1,
-                (width_px as f32 * 9.0 / 16.0) as i32,
+                portrait_target_h(short, long, density, is_vertical_video),
                 crate::android_window::status_bar_height_px(),
                 GRAVITY_TOP,
             )
         };
 
-        // 退出全屏时清掉 setFixedSize，否则会一直钉在横屏尺寸上
-        if !fullscreen {
-            if let Ok(holder) = env
-                .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
-                .and_then(|v| v.l())
-            {
-                let _ = env.call_method(&holder, "setSizeFromLayout", "()V", &[]);
-                if env.exception_check().unwrap_or(false) {
-                    let _ = env.exception_clear();
-                }
-            }
-        }
+        // 退出全屏时 buffer 尺寸由 setLayoutParams 之后那次
+        // setSizeFromLayout 决定（见下面），这里不再提前调 ——
+        // 提前调只会读到尚未更新的旧布局。
 
         // 清掉去重缓存，确保这次一定真的写下去
         if let Ok(mut lock) = LAST_LAYOUT.lock() {
@@ -569,7 +685,14 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         //   ANativeWindow 尺寸与我们算的 letterbox 完全一致 ——
         //   否则会出现"View 是 2201 宽、实际 buffer 还是别的尺寸"
         //   导致画面在 View 内被二次缩放，看起来就是画面偏小、黑边偏窄。
-        if w > 0 && h > 0 {
+        //
+        // 只在**全屏**时钉：
+        //   全屏是固定像素的 letterbox，钉死最稳。
+        //   退出全屏走 setSizeFromLayout（放在 setLayoutParams 之后），
+        //   让 buffer 按新布局自己算 —— 顺序很关键，上一版把
+        //   setSizeFromLayout 写在 setLayoutParams **之前**，
+        //   它读到的还是横屏那份布局，于是 buffer 停在横屏尺寸不动。
+        if fullscreen && w > 0 && h > 0 {
             if let Ok(holder) = env
                 .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
                 .and_then(|v| v.l())
@@ -580,6 +703,28 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
                     "(II)V",
                     &[JValue::Int(w), JValue::Int(h)],
                 );
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
+        }
+
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            *lock = Some((h, top));
+        }
+
+        // 退出全屏：**布局写完之后**再让 buffer 跟随布局。
+        //
+        // 顺序是这次修复的关键。上一版把 setSizeFromLayout 放在
+        // setLayoutParams 之前，它读到的是还没更新的旧布局（横屏那份），
+        // 于是 buffer 停在横屏尺寸 —— 屏幕转了、View 也改了，但实际
+        // 送显的 buffer 还是横屏那么大，视觉上就是"退出全屏了画面还那么大"。
+        if !fullscreen {
+            if let Ok(holder) = env
+                .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
+                .and_then(|v| v.l())
+            {
+                let _ = env.call_method(&holder, "setSizeFromLayout", "()V", &[]);
                 if env.exception_check().unwrap_or(false) {
                     let _ = env.exception_clear();
                 }
@@ -771,35 +916,31 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             return;
         };
 
-        // 从 Activity 获取真实 DisplayMetrics 物理像素
-        let Ok(resources) = env
-            .call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[])
-            .and_then(|v| v.l())
-        else {
+        // 全屏期间绝不能被自适应布局覆盖：全屏是人算出来的 letterbox 像素，
+        // 自适应是竖屏 16:9 / 45%。详情页数据异步回来时会调一次
+        // set_adaptive_layout，若此时正在全屏，就会把全屏几何打回竖屏 ——
+        // 表现是"全屏了，但视频缩回上半屏"。
+        if CUR_FULLSCREEN.load(Ordering::SeqCst) {
+            crate::mxprobe::log_public("[Surface] 全屏中，忽略自适应布局");
             return;
-        };
-        let Ok(dm) = env
-            .call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
-            .and_then(|v| v.l())
-        else {
-            return;
-        };
+        }
 
-        let width_px = env.get_field(&dm, "widthPixels", "I").map(|v| v.i().unwrap_or(1080)).unwrap_or(1080);
-        let height_px = env.get_field(&dm, "heightPixels", "I").map(|v| v.i().unwrap_or(2400)).unwrap_or(2400);
-        let density = env.get_field(&dm, "density", "F").map(|v| v.f().unwrap_or(2.0)).unwrap_or(2.0);
+        CUR_VERTICAL.store(is_vertical, Ordering::SeqCst);
+        if let Ok(mut g) = CUR_VIDEO.lock() {
+            if g.is_none() {
+                // 还不知道真实分辨率时，按"横屏视频"占位，与原先行为一致
+                let (w, h) = if is_vertical { (480, 852) } else { (852, 480) };
+                *g = Some((w, h));
+            }
+        }
+
+        // 用短边基准，避免拿到还没转过来的方向
+        let (short, long, density) = screen_metrics(&mut env, &activity);
         // 播放区上沿 = 状态栏。与 Slint 的 safe_top 对齐（浮层与视频同区域）。
         let top_px = crate::android_window::status_bar_height_px();
 
         // 竖屏与横屏尺寸与 Slint DSL 保持严格对齐，且留出顶部状态栏与控制条空间
-        let target_h = if is_vertical {
-            let avail_h = (height_px - top_px).max(0);
-            let min_h = (220.0 * density) as i32;
-            let max_h = (380.0 * density) as i32;
-            ((avail_h as f32 * 0.45) as i32).clamp(min_h, max_h)
-        } else {
-            (width_px as f32 * 9.0 / 16.0) as i32
-        };
+        let target_h = portrait_target_h(short, long, density, is_vertical);
 
         let Ok(lp) = env.new_object(
             "android/widget/FrameLayout$LayoutParams",
@@ -818,6 +959,25 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             "(Landroid/view/ViewGroup$LayoutParams;)V",
             &[JValue::Object(&lp)],
         );
+
+        // buffer 跟随新布局：详情页从横屏返回竖屏时，这里是兜底
+        if let Ok(holder) = env
+            .call_method(sv.as_obj(), "getHolder", "()Landroid/view/SurfaceHolder;", &[])
+            .and_then(|v| v.l())
+        {
+            let _ = env.call_method(&holder, "setSizeFromLayout", "()V", &[]);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+        }
+
+        if let Ok(mut lock) = LAST_LAYOUT.lock() {
+            *lock = Some((target_h, top_px));
+        }
+
+        crate::mxprobe::log_public(&format!(
+            "[Surface] 自适应布局 -> 高={target_h}, top={top_px}, 竖屏视频={is_vertical}, short={short}, long={long}"
+        ));
     }
 }
 
@@ -939,6 +1099,17 @@ pub fn force_reattach_surface() {
     run_on_ui_thread(|| {
         #[cfg(target_os = "android")]
         imp::force_reattach();
+    });
+}
+
+/// 旋转落定后重落一遍竖屏几何。
+///
+/// 调用点：UI 侧全屏状态从 true 变 false 之后延迟 ~350ms 调一次。
+/// 那时刻屏幕已经真的转回竖屏，DisplayMetrics 才是可信的。
+pub fn reapply_portrait_layout() {
+    run_on_ui_thread(|| {
+        #[cfg(target_os = "android")]
+        imp::reapply_portrait_geometry();
     });
 }
 
