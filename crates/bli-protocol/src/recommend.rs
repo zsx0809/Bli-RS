@@ -50,6 +50,13 @@ pub struct RecommendPage {
     /// 被过滤掉的条目数（广告/直播/番剧）。
     /// 保留这个数字是为了调试：如果它异常大，说明接口形态变了。
     pub filtered_out: usize,
+    /// 服务端这一页**原始**返回了多少条（过滤前）。
+    ///
+    /// 翻页判断必须用它，不能用 `items.len()`：
+    /// 推荐流一页 20 条里常常有一半是直播/广告，过滤完可能只剩 5 条。
+    /// 早先用过滤后的条数判断"拿不满 20 条就是到底了"，于是第一页
+    /// 之后就再也不翻页 —— 表现就是首页只有十来个视频、下拉没反应。
+    pub raw_count: usize,
 }
 
 impl BiliClient {
@@ -81,7 +88,8 @@ impl BiliClient {
             .as_array()
             .ok_or_else(|| Error::Decode("推荐流响应缺少 data.item 数组".into()))?;
 
-        let mut items = Vec::with_capacity(raw_items.len());
+        let raw_count = raw_items.len();
+        let mut items = Vec::with_capacity(raw_count);
         let mut filtered_out = 0usize;
 
         for raw in raw_items {
@@ -97,7 +105,11 @@ impl BiliClient {
             }
         }
 
-        Ok(RecommendPage { items, filtered_out })
+        Ok(RecommendPage {
+            items,
+            filtered_out,
+            raw_count,
+        })
     }
 }
 

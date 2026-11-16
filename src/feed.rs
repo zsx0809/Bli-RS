@@ -91,6 +91,25 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
+/// 从 UI 侧的 VideoItemData 反推可序列化的 VideoItem。
+///
+/// 只在写首页缓存时用。数值字段（aid/cid/duration 秒）在 UI 侧已经被
+/// 格式化成字符串了，这里无处可还原，所以留默认值 —— 缓存只用于
+/// **渲染卡片**，打开视频时一律重新请求详情，不依赖这些数字。
+fn row_to_item(v: &VideoItemData) -> bli_protocol::recommend::VideoItem {
+    bli_protocol::recommend::VideoItem {
+        aid: 0,
+        bvid: v.id.to_string(),
+        cid: 0,
+        title: v.title.to_string(),
+        author: v.author.to_string(),
+        cover_url: v.cover_url.to_string(),
+        duration: 0,
+        view_text: v.views.to_string(),
+        danmaku_text: v.danmaku.to_string(),
+    }
+}
+
 /// 把扁平列表两两配对成行。
 fn pair_rows(items: Vec<VideoItemData>) -> Vec<VideoRowPair> {
     let mut rows = Vec::with_capacity(items.len().div_ceil(2));
@@ -333,7 +352,17 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
 
         match result {
             Ok(page) => {
-                let count = page.items.len();
+                // 翻页判据必须用**过滤前**的原始条数。
+                // 用过滤后的 items.len() 会让"这一页广告很多"被误解成"到底了"，
+                // 于是推荐流永远只有一页。见 RecommendPage::raw_count 的注释。
+                let count = page.raw_count;
+                if page.filtered_out > 0 {
+                    crate::mxprobe::log_public(&format!(
+                        "[Feed] fresh_idx={fresh_idx} 原始 {count} 条，过滤掉 {} 条，保留 {} 条",
+                        page.filtered_out,
+                        page.items.len()
+                    ));
+                }
 
                 // 跨页去重：推荐流偶尔会把同一个视频重复推回来
                 let mut fresh: Vec<bli_protocol::recommend::VideoItem> = Vec::new();
@@ -360,7 +389,6 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
                     .collect();
 
                 let raws: Vec<RawItem> = fresh.iter().map(to_raw).collect();
-                let items_for_cache = fresh.clone();
 
                 let _ = weak.upgrade_in_event_loop(move |w| {
                     let new_items: Vec<VideoItemData> =
@@ -417,29 +445,43 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
                         }
                     }
 
+                    // 写盘要用，先拷一份扁平列表再 move
+                    let cache_snapshot: Vec<bli_protocol::recommend::VideoItem> = all
+                        .iter()
+                        .flat_map(|row| {
+                            let mut v = vec![row_to_item(&row.left)];
+                            if row.has_right {
+                                v.push(row_to_item(&row.right));
+                            }
+                            v
+                        })
+                        .collect();
+
                     let model = Rc::new(VecModel::from(all));
                     w.set_rows(ModelRc::from(model.clone()));
                     MODEL.with(|m| *m.borrow_mut() = Some(model));
                     ensure_cover_pump();
 
-                    // 一页 20 条，拿不满说明到底了
+                    // 一页 20 条：拿满了说明后面还有，拿不满说明到底了。
+                    // 用 raw_count（过滤前），不是过滤后的条数。
                     w.set_has_more(count >= 20);
                     w.set_loading_more(false);
                     w.set_g_refreshing(false);
                     w.set_g_pull(Default::default());
-                    if !quiet || mode != Mode::Refresh {
-                        w.set_feed_state(2);
-                    } else {
-                        w.set_feed_state(2);
-                    }
+                    w.set_feed_state(2);
                     w.set_feed_error(Default::default());
 
                     spawn_batched_loader(covers);
+
+                    // 整份列表写盘（不是只写本页）。
+                    //
+                    // 为什么要按合并后的完整列表写：缓存的作用是让下次
+                    // 冷启动直接看到"上次关掉时的那屏内容"。只写本页的话，
+                    // 翻到第 5 页关掉，下次打开只剩第 5 页那 20 条，比原来还少。
+                    cache_write(&cache_snapshot);
                 });
 
-                // 列表写盘。存的是**本页原始条目**而不是去重后的，
-                // 保证下次启动看到的和这次一样多。
-                cache_write(&items_for_cache);
+
             }
             Err(e) => {
                 log::warn!("推荐流加载失败: {e}");
