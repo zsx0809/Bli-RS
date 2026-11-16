@@ -1880,6 +1880,10 @@ export component VideoDetailView inherits Rectangle {
                 height: 32px;
                 background: transparent;
 
+                // 「关闭」二字的宽度，供发送按钮定位用。
+                // 13px 字号两个字约 26px，给个常量比动态测量省事。
+                property <length> close_w: 26px;
+
                 Text {
                     x: 0px;
                     y: (parent.height - self.height) / 2;
@@ -1891,6 +1895,7 @@ export component VideoDetailView inherits Rectangle {
                     font-weight: 700;
                 }
 
+                // 关闭：最右
                 Text {
                     x: parent.width - self.width;
                     y: (parent.height - self.height) / 2;
@@ -1907,6 +1912,39 @@ export component VideoDetailView inherits Rectangle {
                         }
                     }
                 }
+
+                // 发送：放在「关闭」左边，而不是面板右下角。
+                //
+                // 为什么挪上来：发送按钮原本在面板底部，键盘弹出后
+                // 面板底部正好被键盘盖住 —— 用户点不到发送，只能先
+                // 收键盘再点，很别扭。挪到标题行右上角和"关闭"并排，
+                // 键盘弹不弹都在视野里。
+                Rectangle {
+                    x: parent.width - close_w - self.width - 14px;
+                    y: (parent.height - self.height) / 2;
+                    width: 64px;
+                    height: 28px;
+                    border-radius: Theme.radius_full;
+                    background: root.comment_sending
+                        ? Theme.outline_variant
+                        : (header_send_touch.pressed
+                            ? Theme.primary.transparentize(20%)
+                            : Theme.primary);
+
+                    Text {
+                        text: root.comment_sending ? "发送中" : "发送";
+                        color: Theme.on_primary;
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    header_send_touch := TouchArea {
+                        enabled: !root.comment_sending && root.comment_text != "";
+                        clicked => { root.comment_submit(); }
+                    }
+                }
             }
 
             input_box := Rectangle {
@@ -1915,7 +1953,7 @@ export component VideoDetailView inherits Rectangle {
                 width: parent.width - panel.pad * 2;
                 // 撑满「标题下方 → 底部按钮上方」的全部空间。
                 // 面板本来就是半屏，输入区就有一大片，不用再点一次放大。
-                height: Math.max(120px, panel.height - self.y - 68px);
+                height: Math.max(120px, panel.height - self.y - 50px);
                 border-radius: Theme.radius_sm;
                 background: Theme.surface_variant;
 
@@ -1953,47 +1991,17 @@ export component VideoDetailView inherits Rectangle {
                 }
             }
 
-            footer := Rectangle {
+            // 底部只留状态提示。
+            // 发送按钮已经挪到标题行（见 header），这里不再放按钮 ——
+            // 面板底部正好被键盘盖住，按钮放这里点不到。
+            status_line := Text {
                 x: panel.pad;
-                y: panel.height - 56px;
+                y: panel.height - 36px;
                 width: parent.width - panel.pad * 2;
-                height: 44px;
-                background: transparent;
-
-                Text {
-                    x: 0px;
-                    y: (parent.height - self.height) / 2;
-                    text: root.comment_status;
-                    color: Theme.on_surface_variant;
-                    font-size: 11px;
-                }
-
-                Rectangle {
-                    x: parent.width - self.width;
-                    y: (parent.height - self.height) / 2;
-                    width: 76px;
-                    height: 34px;
-                    border-radius: Theme.radius_full;
-                    background: root.comment_sending
-                        ? Theme.outline_variant
-                        : (panel_send_touch.pressed
-                            ? Theme.primary.transparentize(20%)
-                            : Theme.primary);
-
-                    Text {
-                        text: root.comment_sending ? "发送中" : "发送";
-                        color: Theme.on_primary;
-                        font-size: 13px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    panel_send_touch := TouchArea {
-                        enabled: !root.comment_sending && root.comment_text != "";
-                        clicked => { root.comment_submit(); }
-                    }
-                }
+                text: root.comment_status;
+                color: Theme.on_surface_variant;
+                font-size: 11px;
+                vertical-alignment: center;
             }
         }
     }
