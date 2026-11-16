@@ -103,6 +103,8 @@ export component VideoDetailView inherits Rectangle {
     in-out property <bool> fab_visible: true;
     /// 回复面板是否展开（点 FAB 或点某条评论的"回复"都展开）
     in-out property <bool> reply_panel_open: false;
+    /// 回复输入框是否获得焦点（= 键盘已弹出）
+    in-out property <bool> reply_input_focused: false;
 
     // 详情页根背景必须透明：整个组件是 100% 铺满 AppWindow 的，
     // 如果这里填不透明色，播放区的视频（下层 SurfaceView）就看不见了。
@@ -1597,7 +1599,9 @@ export component VideoDetailView inherits Rectangle {
 
                                                 reply_btn_touch := TouchArea {
                                                     clicked => {
+                                                        debug("DBG reply-btn tap");
                                                         root.reply_target = comment.user_name;
+                                                        root.reply_panel_open = true;
                                                         root.reply_clicked(
                                                             comment.user_name,
                                                             comment.pubtime);
@@ -1754,7 +1758,7 @@ export component VideoDetailView inherits Rectangle {
 
         fab_touch := TouchArea {
             clicked => {
-                debug("FAB clicked");
+                debug("DBG fab tap");
                 root.reply_target = "";
                 root.reply_panel_open = true;
             }
@@ -1783,130 +1787,157 @@ export component VideoDetailView inherits Rectangle {
             }
         }
 
+        // 面板尺寸：聚焦时**直接占上半屏**。
+        //
+        // 为什么这样，而不是"算出键盘高度再上移"：
+        //   Android 输入法大概占下半屏 45~50%，各家差异不大。
+        //   与其精确测量（NativeActivity 上 WindowInsets 与
+        //   getWindowVisibleDisplayFrame 全拿不到值，白折腾），
+        //   不如让面板本身就撑到半屏 —— 键盘占下半、面板占上半，
+        //   视觉上正好贴在输入法上面。多出来的空间也让输入区更宽敞。
+        focus_lift := root.reply_input_focused;
+
         panel := Rectangle {
             width: 100%;
-            height: panel_col.preferred-height + 16px;
-            // 贴着窗口底部。
-            //
-            // 键盘弹出时**不需要**我们自己上移：Manifest 里给 Activity
-            // 声明了 android:windowSoftInputMode="adjustResize"，系统会把
-            // 窗口本身压矮，root.height 随之变小，这里跟着底部走就对。
-            //
-            // 之前试过自己查 IME 高度（ime_height_px），在 NativeActivity
-            // 上恒返回 0 —— 因为窗口不是 adjustResize，根本收不到 insets。
-            y: root.height - self.height;
+            height: focus_lift ? root.height * 0.5 : 236px;
+            y: focus_lift ? 0px : root.height - self.height;
+            animate height, y { duration: 160ms; easing: ease-out; }
             background: Theme.surface_container;
-            border-top-left-radius: Theme.radius_md;
-            border-top-right-radius: Theme.radius_md;
+            border-top-left-radius: focus_lift ? 0px : Theme.radius_md;
+            border-top-right-radius: focus_lift ? 0px : Theme.radius_md;
 
-            panel_col := VerticalLayout {
-                padding: 14px;
-                spacing: 10px;
+            // 聚焦时面板顶到屏幕最上沿，要让开状态栏
+            property <length> pad_top: focus_lift ? root.safe_top + 8px : 0px;
+            property <length> pad: 14px;
 
-                // 标题行
-                Rectangle {
-                    height: 26px;
-                    background: transparent;
+            // ------------------------------------------------------------------
+            // 内部全部用绝对定位，不用 VerticalLayout。
+            //
+            // 原因：VerticalLayout 的 preferred-height 会反过来影响外层
+            // Rectangle 的 height，而外层高度又约束子元素 —— 这个循环在
+            // Slint 里会取值塌陷（之前"回复提示条画出来了、输入框被压没"
+            // 就是它）。绝对定位没有这个问题，高度也更好控制。
+            // ------------------------------------------------------------------
 
-                    Text {
-                        x: 0px;
-                        y: (parent.height - self.height) / 2;
-                        text: root.reply_target == ""
-                            ? "发表评论"
-                            : "回复 @" + root.reply_target;
-                        color: Theme.on_surface;
-                        font-size: 14px;
-                        font-weight: 700;
-                    }
+            header := Rectangle {
+                x: panel.pad;
+                y: panel.pad_top + 8px;
+                width: parent.width - panel.pad * 2;
+                height: 32px;
+                background: transparent;
 
-                    Text {
-                        x: parent.width - self.width;
-                        y: (parent.height - self.height) / 2;
-                        text: "关闭";
-                        color: Theme.on_surface_variant;
-                        font-size: 13px;
+                Text {
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                    text: root.reply_target == ""
+                        ? "发表评论"
+                        : "回复 @" + root.reply_target;
+                    color: Theme.on_surface;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
 
-                        TouchArea {
-                            clicked => {
-                                root.reply_panel_open = false;
-                                root.reply_target = "";
-                            }
+                Text {
+                    x: parent.width - self.width;
+                    y: (parent.height - self.height) / 2;
+                    text: "关闭";
+                    color: Theme.on_surface_variant;
+                    font-size: 13px;
+
+                    TouchArea {
+                        clicked => {
+                            debug("DBG panel close");
+                            root.reply_panel_open = false;
+                            root.reply_target = "";
+                            root.reply_input_focused = false;
                         }
                     }
                 }
+            }
 
-                // 输入框：多行，白底卡片
-                Rectangle {
-                    height: 88px;
-                    border-radius: Theme.radius_sm;
-                    background: Theme.surface_variant;
+            input_box := Rectangle {
+                x: panel.pad;
+                y: header.y + header.height + 10px;
+                width: parent.width - panel.pad * 2;
+                height: Math.max(88px, panel.height - self.y - 70px);
+                border-radius: Theme.radius_sm;
+                background: Theme.surface_variant;
 
-                    if root.comment_text == "" : Text {
-                        x: 12px;
-                        y: 10px;
-                        text: root.reply_target == ""
-                            ? "发一条友善的评论"
-                            : "回复 @" + root.reply_target;
-                        color: Theme.outline;
-                        font-size: 14px;
-                    }
-
-                    TextInput {
-                        x: 12px;
-                        y: 8px;
-                        width: parent.width - 24px;
-                        height: parent.height - 16px;
-                        text <=> root.comment_text;
-                        font-size: 14px;
-                        color: Theme.on_surface;
-                        wrap: word-wrap;
-                        single-line: false;
-                    }
+                if root.comment_text == "" : Text {
+                    x: 12px;
+                    y: 10px;
+                    text: root.reply_target == ""
+                        ? "发一条友善的评论"
+                        : "回复 @" + root.reply_target;
+                    color: Theme.outline;
+                    font-size: 14px;
                 }
 
-                // 状态提示 + 发送
+                panel_input := TextInput {
+                    x: 12px;
+                    y: 8px;
+                    width: parent.width - 24px;
+                    height: parent.height - 16px;
+                    text <=> root.comment_text;
+                    font-size: 14px;
+                    color: Theme.on_surface;
+                    wrap: word-wrap;
+                    single-line: false;
+
+                    // 打开面板自动聚焦：点 FAB 的意图就是"我要打字"
+                    init => { self.focus(); }
+                    changed has-focus => {
+                        debug("DBG input focus changed");
+                        root.reply_input_focused = self.has-focus;
+                    }
+                }
+            }
+
+            footer := Rectangle {
+                x: panel.pad;
+                y: panel.height - 56px;
+                width: parent.width - panel.pad * 2;
+                height: 44px;
+                background: transparent;
+
+                Text {
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                    text: root.comment_status;
+                    color: Theme.on_surface_variant;
+                    font-size: 11px;
+                }
+
                 Rectangle {
+                    x: parent.width - self.width;
+                    y: (parent.height - self.height) / 2;
+                    width: 76px;
                     height: 34px;
-                    background: transparent;
+                    border-radius: Theme.radius_full;
+                    background: root.comment_sending
+                        ? Theme.outline_variant
+                        : (panel_send_touch.pressed
+                            ? Theme.primary.transparentize(20%)
+                            : Theme.primary);
 
                     Text {
-                        x: 0px;
-                        y: (parent.height - self.height) / 2;
-                        text: root.comment_status;
-                        color: Theme.on_surface_variant;
-                        font-size: 11px;
+                        text: root.comment_sending ? "发送中" : "发送";
+                        color: Theme.on_primary;
+                        font-size: 13px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
 
-                    Rectangle {
-                        x: parent.width - self.width;
-                        y: (parent.height - self.height) / 2;
-                        width: 76px;
-                        height: 32px;
-                        border-radius: Theme.radius_full;
-                        background: root.comment_sending
-                            ? Theme.outline_variant
-                            : (panel_send_touch.pressed
-                                ? Theme.primary.transparentize(20%)
-                                : Theme.primary);
-
-                        Text {
-                            text: root.comment_sending ? "发送中" : "发送";
-                            color: Theme.on_primary;
-                            font-size: 13px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-
-                        panel_send_touch := TouchArea {
-                            enabled: !root.comment_sending && root.comment_text != "";
-                            clicked => { root.comment_submit(); }
-                        }
+                    panel_send_touch := TouchArea {
+                        enabled: !root.comment_sending && root.comment_text != "";
+                        clicked => { root.comment_submit(); }
                     }
                 }
             }
         }
     }
+
 
     if root.show_log_dialog : Rectangle {
         x: 0px;
