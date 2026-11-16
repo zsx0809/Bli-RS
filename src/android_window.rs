@@ -298,6 +298,74 @@ mod imp {
         .unwrap_or(0)
     }
 
+    /// 状态栏高度（物理像素）。顶部播放区要让出这一条。
+    ///
+    /// 读 android.R.dimen.status_bar_height 这个系统资源，
+    /// 拿不到就退回 24dp 的估算值。
+    pub fn status_bar_height_px() -> i32 {
+        with_env(|env, activity| {
+            let density = (|| -> Option<f32> {
+                let res = env
+                    .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let dm = env
+                    .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                env.get_field(&dm, "density", "F").ok()?.f().ok()
+            })()
+            .unwrap_or(2.0);
+
+            let id = (|| -> Option<i32> {
+                let res = env
+                    .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                let name = env.new_string("status_bar_height").ok()?;
+                let dimen = env.new_string("dimen").ok()?;
+                let android = env.new_string("android").ok()?;
+                env.call_method(
+                    &res,
+                    "getIdentifier",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+                    &[
+                        JValue::Object(&name),
+                        JValue::Object(&dimen),
+                        JValue::Object(&android),
+                    ],
+                )
+                .ok()?
+                .i()
+                .ok()
+            })()
+            .unwrap_or(0);
+
+            if id <= 0 {
+                return (24.0 * density) as i32;
+            }
+
+            let px = (|| -> Option<i32> {
+                let res = env
+                    .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                env.call_method(&res, "getDimensionPixelSize", "(I)I", &[JValue::Int(id)])
+                    .ok()?
+                    .i()
+                    .ok()
+            })()
+            .unwrap_or(0);
+
+            if px > 0 { px } else { (24.0 * density) as i32 }
+        })
+        .unwrap_or(48)
+    }
+
     pub fn display_density() -> f32 {
         with_env(|env, activity| {
             let res = env

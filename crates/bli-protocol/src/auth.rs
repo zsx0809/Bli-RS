@@ -365,3 +365,132 @@ pub async fn reply_add(
 
     Ok(())
 }
+
+/// 拉评论列表的一页。
+///
+/// 两条路径（这是「评论区永远只有三条」的根因）：
+///
+///   未登录：GET /x/v2/reply/wbi/main
+///           参数 oid / type / mode / pagination_str
+///           只给 3 条热门，reply_control 里**没有 location**（IP 属地）
+///
+///   已登录：GET /x/v2/reply
+///           参数 oid / type / sort / pn / ps
+///           每页 20 条，带 location、楼中楼预置、rcount
+///
+/// 实测（2026-11-17，用设备上真实登录的 cookie 对同一个 aid）：
+///   pn=1 → 20 条，首条「鱼鱼才不是大肥鱼喵」IP属地：内蒙古
+///   pn=2 → 20 条，首条「mhy还我尤拉」IP属地：上海
+///   pn=3 → 20 条，首条「耶葉格」IP属地：重庆
+///   不带 cookie 时 pn=2/3 都返回 0 条 —— 翻页能力本身是登录态给的。
+///
+/// sort: 0 = 按时间，1 = 按热度。
+pub async fn comments_page(
+    client: &reqwest::Client,
+    auth: Option<&Auth>,
+    aid: u64,
+    sort: u32,
+    pn: u32,
+    next_offset: &str,
+) -> Result<serde_json::Value> {
+    let logged_in = auth.map(|a| a.is_logged_in()).unwrap_or(false);
+
+    let (path, params): (&str, Vec<(&str, String)>) = if logged_in {
+        (
+            "/x/v2/reply",
+            vec![
+                ("oid", aid.to_string()),
+                ("type", "1".to_string()),
+                ("sort", sort.to_string()),
+                ("pn", pn.to_string()),
+                ("ps", "20".to_string()),
+            ],
+        )
+    } else {
+        // 未登录走 wbi/main，分页靠 pagination_str 偏移。
+        // 首页给空 offset，下一页的 offset 在
+        // data.cursor.pagination_reply.next_offset 里。
+        let offset = next_offset.replace('"', "\\\"");
+        (
+            "/x/v2/reply/wbi/main",
+            vec![
+                ("oid", aid.to_string()),
+                ("type", "1".to_string()),
+                ("mode", "3".to_string()),
+                ("pagination_str", format!("{{\"offset\":\"{offset}\"}}")),
+            ],
+        )
+    };
+
+    let url = format!("{}{path}", api::API_BASE_URL);
+
+    let mut req = client
+        .get(&url)
+        .header("user-agent", api::BROWSER_UA_PC)
+        .header("referer", api::REFERER)
+        .query(&params);
+
+    if let Some(a) = auth {
+        if a.is_logged_in() {
+            req = req.header("cookie", &a.cookie);
+        }
+    }
+
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        return Err(Error::Network(format!("HTTP {}", resp.status())));
+    }
+
+    Ok(resp.json().await?)
+}
+
+/// 从一页响应里取出「还有没有下一页」和「下一个 offset」。
+///
+/// 两个来源：
+///   未登录路径 → data.cursor.is_end / cursor.pagination_reply.next_offset
+///   已登录路径 → data.page.count 与已取条数比较（登录路径没有 cursor）
+pub fn parse_page_state(json: &serde_json::Value, pn: u32) -> (bool, String) {
+    let data = &json["data"];
+
+    let next_offset = data["cursor"]["pagination_reply"]["next_offset"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // is_end 最权威
+    if let Some(is_end) = data["cursor"]["is_end"].as_bool() {
+        return (!is_end, next_offset);
+    }
+
+    // 兜底：总数 vs 已取
+    let count = data["page"]["count"].as_u64().unwrap_or(0);
+    let taken = (pn as u64) * 20;
+    (taken < count, next_offset)
+}
+
+/// 从一页响应里取出评论数组。
+///
+/// 顶层评论可能在 replies，也可能在 top_replies（置顶评论）。
+/// 置顶的那几条在主列表里通常也会出现，按 rpid 去重。
+pub fn parse_replies(json: &serde_json::Value, owner_mid: u64) -> Vec<crate::CommentItem> {
+    use crate::detail::parse_reply_public;
+
+    let data = &json["data"];
+    let mut out: Vec<crate::CommentItem> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for key in ["top_replies", "replies"] {
+        let Some(arr) = data[key].as_array() else {
+            continue;
+        };
+        for r in arr {
+            let item = parse_reply_public(r, owner_mid);
+            if item.rpid != 0 && !seen.insert(item.rpid) {
+                continue;
+            }
+            out.push(item);
+        }
+    }
+
+    out
+}
