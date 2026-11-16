@@ -1370,6 +1370,21 @@ export component VideoDetailView inherits Rectangle {
                                 border-radius: Theme.radius_sm;
                                 background: Theme.surface_variant;
 
+                                // 占位提示：Slint 1.9 的 TextInput 没有
+                                // placeholder-text，用一个仅在有焦点/有内容时
+                                // 隐藏的 Text 叠在下面（TextInput 背景透明，
+                                // 空内容时能看见它）。
+                                if root.comment_text == "" : Text {
+                                    x: 12px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: root.reply_target == ""
+                                        ? "发一条友善的评论"
+                                        : "回复 @" + root.reply_target;
+                                    color: Theme.outline;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+
                                 TextInput {
                                     x: 12px;
                                     y: (parent.height - self.height) / 2;
@@ -1379,10 +1394,6 @@ export component VideoDetailView inherits Rectangle {
                                     font-size: 13px;
                                     color: Theme.on_surface;
                                     single-line: true;
-                                    // 输入框占位提示：Slint 用 placeholder-text
-                                    placeholder-text: root.reply_target == ""
-                                        ? "发一条友善的评论"
-                                        : "回复 @" + root.reply_target;
                                 }
 
                                 // 发送按钮
