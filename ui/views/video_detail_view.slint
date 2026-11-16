@@ -69,8 +69,22 @@ export component VideoDetailView inherits Rectangle {
     callback follow_clicked();
     callback related_selected(string);
     /// 点击某条评论的「回复」。参数：被回复者昵称、该评论时间（作为定位标识）。
-    /// 评论输入面板尚未实现，这里只做接口预留与日志。
+    /// Rust 侧据此把输入框切到「回复 @某人」模式。
     callback reply_clicked(string, string);
+
+    // ---- 评论输入 ----
+    //
+    // 全部状态都在 Rust 侧（src/login.rs 的 post_comment）。
+    // UI 只做：显示输入框 / 收集文本 / 转发提交动作。
+    in property <bool> logged_in: false;
+    in-out property <string> comment_text: "";
+    in property <string> comment_status: "";
+    in property <bool> comment_sending: false;
+    /// 正在回复谁。空串表示发顶层评论。
+    in-out property <string> reply_target: "";
+    callback comment_submit();
+    callback comment_cancel_reply();
+    callback request_login();
 
     // 详情页根背景必须透明：整个组件是 100% 铺满 AppWindow 的，
     // 如果这里填不透明色，播放区的视频（下层 SurfaceView）就看不见了。
@@ -1292,11 +1306,132 @@ export component VideoDetailView inherits Rectangle {
                     padding-bottom: 48px;
                     spacing: 0px;
 
+                    // ------------------------------------------------------
+                    // 评论输入区
+                    //
+                    // 未登录时不显示输入框，改成一个"登录后参与评论"的
+                    // 引导条 —— 让用户点进输入框、打完字、提交，才发现
+                    // 要登录，是很糟的体验。
+                    // ------------------------------------------------------
+                    if !root.logged_in : Rectangle {
+                        height: 44px;
+                        border-radius: Theme.radius_full;
+                        background: Theme.surface_variant;
+
+                        Text {
+                            x: 14px;
+                            y: (parent.height - self.height) / 2;
+                            text: "登录后参与评论";
+                            color: Theme.on_surface_variant;
+                            font-size: 13px;
+                        }
+
+                        TouchArea {
+                            clicked => { root.request_login(); }
+                        }
+                    }
+
+                    if root.logged_in : Rectangle {
+                        height: input_col.preferred-height;
+                        background: transparent;
+
+                        input_col := VerticalLayout {
+                            spacing: 6px;
+
+                            // 「回复 @某人」提示条
+                            if root.reply_target != "" : Rectangle {
+                                height: 26px;
+                                border-radius: Theme.radius_sm;
+                                background: Theme.primary.transparentize(88%);
+
+                                Text {
+                                    x: 10px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: "回复 @" + root.reply_target;
+                                    color: Theme.primary;
+                                    font-size: 12px;
+                                }
+
+                                Text {
+                                    x: parent.width - self.width - 10px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: "取消";
+                                    color: Theme.on_surface_variant;
+                                    font-size: 12px;
+
+                                    TouchArea {
+                                        clicked => { root.comment_cancel_reply(); }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 42px;
+                                border-radius: Theme.radius_sm;
+                                background: Theme.surface_variant;
+
+                                TextInput {
+                                    x: 12px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: parent.width - 96px;
+                                    height: 24px;
+                                    text <=> root.comment_text;
+                                    font-size: 13px;
+                                    color: Theme.on_surface;
+                                    single-line: true;
+                                    // 输入框占位提示：Slint 用 placeholder-text
+                                    placeholder-text: root.reply_target == ""
+                                        ? "发一条友善的评论"
+                                        : "回复 @" + root.reply_target;
+                                }
+
+                                // 发送按钮
+                                Rectangle {
+                                    x: parent.width - self.width - 8px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 66px;
+                                    height: 28px;
+                                    border-radius: Theme.radius_full;
+                                    background: root.comment_sending
+                                        ? Theme.outline_variant
+                                        : (send_touch.pressed
+                                            ? Theme.primary.transparentize(20%)
+                                            : Theme.primary);
+
+                                    Text {
+                                        text: root.comment_sending ? "发送中" : "发送";
+                                        color: Theme.on_primary;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    send_touch := TouchArea {
+                                        enabled: !root.comment_sending
+                                            && root.comment_text != "";
+                                        clicked => { root.comment_submit(); }
+                                    }
+                                }
+                            }
+
+                            if root.comment_status != "" : Text {
+                                text: root.comment_status;
+                                color: Theme.on_surface_variant;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 10px; background: transparent; }
+
                     if root.comments.length == 0 : Rectangle {
                         height: 140px;
 
                         Text {
-                            text: "评论加载中…";
+                            text: root.logged_in
+                                ? "评论加载中…"
+                                : "登录后可见完整评论";
                             color: Theme.on_surface_variant;
                             font-size: 14px;
                             horizontal-alignment: center;
@@ -1516,9 +1651,7 @@ export component VideoDetailView inherits Rectangle {
 
                                                 reply_btn_touch := TouchArea {
                                                     clicked => {
-                                                        // 暂未接入评论输入面板。
-                                                        // 这里先留明确的视觉反馈，
-                                                        // 不假装功能已实现。
+                                                        root.reply_target = comment.user_name;
                                                         root.reply_clicked(
                                                             comment.user_name,
                                                             comment.pubtime);

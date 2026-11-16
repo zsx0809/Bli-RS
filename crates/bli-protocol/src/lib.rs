@@ -11,12 +11,14 @@
 // ==============================================================================
 
 pub mod api;
+pub mod auth;
 pub mod client;
 pub mod detail;
 pub mod playurl;
 pub mod recommend;
 pub mod wbi;
 
+pub use auth::{Auth, PollState, QrCode};
 pub use client::BiliClient;
 pub use detail::{CommentItem, RelatedVideo, VideoDetail};
 

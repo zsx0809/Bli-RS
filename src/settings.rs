@@ -66,3 +66,29 @@ pub fn set_bool(key: &str, value: bool) {
         persist(m);
     });
 }
+
+pub fn get_string(key: &str) -> String {
+    with_cache(|m| m.get(key).cloned().unwrap_or_default())
+}
+
+pub fn set_string(key: &str, value: &str) {
+    with_cache(|m| {
+        m.insert(key.to_string(), value.to_string());
+        persist(m);
+    });
+}
+
+pub fn remove(key: &str) {
+    with_cache(|m| {
+        m.remove(key);
+        persist(m);
+    });
+}
+
+pub fn get_u64(key: &str) -> u64 {
+    get_string(key).parse().unwrap_or(0)
+}
+
+pub fn set_u64(key: &str, value: u64) {
+    set_string(key, &value.to_string());
+}

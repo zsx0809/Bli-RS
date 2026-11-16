@@ -61,6 +61,28 @@ export component NavigationDrawer inherits Rectangle {
     in-out property <bool> auto_play: true;
     callback auto_play_toggled(bool);
 
+    // ---- 登录态 ----
+    //
+    // 全部由 Rust 侧写入（src/login.rs）。UI 只负责显示与转发动作，
+    // 不做任何网络请求 —— Slint 的 .slint 层没有 async，
+    // 所有异步逻辑都在 Rust 侧。
+    in property <bool> logged_in: false;
+    in property <string> login_name: "";
+    in property <string> login_face_url: "";
+    in property <image> user_face;
+    in property <int> login_level: 0;
+    in property <bool> login_vip: false;
+
+    /// 登录面板是否展开（点抽屉里的"登录"後展开）
+    in-out property <bool> show_login: false;
+    in property <image> login_qr;
+    in property <string> login_status: "";
+    in property <bool> login_qr_loading: false;
+
+    callback open_login();
+    callback close_login();
+    callback do_logout();
+
     callback close_drawer();
     callback navigate_settings();
     callback navigate_history();
@@ -117,7 +139,7 @@ export component NavigationDrawer inherits Rectangle {
             spacing: 0px;
 
             // --------------------------------------------------------------
-            // 第一段：用户卡片
+            // 第一段：用户卡片（未登录 / 已登录两种形态）
             // --------------------------------------------------------------
             Rectangle {
                 height: 104px;
@@ -133,14 +155,14 @@ export component NavigationDrawer inherits Rectangle {
                         spacing: 12px;
                         alignment: start;
 
-                        // 头像：与顶栏同一抽象鱼形，保持身份一致
+                        // 头像：未登录是抽象鱼形，已登录显示真实头像
                         Rectangle {
                             width: 44px;
                             height: 44px;
                             border-radius: Theme.radius_full;
                             background: Theme.primary;
 
-                            Path {
+                            if !root.logged_in : Path {
                                 width: 100%;
                                 height: 100%;
                                 viewbox-width: 24;
@@ -148,6 +170,14 @@ export component NavigationDrawer inherits Rectangle {
                                 commands: "M 4 12 C 7 7.5 13 7.5 16 11 L 20.5 8.2 L 19.6 15.8 L 16 13 C 13 16.5 7 16.5 4 12 Z";
                                 fill: Theme.on_primary;
                                 stroke: transparent;
+                            }
+
+                            if root.logged_in : Image {
+                                width: 100%;
+                                height: 100%;
+                                source: root.user_face;
+                                image-fit: cover;
+                                border-radius: Theme.radius_full;
                             }
                         }
 
@@ -157,7 +187,7 @@ export component NavigationDrawer inherits Rectangle {
                             vertical-stretch: 1;
 
                             Text {
-                                text: "大肥鱼的朋友";
+                                text: root.logged_in ? root.login_name : "未登录";
                                 color: Theme.on_surface;
                                 font-size: 15px;
                                 font-weight: 700;
@@ -165,8 +195,12 @@ export component NavigationDrawer inherits Rectangle {
                             }
 
                             Text {
-                                text: "LV6 · 纯血 Rust 极速模式";
-                                color: Theme.primary;
+                                text: root.logged_in
+                                    ? ("LV" + root.login_level + (root.login_vip ? " · 大会员" : " · 已登录"))
+                                    : "点右侧按钮扫码登录";
+                                color: root.logged_in && root.login_vip
+                                    ? Theme.bili_pink
+                                    : Theme.primary;
                                 font-size: 11px;
                                 overflow: elide;
                             }
@@ -186,10 +220,170 @@ export component NavigationDrawer inherits Rectangle {
                         }
                     }
 
+                    // 动作行：未登录 → "登录"；已登录 → "退出登录"
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        if !root.logged_in : Rectangle {
+                            width: 72px;
+                            height: 26px;
+                            border-radius: Theme.radius_full;
+                            background: login_btn.pressed ? Theme.primary.transparentize(20%) : Theme.primary;
+
+                            Text {
+                                text: "登录";
+                                color: Theme.on_primary;
+                                font-size: 12px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            login_btn := TouchArea {
+                                clicked => { root.open_login(); }
+                            }
+                        }
+
+                        if root.logged_in : Rectangle {
+                            width: 78px;
+                            height: 26px;
+                            border-radius: Theme.radius_full;
+                            background: logout_btn.pressed
+                                ? Theme.surface_variant
+                                : transparent;
+                            border-width: 1px;
+                            border-color: Theme.outline_variant;
+
+                            Text {
+                                text: "退出登录";
+                                color: Theme.on_surface_variant;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            logout_btn := TouchArea {
+                                clicked => { root.do_logout(); }
+                            }
+                        }
+
+                        Text {
+                            text: root.logged_in
+                                ? "评论已解锁全部页"
+                                : "登录后评论区才给全量";
+                            color: Theme.on_surface_variant;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // 登录面板：二维码 + 状态
+            //
+            // 为什么放在抽屉里而不是独立的模态页：
+            //   二维码登录是"扫一下就完事"的一次性动作，不值得占一整个
+            //   页面跳转。展开在抽屉里，扫完抽屉一关就回到原来的位置。
+            // --------------------------------------------------------------
+            if root.show_login : Rectangle {
+                background: Theme.surface_container_high;
+                border-radius: Theme.radius_md;
+                height: login_panel.preferred-height;
+
+                login_panel := VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+
                     Text {
-                        text: "硬币 1024  ·  B币 0.0  ·  零发热运行中";
+                        text: "扫码登录";
+                        color: Theme.on_surface;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+
+                    // 二维码本体：固定 176x176 的白底方块
+                    Rectangle {
+                        width: 176px;
+                        height: 176px;
+                        background: #ffffff;
+                        border-radius: Theme.radius_sm;
+                        horizontal-alignment: center;
+
+                        if root.login_qr_loading : Rectangle {
+                            width: 176px;
+                            height: 176px;
+                            background: transparent;
+
+                            Text {
+                                text: "生成中…";
+                                color: #888888;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Image {
+                            width: 168px;
+                            height: 168px;
+                            source: root.login_qr;
+                            image-fit: contain;
+                        }
+                    }
+
+                    Text {
+                        text: root.login_status;
                         color: Theme.on_surface_variant;
-                        font-size: 11px;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        Rectangle {
+                            width: 72px;
+                            height: 26px;
+                            border-radius: Theme.radius_full;
+                            background: Theme.primary;
+
+                            Text {
+                                text: "刷新";
+                                color: Theme.on_primary;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            TouchArea {
+                                clicked => { root.open_login(); }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 72px;
+                            height: 26px;
+                            border-radius: Theme.radius_full;
+                            border-width: 1px;
+                            border-color: Theme.outline_variant;
+                            background: transparent;
+
+                            Text {
+                                text: "关闭";
+                                color: Theme.on_surface_variant;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            TouchArea {
+                                clicked => { root.close_login(); }
+                            }
+                        }
                     }
                 }
             }

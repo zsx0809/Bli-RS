@@ -30,6 +30,14 @@ static CURRENT_BUFFER: Mutex<Option<std::sync::Arc<crate::stream_source::SharedB
 static VIDEO_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// 全局播放会话序列号，杜绝多任务并发争抢 Surface 与 Codec 冲突
 static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// 当前视频的 aid / bvid / UP mid。
+///
+/// 登录状态变化后要重新拉评论区（未登录 3 条，登录后 20 条/页），
+/// 那时播放上下文早就散在栈上了，只能靠这几个全局量。
+static CURRENT_AID: AtomicU64 = AtomicU64::new(0);
+static CURRENT_OWNER: AtomicU64 = AtomicU64::new(0);
+static CURRENT_BVID: Mutex<Option<String>> = Mutex::new(None);
 /// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
 /// 0 表示未知（此时 seek 直接忽略，避免跳到片头）。
 static DURATION_US: AtomicI64 = AtomicI64::new(0);
@@ -84,6 +92,7 @@ struct RawRelated {
 
 /// 纯数据评论包装
 struct RawComment {
+    rpid: u64,
     user_name: String,
     user_face: String,
     content: String,
@@ -412,79 +421,15 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         }
 
         // 3.2 异步拉取真实评论列表
+        // 记住当前视频身份，登录态变化时要靠它重刷评论
+        CURRENT_AID.store(aid, Ordering::SeqCst);
+        CURRENT_OWNER.store(owner_mid, Ordering::SeqCst);
+        if let Ok(mut g) = CURRENT_BVID.lock() {
+            *g = Some(bvid.clone());
+        }
+
         if aid > 0 {
-            let w_comment = w_clone.clone();
-            let client_c = client.clone();
-            std::thread::spawn(move || {
-                let rt_c = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                if let Ok(comments) = rt_c.block_on(client_c.video_comments(aid, owner_mid)) {
-                    let raw_comments: Vec<RawComment> = comments
-                        .into_iter()
-                        .map(|c| RawComment {
-                            sub_authors: c.sub_replies.iter().map(|s| s.user_name.clone()).collect(),
-                            sub_contents: c.sub_replies.iter().map(|s| s.content.clone()).collect(),
-                            user_name: c.user_name,
-                            user_face: c.user_face,
-                            content: c.content,
-                            likes: c.likes,
-                            pubtime: c.pubtime,
-                            level: c.level,
-                            is_vip: c.is_vip,
-                            is_up: c.is_up,
-                            location: c.location,
-                            reply_count: c.reply_count,
-                        })
-                        .collect();
-
-                    // 先把文字内容上屏（头像留空），头像随后异步补 ——
-                    //   评论主体是文字，头像只是装饰；等头像下载完再整体渲染
-                    //   会让评论区白屏好几秒。
-                    let face_urls: Vec<String> =
-                        raw_comments.iter().map(|c| c.user_face.clone()).collect();
-
-                    let w_face_list = w_comment.clone();
-                    let _ = w_comment.upgrade_in_event_loop(move |w| {
-                        let ui_comments: Vec<CommentItemData> = raw_comments
-                            .into_iter()
-                            .map(|c| {
-                                let sub_authors: Vec<slint::SharedString> =
-                                    c.sub_authors.iter().map(|s| s.as_str().into()).collect();
-                                let sub_replies: Vec<slint::SharedString> =
-                                    c.sub_contents.iter().map(|s| s.as_str().into()).collect();
-                                CommentItemData {
-                                    user_name: c.user_name.into(),
-                                    user_face: Image::default(),
-                                    content: c.content.into(),
-                                    likes: c.likes.into(),
-                                    pubtime: c.pubtime.into(),
-                                    level: c.level as i32,
-                                    is_vip: c.is_vip,
-                                    is_up: c.is_up,
-                                    location: c.location.into(),
-                                    reply_count: c.reply_count as i32,
-                                    sub_replies: ModelRc::new(VecModel::from(sub_replies)),
-                                    sub_authors: ModelRc::new(VecModel::from(sub_authors)),
-                                }
-                            })
-                            .collect();
-                        w.set_video_comments(ModelRc::new(Rc::new(VecModel::from(ui_comments))));
-                    });
-
-                    // 头像异步下载并逐条回填。
-                    //
-                    // 为什么逐条回填而不是攒齐一次性设置：
-                    //   20 条评论的头像，弱网下攒齐可能要十几秒，期间评论区
-                    //   全是灰圆点。逐条回填的话，谁的先下来谁先显示。
-                    //
-                    // 为什么只下前 20 个：
-                    //   接口一页就是 20 条，再往下要翻页 —— 翻页功能还没做，
-                    //   预先下载屏幕外的头像纯属浪费流量。
-                    spawn_comment_faces(w_face_list, face_urls, my_session);
-                }
-            });
+            spawn_comment_load(w_clone.clone(), client.clone(), aid, owner_mid, my_session);
         }
 
         // 3.3 拉取相关视频推荐
@@ -877,6 +822,173 @@ fn start_playback(
     spawn_progress_poller(w_clone.clone(), my_session, duration_us);
 }
 
+/// 拉评论并上屏。登录 / 退出 / 发评论之后都调它重刷。
+///
+/// 为什么要抽成独立函数：
+///   未登录时接口只给 3 条热门评论，而且没有 IP 属地
+///   （reply_control 里就是没有 location 字段）。
+///   登录之后同一条评论会带属地，列表也变成 20 条/页 ——
+///   所以登录态一变就必须整份重拉，不能只补一点。
+///
+/// `session` 用来防串台：用户切走视频后，在途的请求结果要丢掉。
+pub fn spawn_comment_load(
+    window: slint::Weak<AppWindow>,
+    client: bli_protocol::BiliClient,
+    aid: u64,
+    owner_mid: u64,
+    session: u64,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let auth = crate::login::current();
+        let is_login = auth.as_ref().map(|a| a.is_logged_in()).unwrap_or(false);
+
+        // sort=1 热度排序（和未登录那条路径的 mode=3 对齐）
+        let json = match rt.block_on(bli_protocol::auth::comments_page(
+            &client.raw_http(),
+            auth.as_ref(),
+            aid,
+            1,
+            1,
+        )) {
+            Ok(j) => j,
+            Err(e) => {
+                crate::mxprobe::log_public(&format!("[Comment] 拉取失败: {e}"));
+                return;
+            }
+        };
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != session {
+            return;
+        }
+
+        let items = crate::login::build_comment_models(&json, owner_mid);
+        let total = json["data"]["page"]["count"].as_u64().unwrap_or(0);
+        crate::mxprobe::log_public(&format!(
+            "[Comment] 已登录={is_login} 拿到 {} 条 / 共 {total} 条",
+            items.len()
+        ));
+
+        let face_urls: Vec<String> = items.iter().map(|c| c.user_face.clone()).collect();
+
+        let raw: Vec<RawComment> = items
+            .into_iter()
+            .map(|c| RawComment {
+                rpid: c.rpid,
+                sub_authors: c.sub_replies.iter().map(|s| s.user_name.clone()).collect(),
+                sub_contents: c.sub_replies.iter().map(|s| s.content.clone()).collect(),
+                user_name: c.user_name,
+                user_face: c.user_face,
+                content: c.content,
+                likes: c.likes,
+                pubtime: c.pubtime,
+                level: c.level,
+                is_vip: c.is_vip,
+                is_up: c.is_up,
+                location: c.location,
+                reply_count: c.reply_count,
+            })
+            .collect();
+
+        // 先把文字上屏（头像留空），头像随后异步补 ——
+        // 评论主体是文字，等头像下载完再整体渲染会让评论区白屏好几秒。
+        let w_list = window.clone();
+        let _ = window.upgrade_in_event_loop(move |w| {
+            let ui_comments: Vec<CommentItemData> = raw
+                .into_iter()
+                .map(|c| {
+                    let sub_authors: Vec<slint::SharedString> =
+                        c.sub_authors.iter().map(|s| s.as_str().into()).collect();
+                    let sub_replies: Vec<slint::SharedString> =
+                        c.sub_contents.iter().map(|s| s.as_str().into()).collect();
+                    CommentItemData {
+                        rpid: c.rpid as i32,
+                        user_name: c.user_name.into(),
+                        user_face: Image::default(),
+                        content: c.content.into(),
+                        likes: c.likes.into(),
+                        pubtime: c.pubtime.into(),
+                        level: c.level as i32,
+                        is_vip: c.is_vip,
+                        is_up: c.is_up,
+                        location: c.location.into(),
+                        reply_count: c.reply_count as i32,
+                        sub_replies: ModelRc::new(VecModel::from(sub_replies)),
+                        sub_authors: ModelRc::new(VecModel::from(sub_authors)),
+                    }
+                })
+                .collect();
+            w.set_video_comments(ModelRc::new(Rc::new(VecModel::from(ui_comments))));
+        });
+
+        spawn_comment_faces(w_list, face_urls, session);
+    });
+}
+
+/// 登录态变化后重新拉当前视频的评论。
+pub fn reload_comments(client: bli_protocol::BiliClient, _bvid: String) {
+    let aid = CURRENT_AID.load(Ordering::SeqCst);
+    let owner = CURRENT_OWNER.load(Ordering::SeqCst);
+    let session = PLAY_SESSION.load(Ordering::SeqCst);
+    if aid == 0 {
+        return;
+    }
+    let Some(window) = crate::login::window() else {
+        return;
+    };
+    spawn_comment_load(window, client, aid, owner, session);
+}
+
+/// 当前正在播放/浏览的 bvid（登录后重刷评论用）。
+pub fn current_bvid() -> String {
+    CURRENT_BVID
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// 当前视频 aid。
+pub fn current_aid() -> u64 {
+    CURRENT_AID.load(Ordering::SeqCst)
+}
+
+/// 按昵称反查评论 rpid，供 reply/add 定位。
+///
+/// 为什么 UI 只传昵称、由这里反查：
+///   Slint 的 callback 参数是值语义，把 rpid 直接传出去要多加一个
+///   callback 重载；而且用户点"回复"时的目标是**看得见的昵称**，
+///   用昵称当入口更符合意图。真实 rpid 从模型里读 —— 昵称会重名，
+///   但反查走的是"最近一次加载的列表"，同一页里重名极少见。
+///
+/// 找不到就返回 (0,0)：那就是发一条顶层评论，不会发错人。
+pub fn resolve_reply_target(name: &str) -> (u64, u64) {
+    let Some(window) = crate::login::window() else {
+        return (0, 0);
+    };
+    let Some(w) = window.upgrade() else {
+        return (0, 0);
+    };
+    let model = w.get_video_comments();
+    for i in 0..model.row_count() {
+        if let Some(row) = model.row_data(i) {
+            if row.user_name == name {
+                let rpid = row.rpid as u64;
+                // root 和 parent 都传它：B 站一层回复的语义是
+                // root=父评论 rpid, parent=被回复评论 rpid。
+                // 回复一级评论时两者相同。
+                return (rpid, rpid);
+            }
+        }
+    }
+    crate::mxprobe::log_public(&format!("[Comment] 找不到 {name} 的 rpid，按顶层评论发送"));
+    (0, 0)
+}
+
 /// 评论头像批量下载并逐条回填。
 ///
 /// 为什么要单独一个函数、还要带 session：
@@ -1143,6 +1255,17 @@ pub fn toggle_fav(window: slint::Weak<AppWindow>) {
 }
 
 /// 异步下载并解码为原始 RGBA 纯数据 (Send 友好)
+/// 同步版图片下载（给自己的后台线程用，不需要外部传 runtime）。
+///
+/// 登录头像用：那个线程只下一张图，为它传一个 runtime 进来太啰嗦。
+pub fn fetch_rgba_blocking(url: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(download_raw_image(url))
+}
+
 async fn download_raw_image(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     let target = crate::cover::thumbnail_url(url);
     if target.is_empty() {

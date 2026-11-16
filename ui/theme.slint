@@ -74,6 +74,9 @@ export struct RelatedVideoData {
 
 /// 评论区单条评论数据
 export struct CommentItemData {
+    /// 评论 rpid。回复别人时要把它作为 root/parent 传给 reply/add。
+    /// UI 不显示，只用来精确定位 —— 昵称会重名，rpid 不会。
+    rpid: int,
     user_name: string,
     user_face: image,
     content: string,

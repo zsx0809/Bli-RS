@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api;
+use crate::auth::Auth;
 use crate::wbi;
 use crate::{Error, Result};
 
@@ -32,6 +33,16 @@ pub struct BiliClient {
     /// 是风控在 HTTP 层就拦掉了，连响应体都没有。
     /// 格式照抄 PiliPlus IdUtils.genBuvid3：UUID(大写) + 5位随机 + "infoc"。
     buvid: String,
+    /// 登录态。None = 游客。
+    ///
+    /// 为什么挂在 client 上而不是各接口自己收参数：
+    ///   登录之后**每一个** bilibili 请求都要带 cookie —— 评论分页
+    ///   （不带就只有 3 条热门）、playurl 的高清档、IP 属地、
+    ///   点赞投币、发评论。逐个接口传参一定会漏，漏掉的地方表现
+    ///   还很隐蔽（比如评论区"只有三条"）。挂在 client 上一处生效。
+    ///
+    /// 用 std 的 RwLock 而不是 tokio 的：读多写极少，且持锁期间不做 await。
+    auth: Arc<std::sync::RwLock<Option<Auth>>>,
 }
 
 impl BiliClient {
@@ -56,6 +67,7 @@ impl BiliClient {
             http,
             mixin: Arc::new(tokio::sync::Mutex::new(None)),
             buvid: gen_buvid3(),
+            auth: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -69,10 +81,13 @@ impl BiliClient {
 
         // Referer 与 buvid3 cookie 只对 bilibili 域加，避免污染第三方请求。
         // buvid3 是风控必需的设备标识，缺了 playurl 会 412。
+        //
+        // 已登录时把登录 cookie 拼在 buvid3 后面：登录态下 B 站会刷新
+        // buvid（buvid3/buvid4/b_nut），我们保存的整串里本来就带着，
+        // 但首次本地生成的 buvid3 仍要保留 —— 两者并存 B 站取后者。
         if url.contains("bilibili.com") {
-            req = req
-                .header("referer", api::REFERER)
-                .header("cookie", format!("buvid3={}", self.buvid));
+            req = req.header("referer", api::REFERER);
+            req = req.header("cookie", self.cookie_header());
         }
 
         if !params.is_empty() {
@@ -107,6 +122,69 @@ impl BiliClient {
         }
 
         Ok(json)
+    }
+
+    /// 暴露底层 HTTP 客户端。
+    ///
+    /// 给那些需要自己控制 header（比如带 cookie 的评论分页、发评论 POST）
+    /// 的场景用。不鼓励在协议层之外直接发请求 —— 但把 reqwest::Client
+    /// 包在 BiliClient 里会导致每个功能都要加一层方法，权衡下来提供
+    /// 一个受控的逃生口更实际。
+    pub fn raw_http(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
+    /// 当前该带的 cookie 串。
+    ///
+    /// 已登录 → 登录 cookie（其后拼 buvid3，若登录串里没带）
+    /// 未登录 → 只有 buvid3
+    fn cookie_header(&self) -> String {
+        let guard = match self.auth.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(a) if !a.cookie.is_empty() => {
+                if a.cookie.contains("buvid3=") {
+                    a.cookie.clone()
+                } else {
+                    format!("{}; buvid3={}", a.cookie, self.buvid)
+                }
+            }
+            _ => format!("buvid3={}", self.buvid),
+        }
+    }
+
+    /// 装入 / 清空登录态。传 None 表示退出登录。
+    ///
+    /// 换登录态时必须**同时**清掉 mixin_key 缓存：
+    /// WBI 密钥是按账号签发的，游客的 key 用在登录态请求上会被判 -352。
+    pub fn set_auth(&self, auth: Option<Auth>) {
+        let mut guard = match self.auth.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = auth;
+        drop(guard);
+        // mixin 是 async Mutex，这里用 try_lock —— 拿不到就让它下次自然过期，
+        // 不值得为了清缓存去阻塞一个同步函数。
+        if let Ok(mut m) = self.mixin.try_lock() {
+            *m = None;
+        }
+    }
+
+    /// 读一份登录态快照。
+    pub fn auth(&self) -> Option<Auth> {
+        let guard = match self.auth.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.clone()
+    }
+
+    /// 是否已登录。
+    pub fn is_logged_in(&self) -> bool {
+        self.auth().map(|a| a.is_logged_in()).unwrap_or(false)
     }
 
     /// 普通 GET（无签名）。

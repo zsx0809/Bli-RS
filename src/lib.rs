@@ -11,6 +11,7 @@ pub mod stream_source;
 pub mod audio_out;
 pub mod audio_decoder;
 pub mod feed;
+pub mod login;
 
 slint::include_modules!();
 
@@ -290,15 +291,6 @@ fn android_main(app: slint::android::AndroidApp) {
         });
     }
 
-    // 评论回复：输入面板未实现，这里只落日志，不假装能用
-    {
-        main_window.on_comment_reply_clicked(move |name, t| {
-            crate::mxprobe::log_public(&format!(
-                "[评论] 点击回复 {name}（{t}）—— 输入面板尚未实现"
-            ));
-        });
-    }
-
     // 长按卡片（为点赞三连/快捷操作预留）
     {
         main_window.on_video_long_pressed(move |bvid| {
@@ -405,6 +397,99 @@ fn android_main(app: slint::android::AndroidApp) {
 
     // 读回持久化的播放设置
     main_window.set_auto_play(settings::get_bool("auto_play", true));
+
+    // ------------------------------------------------------------------------
+    // 登录
+    //
+    // 一个 BiliClient 贯穿全 App：登录态挂在它身上（见 client.rs:auth），
+    // 换登录态时 set_auth 会同时清掉 WBI 密钥缓存 —— 游客的 key
+    // 拿去签登录态请求会被判 -352。
+    // ------------------------------------------------------------------------
+    let login_client = bli_protocol::BiliClient::new()
+        .map_err(|e| eprintln!("[Login] 创建 client 失败: {e}"))
+        .ok();
+
+    // 登记全局窗口弱引用：后台线程（登录轮询、评论回填）要用它写 UI
+    login::set_window(main_window.as_weak());
+
+    if let Some(client) = login_client.clone() {
+        // 从磁盘恢复登录态，并异步校验是否还活着
+        login::restore(client.clone());
+
+        // 点「登录」：申请二维码 + 开始轮询
+        {
+            let weak = main_window.as_weak();
+            let c = client.clone();
+            main_window.on_request_login(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_show_login(true);
+                    login::start(&w, c.clone());
+                }
+            });
+        }
+
+        // 关掉登录面板：停掉轮询，别在后台空转
+        main_window.on_cancel_login(move || {
+            login::cancel();
+        });
+
+        // 退出登录
+        {
+            let weak = main_window.as_weak();
+            let c = client.clone();
+            main_window.on_do_logout(move || {
+                if let Some(w) = weak.upgrade() {
+                    login::logout(&w, c.clone());
+                }
+            });
+        }
+
+        // 发评论
+        {
+            let weak = main_window.as_weak();
+            let c = client.clone();
+            main_window.on_comment_submit(move || {
+                let Some(w) = weak.upgrade() else { return };
+                let text = w.get_comment_text().to_string();
+                if text.trim().is_empty() {
+                    return;
+                }
+                let aid = player::current_aid();
+                let bvid = player::current_bvid();
+                // 回复目标：UI 只记昵称，真正的 rpid 由 player 侧按昵称反查
+                let target = w.get_reply_target().to_string();
+                let (root, parent) = if target.is_empty() {
+                    (0, 0)
+                } else {
+                    player::resolve_reply_target(&target)
+                };
+                login::post_comment(&w, c.clone(), aid, bvid, text, root, parent);
+            });
+        }
+
+        // 取消「回复 @某人」模式
+        {
+            let weak = main_window.as_weak();
+            main_window.on_comment_reply_cancel(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_reply_target("".into());
+                    w.set_comment_status("".into());
+                }
+            });
+        }
+    }
+
+    // 评论按钮的「回复」：记下目标昵称，UI 侧已改成回复模式
+    {
+        let weak = main_window.as_weak();
+        main_window.on_comment_reply_clicked(move |name, time| {
+            crate::mxprobe::log_public(&format!("[Comment] 点回复 -> {name} ({time})"));
+            if let Some(w) = weak.upgrade() {
+                w.set_reply_target(name.clone());
+                w.set_comment_status("".into());
+            }
+        });
+    }
 
     // 首屏推荐流：真实数据。
     // fresh_idx=0 表示首次进入（语义见 bli_protocol::recommend）。

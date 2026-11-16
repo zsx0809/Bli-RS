@@ -290,6 +290,10 @@ impl BiliClient {
 ///   reply_control.location  "IP属地：广东"
 ///   replies[]               楼中楼（顶层通常预置前 3 条）
 ///   count                   总回复数
+pub fn parse_reply_public(r: &serde_json::Value, owner_mid: u64) -> CommentItem {
+    parse_reply(r, owner_mid)
+}
+
 fn parse_reply(r: &serde_json::Value, owner_mid: u64) -> CommentItem {
     let member = &r["member"];
     let mid = member["mid"].as_u64().unwrap_or(0);

@@ -46,6 +46,18 @@ pub const RELATED: &str = "/x/web-interface/archive/related";
 /// 评论区主列表
 pub const REPLY_LIST: &str = "/x/v2/reply/wbi/main";
 
+/// 通行证服务（登录相关全部在 passport.bilibili.com，不在 api.bilibili.com）
+pub const PASSPORT_BASE_URL: &str = "https://passport.bilibili.com";
+
+/// 扫码登录：申请二维码
+pub const QRCODE_GENERATE: &str = "/x/passport-login/web/qrcode/generate";
+
+/// 扫码登录：轮询状态（成功时登录态在 Set-Cookie 里）
+pub const QRCODE_POLL: &str = "/x/passport-login/web/qrcode/poll";
+
+/// 发表评论 / 回复（POST，必须带 csrf）
+pub const REPLY_ADD: &str = "/x/v2/reply/add";
+
 /// 播放地址（DASH）
 ///
 /// fnval 决定返回哪些轨道：

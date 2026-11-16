@@ -190,6 +190,29 @@ export component AppWindow inherits Window {
     in-out property <bool> play_paused: false;
     in-out property <bool> is_fullscreen: false;
 
+    // ---- 登录态（由 Rust 侧 src/login.rs 写入） ----
+    in-out property <bool> logged_in: false;
+    in-out property <string> login_name: "";
+    in-out property <string> login_face_url: "";
+    in-out property <image> user_face;
+    in-out property <int> login_level: 0;
+    in-out property <bool> login_vip: false;
+    in-out property <bool> show_login: false;
+    in-out property <image> login_qr;
+    in-out property <string> login_status: "";
+    in-out property <bool> login_qr_loading: false;
+
+    // ---- 评论输入 ----
+    in-out property <string> comment_text: "";
+    in-out property <string> comment_status: "";
+    in-out property <bool> comment_sending: false;
+    in-out property <string> reply_target: "";
+    callback comment_submit();
+    callback comment_reply_cancel();
+    callback request_login();
+    callback cancel_login();
+    callback do_logout();
+
     in-out property <float> play_progress: 0.0;
     in property <string> play_time_total: "00:00";
     in property <string> play_time_current: "00:00";
@@ -428,6 +451,16 @@ export component AppWindow inherits Window {
             root.comment_reply_clicked(name, t);
         }
 
+        // 评论输入
+        logged_in: root.logged_in;
+        comment_text <=> root.comment_text;
+        comment_status: root.comment_status;
+        comment_sending: root.comment_sending;
+        reply_target <=> root.reply_target;
+        comment_submit => { root.comment_submit(); }
+        comment_cancel_reply => { root.comment_reply_cancel(); }
+        request_login => { root.request_login(); }
+
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;
         paused: root.play_paused;
@@ -455,6 +488,25 @@ export component AppWindow inherits Window {
         safe_top: root.safe_top;
         auto_play <=> root.auto_play;
         auto_play_toggled(v) => { root.auto_play_changed(v); }
+
+        logged_in: root.logged_in;
+        login_name: root.login_name;
+        login_face_url: root.login_face_url;
+        user_face: root.user_face;
+        login_level: root.login_level;
+        login_vip: root.login_vip;
+        show_login <=> root.show_login;
+        login_qr: root.login_qr;
+        login_status: root.login_status;
+        login_qr_loading: root.login_qr_loading;
+
+        open_login => { root.request_login(); }
+        close_login => {
+            root.show_login = false;
+            root.cancel_login();
+        }
+        do_logout => { root.do_logout(); }
+
         close_drawer => {
             root.drawer_open = false;
             root.drawer_changed();
