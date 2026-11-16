@@ -450,10 +450,11 @@ pub fn post_comment(
                 }
                 Err(e) => {
                     crate::mxprobe::log_public(&format!("[Comment] 发送失败: {e}"));
+                    let msg = format!("发送失败: {e}");
                     let w = w_weak.clone();
-                    let _ = w.upgrade_in_event_loop(|win| {
+                    let _ = w.upgrade_in_event_loop(move |win| {
                         win.set_comment_sending(false);
-                        win.set_comment_status(format!("发送失败: {e}").as_str().into());
+                        win.set_comment_status(msg.as_str().into());
                     });
                 }
             }
