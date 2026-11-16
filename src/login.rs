@@ -103,10 +103,10 @@ pub fn restore(client: bli_protocol::BiliClient) {
             match auth::fetch_nav(&http, &mut a).await {
                 Ok(()) => {
                     crate::mxprobe::log_public(&format!(
-                        "[Login] 登录态有效: {} (LV{})",
+                        "[Login] 登录态有效: {} (LV{}) —— 回填 UI",
                         a.uname, a.level
                     ));
-                    persist_and_apply(a, client, None);
+                    persist_and_apply(a, client);
                 }
                 Err(e) => {
                     crate::mxprobe::log_public(&format!("[Login] 登录态已失效（{e}），清除"));
@@ -119,51 +119,90 @@ pub fn restore(client: bli_protocol::BiliClient) {
 
 /// 把登录态写盘、装进 client、更新 UI。
 ///
-/// `window` 为 None 表示还没拿到 UI（启动恢复阶段），只更新全局状态。
-fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient, window: Option<&AppWindow>) {
+/// 关键点：UI 更新**不能**寄居在头像下载线程里。
+///
+/// 上一版把 `set_logged_in` / `set_login_name` 全塞进头像线程的
+/// `upgrade_in_event_loop` 闭包里，于是：
+///   · 那个线程 upgrade 失败 → 整个登录态在 UI 上不生效
+///   · 头像下载慢或失败 → 连"已登录"三个字都看不到
+/// 用户实测就是"扫码完了还是未登录、头像也没加载"。
+///
+/// 现在拆成两段：
+///   1. 文本状态（昵称/等级/是否登录）**立刻**写，不等网络
+///   2. 头像单独一个线程，回来只覆盖 user_face
+///
+/// `window` 参数已废弃，统一用全局弱引用 —— restore() 在启动阶段
+/// 没有 AppWindow 句柄，走参数的话那条路径永远不更新 UI。
+fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient) {
     crate::settings::set_string(KEY_COOKIE, &a.cookie);
     crate::settings::set_u64(KEY_MID, a.mid);
 
     // client 里的 cookie 影响所有后续请求（评论分页 / playurl 高清 / 发评论）
     client.set_auth(Some(a.clone()));
 
-    let (uname, face, level, is_vip, mid) = (a.uname.clone(), a.face.clone(), a.level, a.is_vip, a.mid);
+    let (uname, face, level, is_vip, mid) = (
+        a.uname.clone(),
+        a.face.clone(),
+        a.level,
+        a.is_vip,
+        a.mid,
+    );
 
     if let Ok(mut g) = AUTH.lock() {
         *g = Some(a);
     }
 
     crate::mxprobe::log_public(&format!(
-        "[Login] 已登录: {uname} mid={mid} LV{level} vip={is_vip}"
+        "[Login] 已登录: {uname} mid={mid} LV{level} vip={is_vip} face={}",
+        if face.is_empty() { "空" } else { &face[..face.len().min(48)] }
     ));
 
-    // 头像下载：和封面同一条流水线（后台下 + 解码 → UI 线程造 Image）
-    let face_gen = FACE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let face_for_thread = face.clone();
-    if let Some(w) = window {
-        let w = w.as_weak();
-        std::thread::spawn(move || {
-            let rgba = if face_for_thread.is_empty() {
-                None
-            } else {
-                crate::player::fetch_rgba_blocking(&face_for_thread)
-            };
-            let _ = w.upgrade_in_event_loop(move |win| {
-                if FACE_GEN.load(Ordering::SeqCst) != face_gen {
-                    return; // 期间又登录了别的账号
-                }
-                if let Some((fw, fh, data)) = rgba {
-                    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&data, fw, fh);
-                    win.set_user_face(Image::from_rgba8(buf));
-                }
+    // ---- 第一段：文本状态，立即生效 ----
+    let text_gen = FACE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    match window() {
+        Some(w) => {
+            let uname_ui = uname.clone();
+            let face_ui = face.clone();
+            let logged = std::sync::Arc::new(AtomicBool::new(false));
+            let logged_flag = logged.clone();
+            let ok = w.upgrade_in_event_loop(move |win| {
                 win.set_logged_in(true);
-                win.set_login_name(uname.as_str().into());
+                win.set_login_name(uname_ui.as_str().into());
                 win.set_login_level(level as i32);
                 win.set_login_vip(is_vip);
-                win.set_login_face_url(face.as_str().into());
+                win.set_login_face_url(face_ui.as_str().into());
+                win.set_show_login(false);
+                win.set_login_status("登录成功".into());
+                win.set_login_qr_loading(false);
+                logged_flag.store(true, Ordering::SeqCst);
             });
-        });
+            if ok.is_err() {
+                crate::mxprobe::log_public("[Login] 警告：UI 事件队列已关闭，登录态只留在内存");
+            }
+        }
+        None => crate::mxprobe::log_public("[Login] 警告：没有登记过窗口，UI 无法更新"),
     }
+
+    // ---- 第二段：头像，后台下载后单独覆盖 ----
+    if face.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let rgba = crate::player::fetch_rgba_blocking(&face);
+        let Some((fw, fh, data)) = rgba else {
+            crate::mxprobe::log_public("[Login] 头像下载失败");
+            return;
+        };
+        let Some(w) = window() else { return };
+        let _ = w.upgrade_in_event_loop(move |win| {
+            if FACE_GEN.load(Ordering::SeqCst) != text_gen {
+                return; // 期间又登录了别的账号
+            }
+            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&data, fw, fh);
+            win.set_user_face(Image::from_rgba8(buf));
+            crate::mxprobe::log_public("[Login] 头像已上屏");
+        });
+    });
 }
 
 /// 当前登录态快照。
@@ -180,12 +219,11 @@ pub fn is_logged_in() -> bool {
 /// 全程在后台线程 —— UI 线程绝对不能碰网络（会卡住渲染，
 /// 表现是界面冻住几百毫秒）。
 pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
-    if POLLING.swap(true, Ordering::SeqCst) {
-        crate::mxprobe::log_public("[Login] 已经在轮询中，忽略重复点击");
-        return;
-    }
-
+    // 每次 start 都推进代数：旧轮询线程看到代数变了会自己退出。
+    // 这里**不**因为"已有轮询"而提前返回 —— 用户点"刷新"就是想让
+    // 旧的那一轮作废。重复点击的代价只是多一次 generate 请求。
     let gen = POLL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    POLLING.store(true, Ordering::SeqCst);
 
     // UI 先进入"加载中"
     {
@@ -205,7 +243,7 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
         {
             Ok(rt) => rt,
             Err(e) => {
-                POLLING.store(false, Ordering::SeqCst);
+                finish(gen);
                 report(&w_weak, format!("创建运行时失败: {e}"));
                 return;
             }
@@ -218,7 +256,7 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    POLLING.store(false, Ordering::SeqCst);
+                    finish(gen);
                     report(&w_weak, format!("创建 HTTP 客户端失败: {e}"));
                     return;
                 }
@@ -227,7 +265,7 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
             let qr = match auth::qrcode_generate(&http).await {
                 Ok(q) => q,
                 Err(e) => {
-                    POLLING.store(false, Ordering::SeqCst);
+                    finish(gen);
                     report(&w_weak, format!("获取二维码失败: {e}"));
                     return;
                 }
@@ -263,14 +301,12 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
             // 这个线程应该安静地死掉，而不是继续抢状态。
             for _ in 0..90 {
                 if POLL_GEN.load(Ordering::SeqCst) != gen {
-                    POLLING.store(false, Ordering::SeqCst);
-                    return;
+                    return; // 被别人接管了，静默退出，不要清 POLLING
                 }
 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
                 if POLL_GEN.load(Ordering::SeqCst) != gen {
-                    POLLING.store(false, Ordering::SeqCst);
                     return;
                 }
 
@@ -289,7 +325,7 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
                             win.set_login_qr_loading(false);
                         });
                         crate::mxprobe::log_public("[Login] 二维码过期");
-                        POLLING.store(false, Ordering::SeqCst);
+                        finish(gen);
                         return;
                     }
                     Ok(PollState::Success(mut a)) => {
@@ -300,14 +336,18 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
                             ));
                         }
 
-                        let w = w_weak.clone();
-                        let _ = w.upgrade_in_event_loop(|win| {
-                            win.set_login_status("登录成功".into());
-                            win.set_show_login(false);
-                        });
+                        // 先清掉"生成中"：否则登录成功了面板还停在 loading 态，
+                        // 用户看到的就是"扫完了没反应"。
+                        if let Some(w) = window() {
+                            let _ = w.upgrade_in_event_loop(|win| {
+                                win.set_login_qr_loading(false);
+                                win.set_login_status("登录成功".into());
+                                win.set_show_login(false);
+                            });
+                        }
 
-                        persist_and_apply(*a, client.clone(), w_weak.upgrade().as_ref());
-                        POLLING.store(false, Ordering::SeqCst);
+                        persist_and_apply(*a, client.clone());
+                        finish(gen);
 
                         // 登录后立刻刷新评论区：未登录只有 3 条，登录后有 20 条/页
                         let cur_bvid = crate::player::current_bvid();
@@ -328,15 +368,31 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
                 win.set_login_status("二维码已过期，请刷新".into());
                 win.set_login_qr_loading(false);
             });
-            POLLING.store(false, Ordering::SeqCst);
+            finish(gen);
         });
     });
 }
 
-/// 取消当前轮询（用户关掉了登录面板 / 点了退出）。
+/// 收尾：只有当代数仍然是自己的时候才把 POLLING 复位。
+///
+/// 为什么必须判代数：用户点了"刷新"之后，新线程已经把 POLLING 置 true，
+/// 旧线程若此时无条件置 false，新线程就再也没人置回去了 ——
+/// 下一次点登录会被当成"已经在轮询中"。
+fn finish(gen: u64) {
+    if POLL_GEN.load(Ordering::SeqCst) == gen {
+        POLLING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 取消当前轮询（用户关掉了登录面板 / 点了退出 / 点了刷新）。
+///
+/// 只推进代数，**不**复位 POLLING —— 复位由 start() 负责。
+/// 如果这里也复位，会出现这个竞态：
+///   cancel() 复位 → 旧线程还在跑 → start() 看到 false 就开新线程
+///   → 两个线程同时轮询同一个 key，其中一个拿到 86038 就把
+///     刚生成的新二维码判成过期。
 pub fn cancel() {
     POLL_GEN.fetch_add(1, Ordering::SeqCst);
-    POLLING.store(false, Ordering::SeqCst);
 }
 
 /// 退出登录。

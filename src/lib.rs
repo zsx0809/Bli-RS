@@ -423,6 +423,11 @@ fn android_main(app: slint::android::AndroidApp) {
             main_window.on_request_login(move || {
                 if let Some(w) = weak.upgrade() {
                     w.set_show_login(true);
+                    // 先取消上一轮再开新的。
+                    // 不取消的话，用户点「刷新」会被 start() 里的
+                    // "已经在轮询中" 拦掉，二维码永远不刷新 ——
+                    // 实测就踩过：第一次网络抖动卡住后，刷新彻底失效。
+                    login::cancel();
                     login::start(&w, c.clone());
                 }
             });
