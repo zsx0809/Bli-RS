@@ -981,61 +981,52 @@ fn spawn_comment_page(
         ));
 
         let face_urls: Vec<String> = items.iter().map(|c| c.user_face.clone()).collect();
-        let start_idx = if fresh {
-            0
-        } else {
-            COMMENT_STATE.lock().map(|g| g.pn.saturating_sub(1) * 20).unwrap_or(0)
-        };
-        // 更可靠的追加位置：直接读 UI 模型当前的条数
-        let w_list = window.clone();
-        let raw: Vec<CommentItemData> = items
+
+        // 注意：CommentItemData 里含 ModelRc，ModelRc **不是 Send**，
+        // 不能在后台线程构造。这里只把纯数据的 RawComment 送过去，
+        // 到 UI 线程再转成模型。
+        let raw: Vec<RawComment> = items
             .into_iter()
-            .map(|c| {
-                let sub_authors: Vec<slint::SharedString> =
-                    c.sub_replies.iter().map(|s| s.user_name.as_str().into()).collect();
-                let sub_replies: Vec<slint::SharedString> =
-                    c.sub_replies.iter().map(|s| s.content.as_str().into()).collect();
-                CommentItemData {
-                    rpid: c.rpid as i32,
-                    user_name: c.user_name.into(),
-                    user_face: Image::default(),
-                    content: c.content.into(),
-                    likes: c.likes.into(),
-                    pubtime: c.pubtime.into(),
-                    level: c.level as i32,
-                    is_vip: c.is_vip,
-                    is_up: c.is_up,
-                    location: c.location.into(),
-                    reply_count: c.reply_count as i32,
-                    sub_replies: ModelRc::new(VecModel::from(sub_replies)),
-                    sub_authors: ModelRc::new(VecModel::from(sub_authors)),
-                }
+            .map(|c| RawComment {
+                rpid: c.rpid,
+                sub_authors: c.sub_replies.iter().map(|s| s.user_name.clone()).collect(),
+                sub_contents: c.sub_replies.iter().map(|s| s.content.clone()).collect(),
+                user_name: c.user_name,
+                user_face: c.user_face,
+                content: c.content,
+                likes: c.likes,
+                pubtime: c.pubtime,
+                level: c.level,
+                is_vip: c.is_vip,
+                is_up: c.is_up,
+                location: c.location,
+                reply_count: c.reply_count,
             })
             .collect();
 
-        let _ = start_idx;
+        let w_list = window.clone();
         let _ = window.upgrade_in_event_loop(move |w| {
             if fresh {
-                let model = VecModel::from(raw);
+                let rows: Vec<CommentItemData> = raw.into_iter().map(raw_to_ui).collect();
+                let model = VecModel::from(rows);
                 w.set_video_comments(ModelRc::new(Rc::new(model)));
             } else {
-                // 追加：
-                //   Slint 的 VecModel 一旦交给 ModelRc 就没有"push 一行"
-                //   的安全入口（set_row_data 只能改已有行，越界会被忽略）。
-                //   稳妥做法是把现有行读出来、拼上新行、整份重设。
-                //   代价是一次 O(n) 的模型重建；20 条/页、翻到几百条时
-                //   也只是几毫秒，比"翻页不生效"可接受得多。
+                // 追加：读出现有行、拼上新行、整份重设。
+                // Slint 的 VecModel 交给 ModelRc 后没有"push 一行"的安全入口，
+                // set_row_data 只能改已有行。20 条/页时重建代价是几毫秒。
                 let model = w.get_video_comments();
-                let mut merged: Vec<CommentItemData> = Vec::with_capacity(model.row_count() + raw.len());
+                let mut merged: Vec<CommentItemData> =
+                    Vec::with_capacity(model.row_count() + raw.len());
                 for i in 0..model.row_count() {
                     if let Some(row) = model.row_data(i) {
                         merged.push(row);
                     }
                 }
-                merged.extend(raw);
+                merged.extend(raw.into_iter().map(raw_to_ui));
                 let new_model = VecModel::from(merged);
                 w.set_video_comments(ModelRc::new(Rc::new(new_model)));
             }
+
             w.set_comments_loading_more(false);
             let has_more = COMMENT_STATE.lock().map(|g| g.has_more).unwrap_or(false);
             w.set_comments_has_more(has_more);
@@ -1110,6 +1101,35 @@ pub fn resolve_reply_target(name: &str) -> (u64, u64) {
     }
     crate::mxprobe::log_public(&format!("[Comment] 找不到 {name} 的 rpid，按顶层评论发送"));
     (0, 0)
+}
+
+/// RawComment → UI 模型行。
+///
+/// 必须是**顶层函数**，不能写成闭包。
+/// 原因：闭包内定义的闭包会被判成"捕获了外层闭包的环境"，
+/// 而外层是 upgrade_in_event_loop 的参数、要求 Send；
+/// Slint 的 Image/ModelRc 内部有 *mut () 的 PhantomData，不是 Send，
+/// 于是整个外层闭包被判成不可 Send，编译期直接报错。
+fn raw_to_ui(c: RawComment) -> CommentItemData {
+    let sub_authors: Vec<slint::SharedString> =
+        c.sub_authors.iter().map(|s| s.as_str().into()).collect();
+    let sub_replies: Vec<slint::SharedString> =
+        c.sub_contents.iter().map(|s| s.as_str().into()).collect();
+    CommentItemData {
+        rpid: c.rpid as i32,
+        user_name: c.user_name.into(),
+        user_face: Image::default(),
+        content: c.content.into(),
+        likes: c.likes.into(),
+        pubtime: c.pubtime.into(),
+        level: c.level as i32,
+        is_vip: c.is_vip,
+        is_up: c.is_up,
+        location: c.location.into(),
+        reply_count: c.reply_count as i32,
+        sub_replies: ModelRc::new(VecModel::from(sub_replies)),
+        sub_authors: ModelRc::new(VecModel::from(sub_authors)),
+    }
 }
 
 /// 评论头像批量下载并逐条回填。
