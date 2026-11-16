@@ -220,6 +220,8 @@ export component AppWindow inherits Window {
     in-out property <bool> comments_has_more: true;
     /// 评论区总条数（服务端 page.count）。标题显示它，而不是已加载条数。
     in-out property <int> comments_total: 0;
+    /// 当前排序：0 = 最新，1 = 最热
+    in-out property <int> comment_sort: 1;
     callback load_more_comments();
     callback change_comment_sort(int);
 
@@ -474,6 +476,7 @@ export component AppWindow inherits Window {
         comments_loading_more: root.comments_loading_more;
         comments_has_more <=> root.comments_has_more;
         comments_total <=> root.comments_total;
+        comment_sort <=> root.comment_sort;
         load_more_comments => { root.load_more_comments(); }
         change_comment_sort(mode) => { root.change_comment_sort(mode); }
 
