@@ -72,6 +72,8 @@ export component RecommendView inherits Rectangle {
     property <length> drag_base: 0px;
     property <length> fling_vel: 0px;
     property <PanAxis> active_axis: PanAxis.None;
+    /// 惯性滑行中（见 fling_timer；决定 content_layer 的 y 要不要走动画）
+    property <bool> flinging: false;
     // 触底加载的节流标志 —— 避免每个像素都往 Rust 侧抛一次 load_more
     property <bool> more_requested: false;
 
@@ -107,9 +109,11 @@ export component RecommendView inherits Rectangle {
         if (axis == PanAxis.Vertical) {
             root.drag_base = root.scroll_y;
             fling_timer.stop();
+            root.flinging = false;
             root.fling_vel = 0px;
         } else if (axis == PanAxis.Horizontal) {
             fling_timer.stop();
+            root.flinging = false;
             root.fling_vel = 0px;
             root.swipe_horizontal(0px, 0px);
         }
@@ -145,9 +149,11 @@ export component RecommendView inherits Rectangle {
             let scaled_v = v * 1.6;
             if ((v / 1px) > 1.2) {
                 root.fling_vel = Math.min(scaled_v, 75px);
+                root.flinging = true;
                 fling_timer.start();
             } else if ((v / 1px) < -1.2) {
                 root.fling_vel = Math.max(scaled_v, -75px);
+                root.flinging = true;
                 fling_timer.start();
             } else {
                 root.fling_vel = 0px;
@@ -166,17 +172,28 @@ export component RecommendView inherits Rectangle {
         }
         root.pull_distance = 0px;
         root.fling_vel = 0px;
+        root.flinging = false;
         root.active_axis = PanAxis.None;
     }
 
     // 惯性滑行：8ms 定时器精准对齐 120Hz 物理刷新帧率 (约 8.33ms/帧)
     // 0.965 衰减系数杜绝高刷下的剧烈衰减与滞涩阻滞感
+    //
+    // 注意 flinging 这个标志的用途：它和 active_axis **同时**参与
+    // content_layer 的 animate y 判据。早先只用 active_axis 判断，
+    // 而 pan_end 里立刻就把 active_axis 清成 None 再去拉起惯性 ——
+    // 于是惯性期间 duration 走的是 200ms 分支：
+    // 8ms 定时器每推一帧、动画就重起一个 200ms 补间，
+    // 补间永远跑不完又要重新追，观感就是「甩一下卡成幻灯片」。
+    // 手指拖动时没这个问题，因为那时 duration 是 0ms ——
+    // 这也正好解释了「拖动跟手、松手极卡」这个割裂现象。
     fling_timer := Timer {
         interval: 8ms;
         running: false;
         triggered => {
             if (Math.abs(root.fling_vel) < 0.4px) {
                 root.fling_vel = 0px;
+                root.flinging = false;
                 self.running = false;
                 return;
             }
@@ -184,12 +201,14 @@ export component RecommendView inherits Rectangle {
             if (next <= 0px) {
                 root.scroll_y = 0px;
                 root.fling_vel = 0px;
+                root.flinging = false;
                 self.running = false;
                 return;
             }
             if (next >= root.max_scroll) {
                 root.scroll_y = root.max_scroll;
                 root.fling_vel = 0px;
+                root.flinging = false;
                 self.running = false;
                 return;
             }
@@ -238,7 +257,8 @@ export component RecommendView inherits Rectangle {
         height: Math.max(parent.height, root.content_h);
         y: root.pull_distance - root.scroll_y;
         animate y {
-            duration: (root.active_axis == PanAxis.None) ? 200ms : 0ms;
+            // 惯性期间必须是 0ms：与手指拖动同一条路径，逐帧直给
+            duration: (root.active_axis == PanAxis.None && !root.flinging) ? 200ms : 0ms;
             easing: ease-out;
         }
 

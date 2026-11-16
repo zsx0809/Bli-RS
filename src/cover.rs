@@ -60,6 +60,11 @@ pub fn thumbnail_url(raw: &str) -> String {
 /// 逐张回传而不是「全部完成再发」：
 ///   20 张图串行下载要好几秒，用户会先看到一片空白。
 ///   逐张到达能立刻填充，体验上是「图片逐渐出现」。
+///
+/// 磁盘缓存：命中 `covers/<bvid>.img` 就直接本地解码，不发请求。
+/// 这是「重复进同一个详情页、来回刷首页都不重新拉图」的前提。
+/// 存的是**原始压缩字节**（webp 约 28KB），不是解码后的 RGBA
+/// （480x270 RGBA 是 518KB，大 18 倍，而解码一次只要几毫秒）。
 pub fn spawn_cover_loader(items: Vec<(String, String)>, tx: Sender<DecodedCover>) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -110,6 +115,15 @@ pub fn spawn_cover_loader(items: Vec<(String, String)>, tx: Sender<DecodedCover>
                         return;
                     };
 
+                    // ---- 先看磁盘缓存 ----
+                    let cache_path = cache_file(&bvid);
+                    if let Ok(bytes) = std::fs::read(&cache_path) {
+                        if let Some(d) = decode_and_pack(bvid.clone(), &bytes) {
+                            let _ = tx.send(d);
+                        }
+                        return;
+                    }
+
                     let target = thumbnail_url(&url);
                     if target.is_empty() {
                         return;
@@ -132,23 +146,13 @@ pub fn spawn_cover_loader(items: Vec<(String, String)>, tx: Sender<DecodedCover>
                         return;
                     };
 
-                    // 解码是 CPU 密集操作，但仍放在这里：
-                    // 20 张 480x270 的 webp 解码总共约 30-50ms，
-                    // 分摊到 6 个并发任务上几乎不可感知，不值得再开线程池。
-                    let Ok(decoded) = image::load_from_memory(&bytes) else {
-                        log::warn!("封面 {bvid}: 解码失败");
+                    // 落盘原始压缩字节（约 28KB），下次直接命中
+                    let _ = std::fs::write(&cache_path, &bytes);
+
+                    let Some(decoded) = decode_and_pack(bvid, &bytes) else {
                         return;
                     };
-
-                    let rgba = decoded.to_rgba8();
-                    let (width, height) = rgba.dimensions();
-
-                    let _ = tx.send(DecodedCover {
-                        bvid,
-                        width,
-                        height,
-                        rgba: rgba.into_raw(),
-                    });
+                    let _ = tx.send(decoded);
                 }));
             }
 
@@ -165,6 +169,40 @@ pub fn spawn_cover_loader(items: Vec<(String, String)>, tx: Sender<DecodedCover>
 
 pub const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Safari/605.1.15";
+
+/// 封面磁盘缓存路径：`<cacheDir>/covers/<bvid>.img`
+fn cache_file(bvid: &str) -> std::path::PathBuf {
+    // bvid 只含字母数字，直接当文件名是安全的；
+    // 仍做一次过滤，避免将来换成含路径分隔符的 id 时出目录穿越问题。
+    let safe: String = bvid
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    crate::cache::cover_dir().join(format!("{safe}.img"))
+}
+
+/// 解码一张已下载（或已缓存）的封面成 RGBA。
+///
+/// 抽成独立函数是因为它有两个调用点（磁盘命中和网络下载），
+/// 两处的后续处理必须完全一致，否则会出现「缓存的图能显示、
+/// 刚下的图不显示」这种分裂。
+fn decode_and_pack(bvid: String, bytes: &[u8]) -> Option<DecodedCover> {
+    let decoded = match image::load_from_memory(bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("封面 {bvid}: 解码失败 {e}");
+            return None;
+        }
+    };
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(DecodedCover {
+        bvid,
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    })
+}
 
 #[cfg(test)]
 mod tests {

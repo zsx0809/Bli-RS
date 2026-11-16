@@ -215,10 +215,22 @@ export component VideoDetailView inherits Rectangle {
     property <float> gesture_base_progress: 0.0;
 
     // 控制条自动隐藏
+    //
+    // awaiting_play 期间不休眠：那时控制条里的播放键是唯一的起播入口，
+    // 自动隐藏后用户会面对一块封面不知道下一步做什么。
     controls_timer := Timer {
         interval: 4s;
-        running: root.controls_visible && root.hud_mode == "" && root.detail.is_ready;
+        running: root.controls_visible
+            && root.hud_mode == ""
+            && !root.awaiting_play
+            && (root.detail.is_ready || root.detail.load_error != "");
         triggered => { root.controls_visible = false; }
+    }
+
+    changed awaiting_play => {
+        if (root.awaiting_play) {
+            root.controls_visible = true;
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -459,9 +471,17 @@ export component VideoDetailView inherits Rectangle {
             respect_system_gesture: false;
 
             tap(x, y) => {
-                root.controls_visible = !root.controls_visible;
-                if (root.controls_visible) {
-                    controls_timer.restart();
+                // 等待起播时，点画面就等于按播放键 —— 不用非得去够控制条。
+                // 这是去掉中央大播放键之后补上的手感损失：用户看到封面
+                // 第一反应就是点画面，这个入口不能没有。
+                if (root.awaiting_play) {
+                    root.awaiting_play = false;
+                    root.toggle_play();
+                } else {
+                    root.controls_visible = !root.controls_visible;
+                    if (root.controls_visible) {
+                        controls_timer.restart();
+                    }
                 }
             }
 
@@ -582,32 +602,33 @@ export component VideoDetailView inherits Rectangle {
         }
 
         // ==================================================================
-        // 中央播放按钮（自动播放关闭时出现）
+        // 「等待起播」提示（自动播放关闭时）
         //
-        // 这是"进详情页只加载、不播放"的起播入口：
-        //   有它，用户明确知道"点这里才开始播"，而不是对着一块黑猜。
+        // 这里**不再画中央大播放键**。
+        //
+        // 为什么去掉：控制条里已经有「快退 / 播放暂停 / 快进 / 全屏」
+        // 一排按键，那个播放暂停键本身就是起播入口（Rust 侧 toggle_play
+        // 的第一条分支就是「还没有解码器 → start_pending」）。
+        // 再叠一个大播放键，屏幕上同时存在两个语义相同的按钮，
+        // 大的那个还盖在画面正中，纯属添乱。
+        //
+        // 现在只留一行小字，告诉用户"封面后面是有东西的，按播放键开始"，
+        // 视觉上不抢画面。controls_visible 在 awaiting_play 期间恒为真
+        // （下面 controls_timer 的启动条件里已经算进去了），所以这行字
+        // 和播放键一定同时可见。
         // ==================================================================
         if root.awaiting_play : Rectangle {
-            width: 64px;
-            height: 64px;
-            border-radius: 32px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: #00000099;
+            width: 100%;
+            height: 100%;
+            background: transparent;
 
             Text {
-                text: "▶";
-                color: #ffffff;
-                font-size: 26px;
-                horizontal-alignment: center;
+                x: 12px;
+                y: parent.height - 78px;
+                text: "点击下方播放键开始播放";
+                color: #ffffffcc;
+                font-size: 12px;
                 vertical-alignment: center;
-            }
-
-            TouchArea {
-                clicked => {
-                    root.awaiting_play = false;
-                    root.toggle_play();
-                }
             }
         }
 

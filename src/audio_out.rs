@@ -101,12 +101,25 @@ pub struct PlayClock {
     /// AAudioStream_getTimestamp 返回的是**硬件侧已播放帧数**，
     /// 这才是唯一准确的播放位置。
     hw_frames: AtomicI64,
+    /// 硬件帧数的**基线**：seek 那一刻已经播到的帧数。
+    ///
+    /// 为什么必须有它：AAudioStream_getTimestamp 返回的 frame_position
+    /// 是这条流**自打开以来**的累计值，它不知道我们跳了进度，也不会因为这个
+    /// 归零。所以 seek 之后直接拿它算位置，立刻就会得到
+    /// 「新基准 + 已播过的全部时长」，画面要么疯狂追帧要么冻住。
+    ///
+    /// 正确做法：seek 时把当前 hw_frames 记成基线，
+    /// position_us() 用 (hw - hw_base) 作为"seek 以来播了多少帧"。
+    /// 这样不需要重建 AAudio 流（重建会断音几百毫秒）。
+    hw_base: AtomicI64,
     /// 累计填入的**静音**帧数。
     ///
     /// 为什么必须扣掉：AAudio 的 frame_position 统计的是"硬件播放了多少帧"，
     /// 包括我们因数据不足而填的静音。若不扣除，音频时钟会跑得比真实
     /// 音频内容快 —— 表现为画面追着音频跑、整体偏快。
     silence_frames: AtomicI64,
+    /// 静音帧数的基线（同理，seek 时记一次，用增量而不是累计值）
+    silence_base: AtomicI64,
     /// 每帧字节数（通道数 × 每样本字节数）
     frame_bytes: AtomicU64,
     /// 采样率
@@ -125,7 +138,9 @@ impl PlayClock {
             written_bytes: AtomicU64::new(0),
             played_bytes: AtomicU64::new(0),
             hw_frames: AtomicI64::new(-1),
+            hw_base: AtomicI64::new(0),
             silence_frames: AtomicI64::new(0),
+            silence_base: AtomicI64::new(0),
             frame_bytes: AtomicU64::new(4),
             sample_rate: AtomicU64::new(48000),
             paused: AtomicBool::new(false),
@@ -150,12 +165,19 @@ impl PlayClock {
         let fb = self.frame_bytes.load(Ordering::Relaxed).max(1);
         let sr = self.sample_rate.load(Ordering::Relaxed).max(1);
 
-        // ---- 首选：硬件时间戳，但要扣掉我们填入的静音 ----
+        // ---- 首选：硬件时间戳，但要扣掉基线与我们填入的静音 ----
+        //
+        // 两者都用**增量**（当前值 - seek 时的基线）：
+        //   · 不 seek 时基线是 0，增量 == 累计值，行为不变
+        //   · seek 之后基线被记成当时的累计值，增量从 0 重新开始
+        //     这正是"跳转后音频从落点重新播了多久"的正确含义
         let hw = self.hw_frames.load(Ordering::Relaxed);
         if hw >= 0 {
+            let hw_base = self.hw_base.load(Ordering::Relaxed);
             let silence = self.silence_frames.load(Ordering::Relaxed);
-            // 真实音频已播放帧数 = 硬件总帧数 - 静音帧数
-            let real = (hw - silence).max(0);
+            let silence_base = self.silence_base.load(Ordering::Relaxed);
+            // 真实音频已播放帧数 = 硬件增量 - 静音增量
+            let real = ((hw - hw_base) - (silence - silence_base)).max(0);
             return base + (real as f64 / sr as f64 * 1_000_000.0) as i64;
         }
 
@@ -212,6 +234,37 @@ impl PlayClock {
         self.played_bytes.store(0, Ordering::Relaxed);
         self.written_bytes.store(0, Ordering::Relaxed);
         self.base_pts_us.store(base_pts_us, Ordering::Relaxed);
+    }
+
+    /// seek 后把时钟整体挪到新位置。
+    ///
+    /// 三件事，缺一不可：
+    ///   1. 把当前的硬件帧数与静音帧数记成**基线**（不是清零 ——
+    ///      它们是 AAudio 的累计值，清零后下一次回调立刻又写回大数，
+    ///      位置会瞬间跳回"已播了多久"）
+    ///   2. PTS 基准改成目标落点
+    ///   3. 字节计数清零（环形缓冲马上会被 clear）
+    ///
+    /// 另外 hw_frames 临时置 -1 没有意义：那会让 position_us 退回
+    /// 字节估算分支，而那条分支在 seek 后同样不准（played_bytes 已清）。
+    /// 直接留着实测值 + 基线偏移，两边都自洽。
+    pub fn reseek_to(&self, base_pts_us: i64) {
+        let hw = self.hw_frames.load(Ordering::Relaxed);
+        let silence = self.silence_frames.load(Ordering::Relaxed);
+        if hw >= 0 {
+            self.hw_base.store(hw, Ordering::Relaxed);
+        }
+        self.silence_base.store(silence, Ordering::Relaxed);
+
+        self.played_bytes.store(0, Ordering::Relaxed);
+        self.written_bytes.store(0, Ordering::Relaxed);
+        self.last_pts_us.store(base_pts_us, Ordering::Relaxed);
+        self.base_pts_us.store(base_pts_us, Ordering::Relaxed);
+    }
+
+    /// 采样率（诊断用）
+    pub fn sample_rate(&self) -> u64 {
+        self.sample_rate.load(Ordering::Relaxed)
     }
 
     pub fn set_paused(&self, p: bool) {
@@ -389,6 +442,18 @@ impl AudioOutput {
             Ok(mut r) => r.clear(),
             Err(e) => e.into_inner().clear(),
         }
+    }
+
+    /// seek：清空残留 PCM + 把时钟整体挪到目标点。
+    ///
+    /// 两件事必须在同一处做，顺序不能反：
+    ///   1. clear() 扔掉环形缓冲里 seek 之前的旧音频
+    ///      （不清的话跳完之后会先听到最多 1 秒的旧声音，
+    ///       与画面完全错位 —— 这正是「跳一下就不同步了」的来源之一）
+    ///   2. reseek_to() 把硬件帧计数与 PTS 基准一起归零
+    pub fn seek_to(&self, pts_us: i64) {
+        self.clear();
+        self.clock.reseek_to(pts_us);
     }
 
     /// 诊断：已消费的字节数。用来确认 AAudio 回调真的在跑。

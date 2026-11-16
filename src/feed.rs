@@ -114,35 +114,125 @@ fn pair_rows(items: Vec<VideoItemData>) -> Vec<VideoRowPair> {
 
     rows
 }
-
 // ==============================================================================
 // 全局状态
 //
-// Slint 的 AppWindow 是单实例，用 thread_local 存请求状态最简单。
-// 换多窗口时这里要改成按窗口 id 索引的 Map。
+// ★ 这里曾经有一个极隐蔽、后果却很严重的 bug：翻页只翻得动一次。
+//
+//   原实现把 IN_FLIGHT / FRESH_IDX 放在 thread_local 里，而
+//   spawn_page_request 是在 **UI 线程**把 IN_FLIGHT 置 true，
+//   然后丢给一个**新建的工作线程**去请求，再在工作线程里把它置回 false。
+//   thread_local 每个线程一份 —— 工作线程改的是它自己那份，
+//   UI 线程那份永远停在 true。
+//
+//   后果：第二次 load_more() 一进来就看到 IN_FLIGHT == true，直接 return。
+//   表现为「首页拉到第一页之后再也翻不动」「刷新以后也只有那一批视频」。
+//   同一个错误也让 FRESH_IDX 卡住，永远请求同一页。
+//
+//   所以请求状态必须是**进程级**的，用 static + Mutex/Atomic，
+//   只有真正只在 UI 线程访问的东西（比如 MODEL 句柄）才适合 thread_local。
 // ==============================================================================
 
-thread_local! {
-    /// 已经请求过封面的 bvid，避免重复下载
-    static REQUESTED_COVERS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+/// 当前翻页游标。0 表示还没加载过任何一页。
+static FRESH_IDX: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+/// 是否正在加载（首屏或下一页），防止重复触发。**必须进程级**（见上面的说明）。
+static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 已出现过的 bvid，用于跨页去重
+static SEEN_BVIDS: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
 
-    /// 当前翻页游标。0 表示还没加载过任何一页。
-    static FRESH_IDX: RefCell<u32> = const { RefCell::new(0) };
+use std::sync::atomic::Ordering;
 
-    /// 是否正在加载（首屏或下一页），防止重复触发
-    static IN_FLIGHT: RefCell<bool> = const { RefCell::new(false) };
-
-    /// bvid -> 封面URL，供懒加载时查
-    static COVER_URLS: RefCell<std::collections::HashMap<String, String>> =
-        RefCell::new(std::collections::HashMap::new());
+fn idx_load() -> u32 {
+    match FRESH_IDX.lock() {
+        Ok(g) => *g,
+        Err(e) => *e.into_inner(),
+    }
 }
 
-/// 首屏加载 / 下拉刷新。
+fn idx_store(v: u32) {
+    match FRESH_IDX.lock() {
+        Ok(mut g) => *g = v,
+        Err(e) => *e.into_inner() = v,
+    }
+}
+
+/// 首页列表缓存文件（放 filesDir，不用 cacheDir —— 系统清缓存时不该把
+/// 「首页长什么样」一起清掉，否则冷启动又是白屏）。
+fn cache_file() -> std::path::PathBuf {
+    let base = crate::android_window::files_dir()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/data/data/com.bli.rs/files"));
+    let _ = std::fs::create_dir_all(&base);
+    base.join("feed_cache.json")
+}
+
+/// 读上次的首页列表。任何解析问题都当作"没有缓存"，不报错。
+fn cache_read() -> Option<Vec<bli_protocol::recommend::VideoItem>> {
+    let text = std::fs::read_to_string(cache_file()).ok()?;
+    let items: Vec<bli_protocol::recommend::VideoItem> = serde_json::from_str(&text).ok()?;
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
+}
+
+/// 把当前列表写盘。封面的 bvid/url 都在 VideoItem 里，所以整份可序列化。
+fn cache_write(items: &[bli_protocol::recommend::VideoItem]) {
+    // 只留前 60 条：缓存的作用是冷启动第一屏，攒太多只会让启动读盘变慢
+    let slice = &items[..items.len().min(60)];
+    match serde_json::to_string(slice) {
+        Ok(s) => {
+            let _ = std::fs::write(cache_file(), s);
+        }
+        Err(e) => log::warn!("首页缓存写入失败: {e}"),
+    }
+}
+
+/// 首屏加载。
+///
+/// 有本地缓存时**先显示缓存再静默刷新** —— 冷启动不再白屏等网络。
 pub fn load_feed(window: slint::Weak<AppWindow>, _fresh_idx: u32) {
-    // 刷新时把游标与去重表都清空，相当于重新开始
-    FRESH_IDX.with(|c| *c.borrow_mut() = 0);
-    REQUESTED_COVERS.with(|c| c.borrow_mut().clear());
-    COVER_URLS.with(|c| c.borrow_mut().clear());
+    // ---- 1. 有缓存：先铺屏，再后台刷新 ----
+    if let Some(items) = cache_read() {
+        let covers: Vec<(String, String)> = items
+            .iter()
+            .filter(|v| !v.cover_url.is_empty())
+            .map(|v| (v.bvid.clone(), v.cover_url.clone()))
+            .collect();
+        let raws: Vec<RawItem> = items.iter().map(to_raw).collect();
+        let n = items.len();
+
+        let _ = window.upgrade_in_event_loop(move |w| {
+            let ui_items: Vec<VideoItemData> =
+                raws.into_iter().map(RawItem::into_slint).collect();
+            let model = Rc::new(VecModel::from(pair_rows(ui_items)));
+            w.set_rows(ModelRc::from(model.clone()));
+            MODEL.with(|m| *m.borrow_mut() = Some(model));
+            w.set_feed_state(2);
+            w.set_feed_error(Default::default());
+            w.set_has_more(true);
+            w.set_loading_more(false);
+            w.set_more_error(Default::default());
+            ensure_cover_pump();
+            spawn_batched_loader(covers);
+        });
+
+        crate::mxprobe::log_public(&format!(
+            "[Feed] 冷启动命中本地缓存 {n} 条，先上屏，后台继续刷新"
+        ));
+
+        // 刷新时不显示骨架屏，也不动已有列表（quiet = true）
+        idx_store(0);
+        spawn_page_request(window, Mode::Refresh, /* quiet = */ true);
+        return;
+    }
+
+    // ---- 2. 无缓存：骨架屏 + 网络 ----
+    idx_store(0);
+    if let Ok(mut g) = SEEN_BVIDS.lock() {
+        g.get_or_insert_with(HashSet::new).clear();
+    }
 
     let weak = window.clone();
     let _ = window.upgrade_in_event_loop(|w| {
@@ -155,13 +245,31 @@ pub fn load_feed(window: slint::Weak<AppWindow>, _fresh_idx: u32) {
         w.set_g_pull(Default::default());
     });
 
-    spawn_page_request(weak, /* append = */ false);
+    spawn_page_request(weak, Mode::Replace, /* quiet = */ false);
+}
+
+/// 下拉刷新。
+///
+/// 与冷启动的区别：**保留现有列表**，把新拉到的内容插到顶部。
+/// 用户下拉时屏幕上本来就有内容，突然全白再慢慢长出来是最差的体验。
+pub fn refresh_feed(window: slint::Weak<AppWindow>) {
+    // 刷新从 fresh_idx = 0 重新开始，对应服务端的一批新推荐
+    idx_store(0);
+
+    let weak = window.clone();
+    let _ = window.upgrade_in_event_loop(|w| {
+        w.set_feed_error(Default::default());
+        w.set_more_error(Default::default());
+        w.set_g_refreshing(true);
+    });
+
+    spawn_page_request(weak, Mode::Prepend, /* quiet = */ true);
 }
 
 /// 加载下一页（滚动到底部触发）。
 pub fn load_more(window: slint::Weak<AppWindow>) {
-    // 正在加载、或已经没有更多了，就直接忽略
-    if IN_FLIGHT.with(|c| *c.borrow()) {
+    // 正在加载就忽略（IN_FLIGHT 是进程级的，这里判断才有效）
+    if IN_FLIGHT.load(Ordering::SeqCst) {
         return;
     }
 
@@ -170,20 +278,34 @@ pub fn load_more(window: slint::Weak<AppWindow>) {
         w.set_more_error(Default::default());
     });
 
-    spawn_page_request(window, /* append = */ true);
+    spawn_page_request(window, Mode::Append, /* quiet = */ true);
+}
+
+/// 一页数据怎么合进当前列表。
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// 替换整个列表（冷启动首屏）
+    Replace,
+    /// 追加到末尾（滚动到底加载更多）
+    Append,
+    /// 插到最前面（下拉刷新）
+    Prepend,
+    /// 只在列表为空时才替换（冷启动的静默刷新；已有内容就不动）
+    Refresh,
 }
 
 /// 统一的「拉一页数据」实现。
-///
-/// `append = false` 是首屏/刷新（替换整个列表），
-/// `append = true` 是加载更多（追加到末尾）。
-fn spawn_page_request(weak: slint::Weak<AppWindow>, append: bool) {
-    if IN_FLIGHT.with(|c| *c.borrow()) {
+fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
+    // compare_exchange 而不是先 load 再 store：两次 load_more 同时进来
+    // 时，只有一个能抢到。这是进程级状态的正确用法。
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return;
     }
-    IN_FLIGHT.with(|c| *c.borrow_mut() = true);
 
-    let fresh_idx = FRESH_IDX.with(|c| *c.borrow());
+    let fresh_idx = idx_load();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -192,8 +314,8 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, append: bool) {
         {
             Ok(rt) => rt,
             Err(e) => {
-                IN_FLIGHT.with(|c| *c.borrow_mut() = false);
-                report_error(&weak, format!("创建运行时失败: {e}"), append);
+                IN_FLIGHT.store(false, Ordering::SeqCst);
+                report_error(&weak, format!("创建运行时失败: {e}"), mode, quiet);
                 return;
             }
         };
@@ -206,103 +328,122 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, append: bool) {
                 .map_err(|e| e.to_string())
         });
 
-        IN_FLIGHT.with(|c| *c.borrow_mut() = false);
+        // 无论成败都必须放开，否则一次失败就永久卡死翻页
+        IN_FLIGHT.store(false, Ordering::SeqCst);
 
         match result {
             Ok(page) => {
                 let count = page.items.len();
 
-                // 记录 bvid -> 封面地址，供后续懒加载
-                COVER_URLS.with(|m| {
-                    let mut m = m.borrow_mut();
-                    for it in &page.items {
-                        m.insert(it.bvid.clone(), it.cover_url.clone());
+                // 跨页去重：推荐流偶尔会把同一个视频重复推回来
+                let mut fresh: Vec<bli_protocol::recommend::VideoItem> = Vec::new();
+                {
+                    let mut guard = match SEEN_BVIDS.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let seen = guard.get_or_insert_with(HashSet::new);
+                    for it in page.items {
+                        if seen.insert(it.bvid.clone()) {
+                            fresh.push(it);
+                        }
                     }
-                });
+                }
 
-                // 收集封面清单，稍后在 UI 线程启动分批加载
-                let covers: Vec<(String, String)> = page
-                    .items
+                // 游标递增（0,1,2,3…，与 PiliPlus RcmdController 一致）
+                idx_store(fresh_idx + 1);
+
+                let covers: Vec<(String, String)> = fresh
                     .iter()
                     .filter(|v| !v.cover_url.is_empty())
                     .map(|v| (v.bvid.clone(), v.cover_url.clone()))
                     .collect();
 
-                let raws: Vec<RawItem> = page.items.iter().map(to_raw).collect();
+                let raws: Vec<RawItem> = fresh.iter().map(to_raw).collect();
+                let items_for_cache = fresh.clone();
 
-                // 游标递增：0, 1, 2, 3 ...
-                //
-                // 与 PiliPlus RcmdController 完全一致（它 page++ 后直接当 fresh_idx）。
-                // 早先想当然地「0 之后跳到 4」，结果第 2、3 页内容与首屏大量重复 ——
-                // 服务端把 fresh_idx 当作内容游标，跳号就跳过了中间的推荐位。
-                FRESH_IDX.with(|c| *c.borrow_mut() = fresh_idx + 1);
-
-                let weak_for_ui = weak.clone();
                 let _ = weak.upgrade_in_event_loop(move |w| {
                     let new_items: Vec<VideoItemData> =
                         raws.into_iter().map(RawItem::into_slint).collect();
 
-                    if append {
-                        // 追加：从**已保存的模型实例**读出内容，而不是 w.get_rows()。
-                        // get_rows() 对值类型数组属性可能拿不到最新内容，
-                        // 早期症状就是「加载更多之后列表反而回到第一页」——
-                        // 因为读到的 existing 是空或旧的，只在它后面接了新数据。
-                        let existing_model = MODEL.with(|m| m.borrow().clone());
-                        let mut all: Vec<VideoRowPair> = Vec::with_capacity(32);
-                        if let Some(ref em) = existing_model {
-                            for i in 0..em.row_count() {
-                                if let Some(r) = em.row_data(i) {
-                                    all.push(r);
-                                }
+                    // 当前列表快照：必须是已保存的 MODEL 实例，
+                    // 不能读 w.get_rows()（值类型数组属性读出来的是副本）
+                    let mut all: Vec<VideoRowPair> = Vec::with_capacity(64);
+                    if let Some(ref em) = MODEL.with(|m| m.borrow().clone()) {
+                        for i in 0..em.row_count() {
+                            if let Some(r) = em.row_data(i) {
+                                all.push(r);
                             }
                         }
-
-                        // 追加时要注意：上一页的最后一行可能只有左卡（奇数个），
-                        // 这时新数据的第一条应该补到那一行的右侧，而不是另起一行。
-                        let mut incoming = new_items.into_iter();
-                        let needs_right = all.last().is_some_and(|r| !r.has_right);
-
-                        if needs_right {
-                            if let Some(first) = incoming.next() {
-                                if let Some(last) = all.last_mut() {
-                                    last.right = first;
-                                    last.has_right = true;
-                                }
-                            }
-                        }
-
-                        let rest: Vec<VideoItemData> = incoming.collect();
-                        all.extend(pair_rows(rest));
-
-                        let model = Rc::new(VecModel::from(all));
-                        w.set_rows(ModelRc::from(model.clone()));
-                        MODEL.with(|m| *m.borrow_mut() = Some(model));
-                        ensure_cover_pump();
-                        w.set_loading_more(false);
-                    } else {
-                        let rows = pair_rows(new_items);
-                        let model = Rc::new(VecModel::from(rows));
-                        w.set_rows(ModelRc::from(model.clone()));
-                        MODEL.with(|m| *m.borrow_mut() = Some(model));
-                        ensure_cover_pump();
-                        w.set_feed_state(2);
-                        w.set_loading_more(false);
-                        w.set_g_refreshing(false);
-                        w.set_g_pull(Default::default());
                     }
+
+                    match mode {
+                        Mode::Replace => {
+                            all = pair_rows(new_items);
+                        }
+                        Mode::Prepend => {
+                            // 新内容插到顶部：先排新的一批，再接旧列表。
+                            // 旧列表最后一行若是单卡（奇数），要重新整理 ——
+                            // 直接拼接会留下一个"只有左卡"的空洞。
+                            let mut merged = new_items;
+                            for row in all.drain(..) {
+                                merged.push(row.left);
+                                if row.has_right {
+                                    merged.push(row.right);
+                                }
+                            }
+                            all = pair_rows(merged);
+                        }
+                        Mode::Append => {
+                            let mut incoming = new_items.into_iter();
+                            // 上一页最后一行可能只有左卡，新数据补到右侧
+                            if all.last().is_some_and(|r| !r.has_right) {
+                                if let Some(first) = incoming.next() {
+                                    if let Some(last) = all.last_mut() {
+                                        last.right = first;
+                                        last.has_right = true;
+                                    }
+                                }
+                            }
+                            let rest: Vec<VideoItemData> = incoming.collect();
+                            all.extend(pair_rows(rest));
+                        }
+                        Mode::Refresh => {
+                            // 静默刷新：列表已有内容就完全不动，
+                            // 免得用户正在看的时候列表突然整体换掉
+                            if all.is_empty() {
+                                all = pair_rows(new_items);
+                            }
+                        }
+                    }
+
+                    let model = Rc::new(VecModel::from(all));
+                    w.set_rows(ModelRc::from(model.clone()));
+                    MODEL.with(|m| *m.borrow_mut() = Some(model));
+                    ensure_cover_pump();
 
                     // 一页 20 条，拿不满说明到底了
                     w.set_has_more(count >= 20);
+                    w.set_loading_more(false);
+                    w.set_g_refreshing(false);
+                    w.set_g_pull(Default::default());
+                    if !quiet || mode != Mode::Refresh {
+                        w.set_feed_state(2);
+                    } else {
+                        w.set_feed_state(2);
+                    }
+                    w.set_feed_error(Default::default());
 
-                    // 开始下载这批封面（内部会按 10 张一批推进）
                     spawn_batched_loader(covers);
                 });
 
-                let _ = weak_for_ui;
+                // 列表写盘。存的是**本页原始条目**而不是去重后的，
+                // 保证下次启动看到的和这次一样多。
+                cache_write(&items_for_cache);
             }
             Err(e) => {
                 log::warn!("推荐流加载失败: {e}");
-                report_error(&weak, e, append);
+                report_error(&weak, e, mode, quiet);
             }
         }
     });
@@ -437,62 +578,26 @@ fn fill_cover(model: &Rc<VecModel<VideoRowPair>>, bvid: &str, img: Image) {
     }
 }
 
-/// 封面下载 + 回填。
-///
-/// 关键：持有同一份 `Rc<VecModel>`，逐行 `set_row_data`。
-/// 之前每次 `w.get_rows()` 取模型，对于值类型数组属性会拿到新包装，
-/// 对副本 set_row_data 不反映到 UI —— 表现为只有前几张图能显示。
-fn spawn_cover_pump(
-    _window: slint::Weak<AppWindow>,
-    model: Rc<VecModel<VideoRowPair>>,
-    covers: Vec<(String, String)>,
-) {
-    let (tx, rx) = mpsc::channel::<crate::cover::DecodedCover>();
-    crate::cover::spawn_cover_loader(covers, tx);
-
-    let timer = Rc::new(slint::Timer::default());
-    let timer_for_cb = timer.clone();
-
-    timer.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(16),
-        move || {
-            let mut disconnected = false;
-
-            loop {
-                match rx.try_recv() {
-                    Ok(d) => {
-                        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                            &d.rgba, d.width, d.height,
-                        );
-                        fill_cover(&model, &d.bvid, Image::from_rgba8(buffer));
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if disconnected {
-                timer_for_cb.stop();
-            }
-        },
-    );
-}
-
-fn report_error(window: &slint::Weak<AppWindow>, msg: String, append: bool) {
+fn report_error(window: &slint::Weak<AppWindow>, msg: String, mode: Mode, quiet: bool) {
     let _ = window.upgrade_in_event_loop(move |w| {
-        if append {
-            // 加载更多失败：列表保留，底部显示可重试
-            w.set_loading_more(false);
-            w.set_more_error(msg.as_str().into());
-        } else {
-            w.set_feed_error(msg.as_str().into());
-            w.set_feed_state(3);
-            w.set_g_refreshing(false);
-            w.set_g_pull(Default::default());
+        w.set_loading_more(false);
+        w.set_g_refreshing(false);
+        w.set_g_pull(Default::default());
+
+        match mode {
+            // 加载更多失败：列表保留，底部显示「上滑重试」
+            Mode::Append => {
+                w.set_more_error(msg.as_str().into());
+            }
+            // 刷新失败：列表里已经有东西的话不要整屏报错，
+            // 只在底部留一句提示（用户还在看原来的内容）
+            Mode::Prepend | Mode::Refresh if quiet => {
+                w.set_more_error(msg.as_str().into());
+            }
+            _ => {
+                w.set_feed_error(msg.as_str().into());
+                w.set_feed_state(3);
+            }
         }
     });
 }

@@ -1,6 +1,7 @@
 pub use slint::ComponentHandle;
 
 pub mod android_window;
+pub mod cache;
 pub mod cover;
 pub mod mxprobe;
 pub mod player;
@@ -520,12 +521,12 @@ fn android_main(app: slint::android::AndroidApp) {
     // fresh_idx=0 表示首次进入（语义见 bli_protocol::recommend）。
     feed::load_feed(main_window.as_weak(), 0);
 
-    // 下拉刷新：重新拉第一页
+    // 下拉刷新：拉一批新推荐插到列表顶部，**不清空现有列表**
     {
         let weak = main_window.as_weak();
         main_window.on_refresh_feed(move || {
             if let Some(w) = weak.upgrade() {
-                feed::load_feed(w.as_weak(), 0);
+                feed::refresh_feed(w.as_weak());
             }
         });
     }

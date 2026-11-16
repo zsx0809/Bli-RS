@@ -257,7 +257,17 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
     // 新会话先把时长清零：seek 在时长未知时会安全忽略，
     // 总比拿上一个视频的时长算出一个荒谬的跳转点强。
     DURATION_US.store(0, Ordering::SeqCst);
+
+    // 清理上一个视频的流缓存 —— 必须在 stop_current() **之后**：
+    // 解码器持有文件，不关掉删不掉（Linux 下 unlink 虽然能成功，
+    // 但 inode 要等句柄全关才真正释放，空间不会立刻回来）。
+    //
+    // 这一步是「自动连播不占存储」的关键：切下一个视频的瞬间，
+    // 上一个的 MB 级缓存就没了，磁盘占用恒定在当前这一个视频的量级。
+    // 同一个 bvid 重进（循环播放 / 重播）时 retain_only 会把它留下，
+    // 于是不用重新下载。
     stop_current();
+    crate::cache::retain_only(&bvid);
 
     // 注意：这里**不**解除系统手势排除区。
     // 解除会让左边缘侧滑被系统吃掉并 finish 掉 NativeActivity，
@@ -448,12 +458,21 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                 })
                 .collect();
 
-            let covers_to_download: Vec<(usize, String)> = raw_rel
+            // 相关推荐的封面：**全部**都要下。
+            //
+            // 之前是 .take(12) —— 那是「详情页推荐流只有十来个封面、
+            // 剩下的全是灰块」的直接原因。当时大概是想着「先下够首屏」，
+            // 但推荐列表本来就只有二三十条，省这点请求毫无意义，
+            // 反而让人以为列表坏了。
+            //
+            // 现在改成全部交给 cover 模块的并发加载器（6 路并发 + 磁盘缓存），
+            // 首屏那次进详情页会把整列都填满；第二次进同一个视频时
+            // 全部命中本地缓存，一个网络请求都不发。
+            // 封面清单必须在 raw_rel 被 move 进下面那个闭包**之前**取出来
+            let cover_items: Vec<(String, String)> = raw_rel
                 .iter()
-                .enumerate()
-                .take(12)
-                .filter(|(_, r)| !r.cover_url.is_empty())
-                .map(|(i, r)| (i, r.cover_url.clone()))
+                .filter(|r| !r.cover_url.is_empty())
+                .map(|r| (r.bvid.clone(), r.cover_url.clone()))
                 .collect();
 
             let w_rel = w_clone.clone();
@@ -477,31 +496,50 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                 RELATED_MODEL.with(|m| *m.borrow_mut() = Some(model));
             });
 
-            if !covers_to_download.is_empty() {
+            // 下载 + 回填。
+            //
+            // 走 cover 模块的统一加载器，而不是自己串行循环：
+            //   · 6 路并发，二三十张图从「一张一张慢慢出」变成整屏齐出
+            //   · 自带磁盘缓存，重复进同一个视频零请求
+            //   · 解码出来的 RGBA 通过 channel 回到 UI 线程再建 Image
+            //     （Image 非 Send，绝不能在下载线程里构造）
+            //
+            // 回填按 bvid 找行号，而不是假定「下载完成顺序 == 列表顺序」——
+            // 并发下载的完成顺序是乱的，按下标写会串图。
+            if !cover_items.is_empty() {
+                let (tx, rx) = std::sync::mpsc::channel::<crate::cover::DecodedCover>();
+                crate::cover::spawn_cover_loader(cover_items, tx);
+
                 let w_cov_ui = w_clone.clone();
                 std::thread::spawn(move || {
-                    let rt_cov = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(r) => r,
-                        Err(_) => return,
-                    };
-                    for (idx, url) in covers_to_download {
+                    for d in rx {
                         if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
                             return;
                         }
-                        if let Some((w, h, rgba)) = rt_cov.block_on(download_raw_image(&url)) {
-                            let w_ui = w_cov_ui.clone();
-                            let _ = w_ui.upgrade_in_event_loop(move |_| {
-                                RELATED_MODEL.with(|cell| {
-                                    if let Some(ref m) = *cell.borrow() {
-                                        if let Some(mut row) = m.row_data(idx) {
-                                            let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
-                                            row.cover = Image::from_rgba8(buf);
-                                            m.set_row_data(idx, row);
-                                        }
+                        let w_ui = w_cov_ui.clone();
+                        let bvid = d.bvid.clone();
+
+                        let _ = w_ui.upgrade_in_event_loop(move |_| {
+                            RELATED_MODEL.with(|cell| {
+                                let Some(ref m) = *cell.borrow() else {
+                                    return;
+                                };
+                                for i in 0..m.row_count() {
+                                    let Some(mut row) = m.row_data(i) else {
+                                        continue;
+                                    };
+                                    if row.bvid.as_str() != bvid {
+                                        continue;
                                     }
-                                });
+                                    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                                        &d.rgba, d.width, d.height,
+                                    );
+                                    row.cover = Image::from_rgba8(buf);
+                                    m.set_row_data(i, row);
+                                    break;
+                                }
                             });
-                        }
+                        });
                     }
                 });
             }
@@ -650,18 +688,11 @@ fn start_playback(
     //
     // 于是解码器"跟着下载进度走"：下载慢它等，下载快它追。
     // 一小时的视频也能在首段就绪后立即起播，不需要等整段下完。
-    let cache_dir = crate::android_window::cache_dir()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let p = std::path::PathBuf::from("/data/data/com.bli.rs/cache");
-            if p.exists() || std::fs::create_dir_all(&p).is_ok() {
-                p
-            } else {
-                std::env::temp_dir()
-            }
-        });
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let path = cache_dir.join(format!("v_{bvid}.m4s"));
+    //
+    // 缓存策略见 src/cache.rs：同一时刻磁盘上只留**当前这一个**视频的
+    // 音视频流。清理发生在 play() 里（切换视频的瞬间，旧解码器已停），
+    // 所以循环 / 重播同一个 bvid 时文件还在，不会重新下载。
+    let path = crate::cache::stream_path(&bvid, 'v');
     let path_str = path.to_string_lossy().to_string();
 
     // 残留的半截文件必须删掉：它会被当成完整视频解析。
@@ -688,7 +719,7 @@ fn start_playback(
     // 音频文件小得多（192K 码率下一小时约 86MB，但首段阈值只要 64KB
     // 就够解出前几个 AAC 帧），所以起播几乎立刻可用。
     let audio_parts = audio_url.as_ref().map(|au| {
-        let apath = cache_dir.join(format!("a_{bvid}.m4s"));
+        let apath = crate::cache::stream_path(&bvid, 'a');
         let (abuf, arx) = spawn_stream_download(
             "音频",
             client.clone(),
@@ -1266,6 +1297,35 @@ fn spawn_stream_download(
         None => crate::mxprobe::log_public(&format!("[{label}] 未能探测总长度")),
     }
 
+    // ---- 命中完整缓存就不下载 ----
+    //
+    // 判据：磁盘上已有文件的大小 == 远端 Content-Length。
+    //
+    // 为什么这个判据是可靠的：文件名是 v_<bvid>.m4s，bvid 唯一确定一个视频；
+    // 同一个 bvid 的播放地址（playurl 签名）会变，但内容是同一份流。
+    // 长度完全相等说明上次已经下完，直接当成品用。
+    //
+    // 意义：循环播放 / 播完重播 / 退出详情页再进来，这几种最常见的场景
+    // 全部变成「零流量 + 首帧立刻出来」。这正是用户要的那条缓存策略。
+    //
+    // 注意长度对不上时**必须删除**再重下：半截文件会被当成完整视频解析，
+    // 表现为播到某个点画面冻住（extractor 读到文件尾就发 EOS）。
+    let cached_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if let Some(total) = total_len {
+        if cached_len == total && total > 0 {
+            crate::mxprobe::log_public(&format!(
+                "[{label}] 命中完整缓存 {:.1} MB，跳过下载",
+                total as f64 / 1_048_576.0
+            ));
+            let buffer = crate::stream_source::SharedBuffer::new(path.clone(), total_len);
+            buffer.finish(total);
+            let (tx_ready, rx_ready) = std::sync::mpsc::sync_channel::<()>(1);
+            // 立刻发"首段就绪"，让起播流程不用等那 12 秒超时
+            let _ = tx_ready.send(());
+            return (buffer, rx_ready);
+        }
+    }
+
     let _ = std::fs::remove_file(&path);
     let buffer = crate::stream_source::SharedBuffer::new(path.clone(), total_len);
 
@@ -1778,8 +1838,14 @@ pub fn set_volume(v: f32) {
 
 /// 跳转到进度（0.0~1.0）。
 ///
-/// 归一化进度 × 总时长 = 目标 PTS，交给解码线程执行
-/// AMediaExtractor_seekTo + 丢帧校正（见 video_decoder::decode_loop）。
+/// 归一化进度 × 总时长 = 目标 PTS，**同时**交给视频与音频两个解码线程
+/// 执行（AMediaExtractor_seekTo + 丢帧校正）。
+///
+/// 为什么两边都要跳：
+///   早先只跳视频。结果是画面到了新位置，声音还在原地播 ——
+///   偏出去的正好是"跳了多少"。这是用户看到的那种
+///   「有的视频音画极度不同步」里最夸张的一类：
+///   只要他拖过进度条或按过快进快退，就必然错位。
 pub fn seek_to(frac: f32) {
     let dur = DURATION_US.load(Ordering::SeqCst);
     if dur <= 0 {
@@ -1792,12 +1858,28 @@ pub fn seek_to(frac: f32) {
         frac * 100.0,
         target_us
     ));
+    seek_all(target_us);
+}
+
+/// 把同一个目标 PTS 交给音视频两条解码线程。
+fn seek_all(target_us: i64) {
+    let mut did = false;
+
     if let Ok(cur) = CURRENT.lock() {
         if let Some(dec) = cur.as_ref() {
             dec.controls.request_seek(target_us);
-        } else {
-            crate::mxprobe::log_public("[Seek] 当前没有解码器实例");
+            did = true;
         }
+    }
+    if let Ok(cur) = AUDIO_DECODER.lock() {
+        if let Some(dec) = cur.as_ref() {
+            dec.request_seek(target_us);
+            did = true;
+        }
+    }
+
+    if !did {
+        crate::mxprobe::log_public("[Seek] 当前没有解码器实例");
     }
 }
 
@@ -1866,11 +1948,7 @@ pub fn seek_by(secs: f32) {
         secs, target, cur_pts
     ));
 
-    if let Ok(cur) = CURRENT.lock() {
-        if let Some(dec) = cur.as_ref() {
-            dec.controls.request_seek(target);
-        }
-    }
+    seek_all(target);
 }
 
 /// 播放 / 暂停切换。
