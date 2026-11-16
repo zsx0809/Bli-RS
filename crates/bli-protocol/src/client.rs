@@ -124,6 +124,51 @@ impl BiliClient {
         Ok(json)
     }
 
+    /// 带自定义请求头的 GET（绝对 URL，不签名）。
+    ///
+    /// 用于 App 端接口：它们不用 WBI 签名，但要求一整套 App 请求头
+    /// （User-Agent / buvid / fp_local / statistics / env …）。
+    /// 少任何一个都可能被降级成网页访客身份，拿到的就是热榜而不是推荐。
+    pub async fn get_with_headers(
+        &self,
+        url: &str,
+        params: &BTreeMap<String, String>,
+        headers: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        let mut req = self.http.get(url);
+
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+
+        // cookie 统一由这里注入，避免调用方忘了带 buvid3 导致风控 412
+        req = req.header("cookie", self.cookie_header());
+
+        if !params.is_empty() {
+            req = req.query(params);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Network(format!("HTTP {status}")));
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        let code = json.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code != 0 {
+            let msg = json
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("未知错误")
+                .to_string();
+            return Err(Error::Api { code, message: msg });
+        }
+
+        Ok(json)
+    }
+
     /// 暴露底层 HTTP 客户端。
     ///
     /// 给那些需要自己控制 header（比如带 cookie 的评论分页、发评论 POST）
@@ -153,6 +198,14 @@ impl BiliClient {
             }
             _ => format!("buvid3={}", self.buvid),
         }
+    }
+
+    /// 对外暴露设备指纹（buvid3）。
+    ///
+    /// App 端接口把这个值放在 **HTTP header `buvid`** 里，而不是 cookie。
+    /// 两者必须一致，否则风控会把请求与设备对不上而降级。
+    pub fn buvid_string(&self) -> String {
+        self.buvid.clone()
     }
 
     /// 装入 / 清空登录态。传 None 表示退出登录。

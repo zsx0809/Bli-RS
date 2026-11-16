@@ -177,6 +177,10 @@ fn idx_store(v: u32) {
 
 /// 首页列表缓存文件（放 filesDir，不用 cacheDir —— 系统清缓存时不该把
 /// 「首页长什么样」一起清掉，否则冷启动又是白屏）。
+/// 缓存格式版本。换推荐接口（Web → App）时必须递增，
+/// 否则旧缓存会把"热榜内容"当成新推荐继续显示一整天。
+const CACHE_VERSION: u32 = 2;
+
 fn cache_file() -> std::path::PathBuf {
     let base = crate::android_window::files_dir()
         .map(std::path::PathBuf::from)
@@ -188,7 +192,16 @@ fn cache_file() -> std::path::PathBuf {
 /// 读上次的首页列表。任何解析问题都当作"没有缓存"，不报错。
 fn cache_read() -> Option<Vec<bli_protocol::recommend::VideoItem>> {
     let text = std::fs::read_to_string(cache_file()).ok()?;
-    let items: Vec<bli_protocol::recommend::VideoItem> = serde_json::from_str(&text).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+    // 版本不符 → 当没有缓存（下次写盘时会覆盖成新格式）
+    if parsed.get("v").and_then(|v| v.as_u64()) != Some(CACHE_VERSION as u64) {
+        crate::mxprobe::log_public("[Feed] 缓存版本不符，丢弃重建");
+        return None;
+    }
+
+    let items: Vec<bli_protocol::recommend::VideoItem> =
+        serde_json::from_value(parsed.get("items")?.clone()).ok()?;
     if items.is_empty() {
         None
     } else {
@@ -200,7 +213,11 @@ fn cache_read() -> Option<Vec<bli_protocol::recommend::VideoItem>> {
 fn cache_write(items: &[bli_protocol::recommend::VideoItem]) {
     // 只留前 60 条：缓存的作用是冷启动第一屏，攒太多只会让启动读盘变慢
     let slice = &items[..items.len().min(60)];
-    match serde_json::to_string(slice) {
+    let payload = serde_json::json!({
+        "v": CACHE_VERSION,
+        "items": slice,
+    });
+    match serde_json::to_string(&payload) {
         Ok(s) => {
             let _ = std::fs::write(cache_file(), s);
         }
@@ -343,10 +360,18 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
             }
         };
 
+        // ★ 走 **App 端** 推荐接口，不是 Web 端。
+        //
+        // Web 端 /x/web-interface/wbi/index/top/feed/rcmd 在"无画像"
+        // 情况下返回的是通用热榜，翻多少页都是同一批视频 ——
+        // 这正是"怎么刷都是那几个视频"的根因。
+        //
+        // App 端 /x/v2/feed/index 走推荐引擎，idx 每推进一次就是一批
+        // 全新内容。PiliPlus 默认也用这个（RcmdSource.app）。
         let result = rt.block_on(async {
             let client = bli_protocol::BiliClient::new().map_err(|e| e.to_string())?;
             client
-                .recommend_feed(fresh_idx, 20)
+                .recommend_feed_app(fresh_idx)
                 .await
                 .map_err(|e| e.to_string())
         });
@@ -466,9 +491,15 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
                     MODEL.with(|m| *m.borrow_mut() = Some(model));
                     ensure_cover_pump();
 
-                    // 一页 20 条：拿满了说明后面还有，拿不满说明到底了。
-                    // 用 raw_count（过滤前），不是过滤后的条数。
-                    w.set_has_more(count >= 20);
+                    // 到底判断。
+                    //
+                    // App 端接口每页固定 10~12 条（不是 Web 端的 20），
+                    // 所以阈值不能用 20，否则第一页就判"到底了"。
+                    //
+                    // 而且 App 推荐流理论上**无限**（PiliPlus 里 isEnd 恒为
+                    // false，翻到底自动续），只要服务端还在给内容就不该停。
+                    // 这里只拦住"服务端返回空页"这一种真到底的情况。
+                    w.set_has_more(count > 0);
                     w.set_loading_more(false);
                     w.set_g_refreshing(false);
                     w.set_g_pull(Default::default());

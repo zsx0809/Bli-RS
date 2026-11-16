@@ -185,6 +185,27 @@ export component AppWindow inherits Window {
     /// false：只加载详情，等用户点播放键
     in-out property <bool> auto_play: true;
 
+    // ---- 播放设置（详情页二级菜单里的五个开关）----
+    //
+    // 这些值由 Rust 侧从 settings.conf 读回并写入，改动时回调回去持久化。
+    // 语义：
+    //   auto_next     播完自动播下一个（相关推荐第一条）
+    //   loop_single   单个视频循环
+    //   loop_list     整个列表循环
+    //   pause_at_end  播完停在最后一帧
+    //   audio_only    听视频（关画面，只放声音）
+    in-out property <bool> set_auto_next: true;
+    in-out property <bool> set_loop_single: false;
+    in-out property <bool> set_loop_list: false;
+    in-out property <bool> set_pause_at_end: false;
+    in-out property <bool> set_audio_only: false;
+    callback setting_changed(string, bool);
+
+    // ---- 清晰度选择 ----
+    in-out property <[string]> quality_options: ["自动"];
+    in-out property <int> quality_index: 0;
+    callback quality_selected(int);
+
     /// 已拿到播放地址、但还没起播（自动播放关闭时的状态）
     in-out property <bool> awaiting_play: false;
     in-out property <bool> play_paused: false;
@@ -479,6 +500,21 @@ export component AppWindow inherits Window {
         comment_sort <=> root.comment_sort;
         load_more_comments => { root.load_more_comments(); }
         change_comment_sort(mode) => { root.change_comment_sort(mode); }
+
+        // 播放设置二级菜单
+        set_auto_next: root.set_auto_next;
+        set_loop_single: root.set_loop_single;
+        set_loop_list: root.set_loop_list;
+        set_pause_at_end: root.set_pause_at_end;
+        set_audio_only: root.set_audio_only;
+        setting_changed(key, val) => {
+            root.setting_changed(key, val);
+        }
+
+        // 清晰度
+        quality_options: root.quality_options;
+        quality_index <=> root.quality_index;
+        quality_selected(idx) => { root.quality_selected(idx); }
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;

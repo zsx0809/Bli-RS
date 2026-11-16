@@ -54,9 +54,27 @@ export component VideoDetailView inherits Rectangle {
     in-out property <int> active_tab: 0;
     in-out property <bool> is_following: false;
 
-    // 诊断日志相关属性与回调
+    // 诊断日志相关属性与回调（保留给内部诊断，不再有 UI 入口）
     in property <string> log_text: "";
     in-out property <bool> show_log_dialog: false;
+
+    // ---- 播放设置（二级菜单）----
+    //
+    // 这个面板取代了原来那个"日志"按钮。日志是给开发者看的，
+    // 普通用户点开只会一脸问号；这里放的是真正会影响观看行为的东西。
+    in-out property <bool> show_settings_panel: false;
+    in-out property <bool> set_auto_next: true;     // 自动连播
+    in-out property <bool> set_loop_single: false;  // 单个循环
+    in-out property <bool> set_loop_list: false;    // 列表循环
+    in-out property <bool> set_pause_at_end: false; // 播完暂停
+    in-out property <bool> set_audio_only: false;   // 听视频
+    callback setting_changed(string, bool);
+
+    // ---- 清晰度选择 ----
+    in property <[string]> quality_options: ["自动"];
+    in-out property <int> quality_index: 0;
+    in-out property <bool> show_quality_panel: false;
+    callback quality_selected(int);
     callback refresh_log_clicked();
     callback clear_log_clicked();
 
@@ -688,31 +706,30 @@ export component VideoDetailView inherits Rectangle {
                 }
             }
 
-            // ---- 右侧功能图标：日志 ----
+            // ---- 右侧功能图标：播放设置 ----
             //
-            // 只放一个。播放设置、投屏这些还没做，占位图标点不了是欺骗，
-            // 等真做了再加。
-            log_btn := GestureArea {
+            // 原来是"日志"按钮 —— 那是给我调试用的，用户点开只会看到一堆
+            // 内部日志，毫无意义。现在换成播放设置二级菜单
+            //（自动连播 / 循环 / 播完暂停 / 听视频）。
+            settings_btn := GestureArea {
                 x: parent.width - self.width - 8px;
                 y: 6px;
                 width: 44px;
                 height: 44px;
 
                 tap(x, y) => {
-                    root.show_log_dialog = !root.show_log_dialog;
-                    if (root.show_log_dialog) {
-                        root.refresh_log_clicked();
-                    }
+                    root.show_settings_panel = !root.show_settings_panel;
+                    root.controls_visible = true;
                 }
 
-                // 三横线（"日志列表"意象），比"日志"两个字更轻
+                // 齿轮：外圈 + 内圈，比三横线更像"设置"
                 IconBase {
                     x: 10px;
                     y: 10px;
                     size: 24px;
                     tint: #ffffff;
                     stroke_w: 2px;
-                    commands: "M 4 7 L 20 7 M 4 12 L 20 12 M 4 17 L 20 17";
+                    commands: "M 12 15.5 A 3.5 3.5 0 1 0 12 8.5 A 3.5 3.5 0 1 0 12 15.5 Z M 12 2.5 L 13.4 5.2 M 12 21.5 L 10.6 18.8 M 2.5 12 L 5.2 10.6 M 21.5 12 L 18.8 13.4 M 5.3 5.3 L 7.6 7.6 M 18.7 18.7 L 16.4 16.4 M 5.3 18.7 L 7.6 16.4 M 18.7 5.3 L 16.4 7.6";
                 }
             }
 
@@ -899,6 +916,47 @@ export component VideoDetailView inherits Rectangle {
                 color: #ffffff;
                 font-size: 11px;
                 vertical-alignment: center;
+            }
+
+            // ---- 清晰度按钮：进度条上方、视频右下角 ----
+            //
+            // 位置要求是用户明确指定的："进度条的上方、视频的右下角"。
+            // 与左边的时间行同一水平线（y = height - 52），左右对称，
+            // 视觉上不打架。
+            //
+            // 文案直接显示当前档位（"自动" / "1080P" / "720P"），
+            // 而不是一个抽象图标 —— 用户点它之前就想知道现在是什么清晰度。
+            quality_btn := GestureArea {
+                x: parent.width - self.width - 12px;
+                y: parent.height - 60px;
+                width: q_label.width + 20px;
+                height: 24px;
+                tap_slop: 6px;
+
+                tap(x, y) => {
+                    root.show_quality_panel = !root.show_quality_panel;
+                    root.show_settings_panel = false;
+                    root.controls_visible = true;
+                }
+
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 4px;
+                    background: quality_btn.pressed ? #ffffff33 : #00000066;
+                }
+
+                q_label := Text {
+                    x: 10px;
+                    y: (parent.height - self.height) / 2;
+                    text: root.quality_options.length > root.quality_index
+                        ? root.quality_options[root.quality_index]
+                        : "自动";
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
             }
         }
 
@@ -2023,115 +2081,352 @@ export component VideoDetailView inherits Rectangle {
     }
 
 
-    if root.show_log_dialog : Rectangle {
+    // ======================================================================
+    // 播放设置（二级菜单）
+    //
+    // 取代了原来那个"日志"浮层。日志是开发者的东西，用户看不懂也用不上；
+    // 这里放的都是会实际影响观看行为的开关。
+    //
+    // 布局：从底部浮起的卡片，不是全屏遮罩 —— 全屏黑罩再放几个开关
+    // 视觉上太重，而且挡住了正在播的画面。
+    // ======================================================================
+    if root.show_settings_panel : Rectangle {
         x: 0px;
-        y: 0px;
-        width: 100%;
-        height: 100%;
-        background: #000000dd;
+        y: root.player_top;
+        width: root.width;
+        height: root.player_height;
+        background: #00000000;
 
-        VerticalLayout {
-            padding: 16px;
-            padding-top: root.safe_top + 12px;
-            padding-bottom: root.safe_bottom + 12px;
-            spacing: 10px;
+        // 点空白处关闭
+        TouchArea {
+            clicked => { root.show_settings_panel = false; }
+        }
 
-            // 头部标题与控制栏
-            HorizontalLayout {
-                height: 38px;
-                alignment: space-between;
+        settings_card := Rectangle {
+            x: parent.width - self.width - 8px;
+            y: 54px;
+            width: 210px;
+            height: settings_col.preferred-height + 16px;
+            border-radius: 12px;
+            background: Theme.surface_container_high;
+            border-width: 1px;
+            border-color: Theme.outline_variant;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000088;
 
-                Text {
-                    text: "运行诊断日志";
-                    color: #ffffff;
-                    font-size: 16px;
-                    font-weight: 700;
-                    vertical-alignment: center;
+            TouchArea { }
+
+            settings_col := VerticalLayout {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                spacing: 2px;
+
+                // ---- 自动连播 ----
+                setting_row := Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    width: 100%;
+                    background: ar_touch.pressed ? Theme.surface_variant : transparent;
+
+                    Text {
+                        x: 10px;
+                        y: 0px;
+                        width: parent.width - 72px;
+                        height: parent.height;
+                        text: "自动连播";
+                        color: Theme.on_surface;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    // 开关
+                    Rectangle {
+                        x: parent.width - 52px;
+                        y: (parent.height - 24px) / 2;
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.set_auto_next ? Theme.primary : Theme.surface_variant;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+                            y: 3px;
+                            x: root.set_auto_next ? parent.width - self.width - 3px : 3px;
+                            animate x { duration: 140ms; easing: ease-out; }
+                        }
+                    }
+
+                    ar_touch := TouchArea {
+                        clicked => {
+                            root.set_auto_next = !root.set_auto_next;
+                            root.setting_changed("auto_next", root.set_auto_next);
+                        }
+                    }
                 }
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
+                // ---- 单个循环 ----
+                Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    width: 100%;
+                    background: loop1_touch.pressed ? Theme.surface_variant : transparent;
 
-                    // 刷新
+                    Text {
+                        x: 10px;
+                        y: 0px;
+                        width: parent.width - 72px;
+                        height: parent.height;
+                        text: "单个循环";
+                        color: Theme.on_surface;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
                     Rectangle {
-                        width: 58px;
-                        height: 30px;
-                        border-radius: 6px;
-                        background: Theme.surface_variant;
-                        Text {
-                            text: "刷新";
-                            color: #ffffff;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                        TouchArea {
-                            clicked => { root.refresh_log_clicked(); }
+                        x: parent.width - 52px;
+                        y: (parent.height - 24px) / 2;
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.set_loop_single ? Theme.primary : Theme.surface_variant;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+                            y: 3px;
+                            x: root.set_loop_single ? parent.width - self.width - 3px : 3px;
+                            animate x { duration: 140ms; easing: ease-out; }
                         }
                     }
 
-                    // 清空
-                    Rectangle {
-                        width: 58px;
-                        height: 30px;
-                        border-radius: 6px;
-                        background: Theme.surface_variant;
-                        Text {
-                            text: "清空";
-                            color: #ffffff;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                    loop1_touch := TouchArea {
+                        clicked => {
+                            root.set_loop_single = !root.set_loop_single;
+                            // 与列表循环互斥：两个同时开语义就冲突了
+                            if (root.set_loop_single) { root.set_loop_list = false; }
+                            root.setting_changed("loop_single", root.set_loop_single);
+                            if (root.set_loop_single) {
+                                root.setting_changed("loop_list", false);
+                            }
                         }
-                        TouchArea {
-                            clicked => { root.clear_log_clicked(); }
+                    }
+                }
+
+                // ---- 列表循环 ----
+                Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    width: 100%;
+                    background: loopn_touch.pressed ? Theme.surface_variant : transparent;
+
+                    Text {
+                        x: 10px;
+                        y: 0px;
+                        width: parent.width - 72px;
+                        height: parent.height;
+                        text: "列表循环";
+                        color: Theme.on_surface;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        x: parent.width - 52px;
+                        y: (parent.height - 24px) / 2;
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.set_loop_list ? Theme.primary : Theme.surface_variant;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+                            y: 3px;
+                            x: root.set_loop_list ? parent.width - self.width - 3px : 3px;
+                            animate x { duration: 140ms; easing: ease-out; }
                         }
                     }
 
-                    // 关闭
-                    Rectangle {
-                        width: 58px;
-                        height: 30px;
-                        border-radius: 6px;
-                        background: Theme.primary;
-                        Text {
-                            text: "关闭";
-                            color: #ffffff;
-                            font-size: 12px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                    loopn_touch := TouchArea {
+                        clicked => {
+                            root.set_loop_list = !root.set_loop_list;
+                            if (root.set_loop_list) { root.set_loop_single = false; }
+                            root.setting_changed("loop_list", root.set_loop_list);
+                            if (root.set_loop_list) {
+                                root.setting_changed("loop_single", false);
+                            }
                         }
-                        TouchArea {
-                            clicked => { root.show_log_dialog = false; }
+                    }
+                }
+
+                // ---- 播完暂停 ----
+                Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    width: 100%;
+                    background: pause_touch.pressed ? Theme.surface_variant : transparent;
+
+                    Text {
+                        x: 10px;
+                        y: 0px;
+                        width: parent.width - 72px;
+                        height: parent.height;
+                        text: "播完暂停";
+                        color: Theme.on_surface;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        x: parent.width - 52px;
+                        y: (parent.height - 24px) / 2;
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.set_pause_at_end ? Theme.primary : Theme.surface_variant;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+                            y: 3px;
+                            x: root.set_pause_at_end ? parent.width - self.width - 3px : 3px;
+                            animate x { duration: 140ms; easing: ease-out; }
+                        }
+                    }
+
+                    pause_touch := TouchArea {
+                        clicked => {
+                            root.set_pause_at_end = !root.set_pause_at_end;
+                            root.setting_changed("pause_at_end", root.set_pause_at_end);
+                        }
+                    }
+                }
+
+                // ---- 听视频 ----
+                Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    width: 100%;
+                    background: audio_touch.pressed ? Theme.surface_variant : transparent;
+
+                    Text {
+                        x: 10px;
+                        y: 0px;
+                        width: parent.width - 72px;
+                        height: parent.height;
+                        text: "听视频";
+                        color: Theme.on_surface;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        x: parent.width - 52px;
+                        y: (parent.height - 24px) / 2;
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.set_audio_only ? Theme.primary : Theme.surface_variant;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            background: #ffffff;
+                            y: 3px;
+                            x: root.set_audio_only ? parent.width - self.width - 3px : 3px;
+                            animate x { duration: 140ms; easing: ease-out; }
+                        }
+                    }
+
+                    audio_touch := TouchArea {
+                        clicked => {
+                            root.set_audio_only = !root.set_audio_only;
+                            root.setting_changed("audio_only", root.set_audio_only);
                         }
                     }
                 }
             }
+        }
+    }
 
-            // 日志文本视口
-            Rectangle {
-                border-radius: 8px;
-                background: #0d1117;
-                border-width: 1px;
-                border-color: #30363d;
-                clip: true;
+    // ======================================================================
+    // 清晰度选择（点右下角那个档位按钮弹出）
+    // ======================================================================
+    if root.show_quality_panel : Rectangle {
+        x: 0px;
+        y: root.player_top;
+        width: root.width;
+        height: root.player_height;
+        background: #00000000;
 
-                Flickable {
+        TouchArea {
+            clicked => { root.show_quality_panel = false; }
+        }
+
+        q_card := Rectangle {
+            x: parent.width - self.width - 12px;
+            y: Math.max(0px, parent.height - self.height - 64px);
+            width: 132px;
+            height: q_col.preferred-height + 12px;
+            border-radius: 10px;
+            background: Theme.surface_container_high;
+            border-width: 1px;
+            border-color: Theme.outline_variant;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000088;
+
+            TouchArea { }
+
+            q_col := VerticalLayout {
+                x: 6px;
+                y: 6px;
+                width: parent.width - 12px;
+                spacing: 0px;
+
+                for opt[idx] in root.quality_options : Rectangle {
+                    height: 36px;
+                    border-radius: 6px;
                     width: 100%;
-                    height: 100%;
-                    content-height: log_txt.preferred-height + 32px;
+                    background: idx == root.quality_index
+                        ? Theme.primary.transparentize(78%)
+                        : (q_touch.pressed ? Theme.surface_variant : transparent);
 
-                    VerticalLayout {
-                        padding: 12px;
-                        alignment: start;
+                    Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: opt;
+                        color: idx == root.quality_index ? Theme.primary : Theme.on_surface;
+                        font-size: 13px;
+                        font-weight: idx == root.quality_index ? 700 : 400;
+                    }
 
-                        log_txt := Text {
-                            text: root.log_text != "" ? root.log_text : "暂无日志，请点击刷新";
-                            color: #58a6ff;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                    // 当前档位右侧打勾
+                    if idx == root.quality_index : IconBase {
+                        x: parent.width - 26px;
+                        y: (parent.height - 14px) / 2;
+                        size: 14px;
+                        tint: Theme.primary;
+                        stroke_w: 2px;
+                        commands: "M 3 10 L 7 14 L 15 5";
+                    }
+
+                    q_touch := TouchArea {
+                        clicked => {
+                            root.quality_index = idx;
+                            root.show_quality_panel = false;
+                            root.quality_selected(idx);
                         }
                     }
                 }

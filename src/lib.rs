@@ -292,6 +292,38 @@ fn android_main(app: slint::android::AndroidApp) {
         });
     }
 
+    // 播放设置二级菜单：五个开关的持久化
+    //
+    // key 用短名（auto_next / loop_single / …），settings.conf 是
+    // key=value 纯文本，短名让文件保持可读、手动改也方便。
+    {
+        let weak = main_window.as_weak();
+        main_window.on_setting_changed(move |key, val| {
+            let k = key.to_string();
+            settings::set_bool(&k, val);
+            crate::mxprobe::log_public(&format!("[设置] {k} -> {val}"));
+
+            // 「听视频」要立刻生效：它控制的是视频层可见性，
+            // 不是下次起播才起作用的东西。
+            if k == "audio_only" {
+                if let Some(w) = weak.upgrade() {
+                    let _ = w;
+                    crate::player::set_audio_only(val);
+                }
+            }
+        });
+    }
+
+    // 清晰度选择
+    {
+        let weak = main_window.as_weak();
+        main_window.on_quality_selected(move |idx| {
+            if let Some(w) = weak.upgrade() {
+                player::set_quality(w.as_weak(), idx);
+            }
+        });
+    }
+
     // 长按卡片（为点赞三连/快捷操作预留）
     {
         main_window.on_video_long_pressed(move |bvid| {
@@ -398,6 +430,11 @@ fn android_main(app: slint::android::AndroidApp) {
 
     // 读回持久化的播放设置
     main_window.set_auto_play(settings::get_bool("auto_play", true));
+    main_window.set_set_auto_next(settings::get_bool("auto_next", true));
+    main_window.set_set_loop_single(settings::get_bool("loop_single", false));
+    main_window.set_set_loop_list(settings::get_bool("loop_list", false));
+    main_window.set_set_pause_at_end(settings::get_bool("pause_at_end", false));
+    main_window.set_set_audio_only(settings::get_bool("audio_only", false));
 
     // ------------------------------------------------------------------------
     // 登录

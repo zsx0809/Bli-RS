@@ -61,6 +61,30 @@ impl Track {
     }
 }
 
+/// 清晰度 id → 显示文案。
+///
+/// id 常量来自 B 站 playurl 文档；未知 id 退回分辨率写法，
+/// 保证任何情况下都不会出现空白菜单项。
+fn quality_label(id: u64, height: Option<u32>) -> String {
+    match id {
+        127 => "8K".to_string(),
+        126 => "杜比视界".to_string(),
+        125 => "HDR".to_string(),
+        120 => "4K".to_string(),
+        116 => "1080P60".to_string(),
+        112 => "1080P+".to_string(),
+        80 => "1080P".to_string(),
+        74 => "720P60".to_string(),
+        64 => "720P".to_string(),
+        32 => "480P".to_string(),
+        16 => "360P".to_string(),
+        _ => match height {
+            Some(h) => format!("{h}P"),
+            None => format!("q{id}"),
+        },
+    }
+}
+
 /// DASH 播放信息
 #[derive(Debug, Clone, Default)]
 pub struct DashPlayInfo {
@@ -98,6 +122,37 @@ impl DashPlayInfo {
 
         // 没有 AVC 就退回任意编码里最高的
         usable().max_by_key(|t| (t.height.unwrap_or(0), t.bandwidth))
+    }
+
+    /// 按清晰度 id 精确选轨（用户手动指定档位时用）。
+    ///
+    /// 找不到该 id 就返回 None，由调用方回退到 `pick_video(Some(max))`。
+    /// 这样"用户选了 1080P 但账号无权限"时会自动降级，而不是黑屏。
+    pub fn pick_video_by_id(&self, qid: u64) -> Option<&Track> {
+        self.video
+            .iter()
+            .filter(|t| t.id == qid && t.primary_url().is_some())
+            .max_by_key(|t| (t.is_avc(), t.bandwidth))
+    }
+
+    /// 当前可用的清晰度档位，从高到低去重。
+    ///
+    /// 返回 (清晰度 id, 显示名) 列表，用于 UI 的清晰度菜单。
+    /// 只保留真正有可用地址的轨道 —— 菜单里列出点了播不了的档位是欺骗。
+    pub fn quality_options(&self) -> Vec<(u64, String)> {
+        let mut seen: Vec<(u64, String)> = Vec::new();
+        for t in &self.video {
+            if t.primary_url().is_none() {
+                continue;
+            }
+            if seen.iter().any(|(id, _)| *id == t.id) {
+                continue;
+            }
+            seen.push((t.id, quality_label(t.id, t.height)));
+        }
+        // 高清在前
+        seen.sort_by(|a, b| b.0.cmp(&a.0));
+        seen
     }
 
     /// 选一条音频轨：取码率最高的。

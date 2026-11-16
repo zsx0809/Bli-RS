@@ -111,6 +111,169 @@ impl BiliClient {
             raw_count,
         })
     }
+
+    /// 拉取首页推荐（**App 端**，真正的个性化推荐）。
+    ///
+    /// 与 `recommend_feed`（Web 端）的关键差别：
+    ///   · Web 端在无画像时返回通用热榜，翻页高度重复
+    ///   · App 端走推荐引擎，`idx` 每推进一次就是一批全新内容
+    ///
+    /// 参数照抄 PiliPlus `VideoHttp.rcmdVideoListApp`，一个都不改：
+    /// 这些值共同决定服务端走哪条推荐链路，改任何一项都可能退回热榜。
+    pub async fn recommend_feed_app(&self, idx: u32) -> Result<RecommendPage> {
+        let mut params = BTreeMap::new();
+        params.insert("build".to_string(), "8430300".to_string());
+        params.insert("c_locale".to_string(), "zh_CN".to_string());
+        params.insert("channel".to_string(), "master".to_string());
+        params.insert("column".to_string(), "2".to_string());
+        params.insert("device".to_string(), "phone".to_string());
+        params.insert("device_name".to_string(), "android".to_string());
+        params.insert("device_type".to_string(), "0".to_string());
+        params.insert("disable_rcmd".to_string(), "0".to_string());
+        params.insert("flush".to_string(), "8".to_string());
+        params.insert("fnval".to_string(), "976".to_string());
+        params.insert("fnver".to_string(), "0".to_string());
+        params.insert("force_host".to_string(), "2".to_string());
+        params.insert("fourk".to_string(), "1".to_string());
+        params.insert("guidance".to_string(), "1".to_string());
+        params.insert("https_url_req".to_string(), "1".to_string());
+        params.insert("idx".to_string(), idx.to_string());
+        params.insert("mobi_app".to_string(), "android_i".to_string());
+        params.insert("network".to_string(), "wifi".to_string());
+        params.insert("platform".to_string(), "android".to_string());
+        params.insert("player_net".to_string(), "1".to_string());
+        // pull=true 只在首次请求（idx == 0）时为 true
+        params.insert(
+            "pull".to_string(),
+            if idx == 0 { "true".to_string() } else { "false".to_string() },
+        );
+        params.insert("qn".to_string(), "32".to_string());
+        params.insert("recsys_mode".to_string(), "0".to_string());
+        params.insert("s_locale".to_string(), "zh_CN".to_string());
+        params.insert("splash_id".to_string(), String::new());
+        params.insert("statistics".to_string(), api::APP_STATISTICS.to_string());
+        params.insert("voice_balance".to_string(), "0".to_string());
+
+        let url = format!("{}{}", api::APP_BASE_URL, api::RECOMMEND_APP);
+
+        let headers = vec![
+            ("user-agent", api::APP_UA.to_string()),
+            ("app-key", "android_hd".to_string()),
+            ("env", "prod".to_string()),
+            ("buvid", self.buvid_string()),
+            // PiliPlus 送的是一串 1 的假指纹。真实指纹缺失时服务端照样
+            // 走推荐链路，而这串 1 是它实测可用的值，照抄最稳。
+            ("fp_local", "1".repeat(64)),
+            ("fp_remote", "1".repeat(64)),
+            ("session_id", "11111111".to_string()),
+            ("x-bili-trace-id", api::APP_TRACE_ID.to_string()),
+            ("x-bili-aurora-eid", String::new()),
+            ("x-bili-aurora-zone", String::new()),
+            ("bili-http-engine", "cronet".to_string()),
+        ];
+
+        let json = self
+            .get_with_headers(&url, &params, &headers)
+            .await?;
+
+        let raw_items = json["data"]["items"]
+            .as_array()
+            .ok_or_else(|| Error::Decode("App 推荐响应缺少 data.items 数组".into()))?;
+
+        let raw_count = raw_items.len();
+        let mut items = Vec::with_capacity(raw_count);
+        let mut filtered_out = 0usize;
+
+        for raw in raw_items {
+            // App 端过滤规则（对应 PiliPlus _filterAppRcmd）：
+            //   card_goto 为广告 / ad_info 存在 / can_play != 1 → 丢弃
+            if matches!(
+                raw["card_goto"].as_str(),
+                Some("ad_av") | Some("ad_web_s")
+            ) || !raw["ad_info"].is_null()
+                || raw["can_play"].as_i64().unwrap_or(1) != 1
+            {
+                filtered_out += 1;
+                continue;
+            }
+
+            match parse_item_app(raw) {
+                Some(v) => items.push(v),
+                None => filtered_out += 1,
+            }
+        }
+
+        Ok(RecommendPage {
+            items,
+            filtered_out,
+            raw_count,
+        })
+    }
+}
+
+/// 解析 App 端推荐条目。
+///
+/// 字段结构与 Web 端完全不同：标题在 `title`，时长和 aid 埋在 `player_args`，
+/// 封面在 `cover`，作者在 `args.up_name` 或 `owner.name`。
+fn parse_item_app(raw: &serde_json::Value) -> Option<VideoItem> {
+    // 只要普通视频。实时直播/番剧在 App 流里用 card_goto 标记
+    let goto = raw["card_goto"].as_str().unwrap_or("av");
+    if goto != "av" && goto != "av_rcmd" {
+        return None;
+    }
+
+    let args = &raw["player_args"];
+    let aid = args["aid"]
+        .as_i64()
+        .or_else(|| raw["param"].as_str().and_then(|s| s.parse::<i64>().ok()))
+        .or_else(|| raw["aid"].as_i64())?;
+
+    let bvid = raw["bvid"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| crate::recommend::av_to_bv(aid));
+
+    let cid = args["cid"].as_i64().unwrap_or(0);
+    let title = raw["title"].as_str()?.to_string();
+
+    let cover_url = raw["cover"]
+        .as_str()
+        .or_else(|| raw["pic"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let author = raw["args"]["up_name"]
+        .as_str()
+        .or_else(|| raw["owner"]["name"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let duration = args["duration"].as_i64().unwrap_or(0);
+
+    // 播放量：App 流里可能是数字，也可能是 "12.3万" 这种文案
+    let view_text = raw["stat"]["view"]
+        .as_u64()
+        .map(|n| format_count(n as i64))
+        .or_else(|| raw["cover_left_text_1"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    let danmaku_text = raw["stat"]["danmaku"]
+        .as_u64()
+        .map(|n| format_count(n as i64))
+        .or_else(|| raw["cover_left_text_2"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    Some(VideoItem {
+        aid,
+        bvid,
+        cid,
+        title,
+        author,
+        cover_url,
+        duration,
+        view_text,
+        danmaku_text,
+    })
 }
 
 /// 解析单条推荐。
@@ -152,13 +315,13 @@ fn parse_item(raw: &serde_json::Value) -> Option<VideoItem> {
     // App 端在 cover_left_text_1/2（已格式化的中文串）
     let view_text = raw["stat"]["view"]
         .as_i64()
-        .map(format_count)
+        .map(|n| format_count(n as i64))
         .or_else(|| raw["cover_left_text_1"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "0".into());
 
     let danmaku_text = raw["stat"]["danmaku"]
         .as_i64()
-        .map(format_count)
+        .map(|n| format_count(n as i64))
         .or_else(|| raw["cover_left_text_2"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "0".into());
 

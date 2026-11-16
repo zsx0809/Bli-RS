@@ -138,6 +138,8 @@ pub struct Controls {
     ///   通知 Slint，会把 UI 线程压满。UI 侧用 200ms 定时器来轮询，
     ///   刷新率对人眼足够，代价可以忽略。
     last_pts_us: AtomicI64,
+    /// 是否已播完（收到 EOS）。播放器据此决定自动连播 / 循环 / 暂停。
+    ended: AtomicBool,
 }
 
 impl Default for Controls {
@@ -147,6 +149,7 @@ impl Default for Controls {
             seek_target_us: Mutex::new(None),
             // -1 = "还没有任何帧送显"，与 PTS 0（首帧）区分开
             last_pts_us: AtomicI64::new(-1),
+            ended: AtomicBool::new(false),
         }
     }
 }
@@ -167,6 +170,19 @@ impl Controls {
         }
     }
     /// 取出并清空待处理 seek
+    /// 是否已播到结尾（EOS）。
+    ///
+    /// 单独一个标志而不是靠"线程结束"判断：解码线程结束后
+    /// CURRENT 里那个 VideoDecoder 还在（要等下次 play() 才清），
+    /// 所以只能靠这个原子量告诉播放器"这条播完了"。
+    fn mark_ended(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+    }
+
+    pub fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
     fn take_seek(&self) -> Option<i64> {
         self.seek_target_us.lock().ok().and_then(|mut t| t.take())
     }
@@ -615,6 +631,7 @@ fn decode_loop(
 
                     if eos {
                         output_done = true;
+                        controls.mark_ended();
                     }
                 }
                 Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {

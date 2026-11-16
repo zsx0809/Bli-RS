@@ -92,6 +92,73 @@ impl AudioDecoder {
     }
 }
 
+/// 探测音频轨的真实格式：(采样率, 声道数)。
+///
+/// 为什么必须在**打开 AAudio 流之前**探测：
+///   MediaCodec 解出的 PCM 是音轨的原生采样率。AAudio 流一旦按某个
+///   采样率打开，它就把收到的字节**按那个速率**播出去，不做重采样。
+///   按 48000 打开却喂 44100 的数据 → 声音快 8.8%、音调偏高，
+///   而且消费速度与生产速度不匹配，会周期性欠载 —— 听感就是"杂音"。
+///
+/// 之前这里偷懒固定按 48k 开流，注释里写"AAudio 会自动重采样"，
+/// 那是错的。代价是一部分视频音画不同步 + 全程杂音，且症状随机
+/// （取决于那个视频的音轨恰好是 44.1k 还是 48k），很难归因。
+///
+/// 探测本身很便宜：只解封装、读轨道格式，不解码任何帧。
+/// 数据源是流式的，但这个函数只碰文件头（moov），首段就够。
+pub fn probe_format(buffer: Arc<crate::stream_source::SharedBuffer>) -> (i32, i32) {
+    const DEFAULT: (i32, i32) = (48_000, 2);
+    unsafe {
+        let ex = crate::video_decoder::raw_extractor::AMediaExtractor_new();
+        if ex.is_null() {
+            return DEFAULT;
+        }
+        let ds = crate::stream_source::create_data_source(buffer);
+        if ds.is_null() {
+            crate::video_decoder::raw_extractor::AMediaExtractor_delete(ex);
+            return DEFAULT;
+        }
+        let r = crate::video_decoder::raw_extractor::AMediaExtractor_setDataSourceCustom(ex, ds);
+        if r != 0 {
+            crate::video_decoder::raw_extractor::AMediaExtractor_delete(ex);
+            return DEFAULT;
+        }
+
+        let tracks = crate::video_decoder::raw_extractor::AMediaExtractor_getTrackCount(ex);
+        let mut out = DEFAULT;
+        for i in 0..tracks {
+            let fmt = crate::video_decoder::raw_extractor::AMediaExtractor_getTrackFormat(ex, i);
+            if fmt.is_null() {
+                continue;
+            }
+            let s = crate::video_decoder::raw_extractor::AMediaFormat_toString(fmt);
+            let desc = if s.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(s).to_string_lossy().to_string()
+            };
+            if desc.contains("audio/") {
+                if let Some(nn) = std::ptr::NonNull::new(fmt as *mut ndk_sys::AMediaFormat) {
+                    let mut f = MediaFormat::from_ptr(nn);
+                    out = (
+                        f.i32("sample-rate").unwrap_or(DEFAULT.0),
+                        f.i32("channel-count").unwrap_or(DEFAULT.1),
+                    );
+                }
+                break;
+            }
+            crate::video_decoder::raw_extractor::AMediaFormat_delete(fmt);
+        }
+
+        crate::video_decoder::raw_extractor::AMediaExtractor_delete(ex);
+        if out.0 <= 0 || out.1 <= 0 {
+            DEFAULT
+        } else {
+            out
+        }
+    }
+}
+
 fn decode_loop(
     buffer: Arc<crate::stream_source::SharedBuffer>,
     output: Arc<AudioOutput>,

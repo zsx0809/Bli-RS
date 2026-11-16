@@ -56,6 +56,19 @@ struct PendingStream {
 
 static PENDING_STREAM: Mutex<Option<PendingStream>> = Mutex::new(None);
 
+/// 用户手动指定的清晰度 id（0 = 自动）。
+///
+/// 放在全局而不是参数里：清晰度是"这一路播放的偏好"，
+/// 用户在详情页点一下就要立刻重播生效，那时 play() 早已返回，
+/// 拿不到局部变量。
+static DESIRED_QN: AtomicU64 = AtomicU64::new(0);
+
+/// 当前这次播放实际拿到的视频高度（用于 UI 回显）
+static ACTUAL_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// 当前视频的清晰度候选（id, 文案），供 UI 菜单用
+static QUALITY_LIST: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
 thread_local! {
     /// 相关推荐视频模型句柄（仅在 UI 线程访问，杜绝跨线程 Send 冲突）
     static RELATED_MODEL: RefCell<Option<Rc<VecModel<RelatedVideoData>>>> = const { RefCell::new(None) };
@@ -564,11 +577,52 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             return;
         }
 
-        // 优先 720P / 480P，移动端秒级快速下载，杜绝 1080P 超大体积与限速导致长时间卡在加载中
-        let Some(vtrack) = info.pick_video(Some(720)) else {
+        // ---- 清晰度选择 ----
+        //
+        // 优先级：
+        //   1. 用户手动指定了 id 且该档位可用 → 用它
+        //   2. 否则自动：默认上限 720P
+        //
+        // 为什么自动档上限是 720P 而不是最高：
+        //   移动端 1080P60 单集动辄 200MB+，起播要等很久，流量也扛不住。
+        //   用户想要更高自己点清晰度菜单，这个决定权交出去。
+        let desired = DESIRED_QN.load(Ordering::SeqCst);
+
+        // 先把候选档位存起来给 UI（无论最后选了哪个）
+        let options = info.quality_options();
+        if let Ok(mut g) = QUALITY_LIST.lock() {
+            *g = options.clone();
+        }
+        {
+            let w_q = w_clone.clone();
+            let labels: Vec<String> = std::iter::once("自动".to_string())
+                .chain(options.iter().map(|(_, l)| l.clone()))
+                .collect();
+            let _ = w_q.upgrade_in_event_loop(move |w| {
+                let model: Vec<slint::SharedString> =
+                    labels.iter().map(|s| s.as_str().into()).collect();
+                w.set_quality_options(slint::ModelRc::new(slint::VecModel::from(model)));
+            });
+        }
+
+        let picked = if desired > 0 {
+            info.pick_video_by_id(desired)
+                .or_else(|| info.pick_video(Some(720)))
+        } else {
+            info.pick_video(Some(720))
+        };
+
+        let Some(vtrack) = picked else {
             report_fail(&w_clone, "该视频没有可用的视频流（可能是充电专属或地区限制）".into());
             return;
         };
+
+        ACTUAL_HEIGHT.store(vtrack.height.unwrap_or(0) as u64, Ordering::SeqCst);
+        crate::mxprobe::log_public(&format!(
+            "[Player] 清晰度: 请求 {desired} -> 实际 {}P (id={})",
+            vtrack.height.unwrap_or(0),
+            vtrack.id
+        ));
         let Some(url) = vtrack.primary_url().map(|s| s.to_string()) else {
             report_fail(&w_clone, "视频流地址为空".into());
             return;
@@ -760,7 +814,18 @@ fn start_playback(
     }
 
     // 3.7 展现视频层并启动硬解
-    crate::video_surface::set_visible(true);
+    //
+    // 「听视频」开着时不显示画面。解码器照常起（音频要靠它），
+    // 只是视频层保持透明。
+    let audio_only = w_clone
+        .upgrade()
+        .map(|w| w.get_set_audio_only())
+        .unwrap_or(false);
+    if audio_only {
+        crate::mxprobe::log_public("[AudioOnly] 听视频模式：不显示画面");
+    } else {
+        crate::video_surface::set_visible(true);
+    }
 
     // ---- 音频：先于视频启动 ----
     //
@@ -776,15 +841,19 @@ fn start_playback(
             Err(_) => crate::mxprobe::log_public("[Audio] 首段等待超时，继续尝试解码"),
         }
 
-        // 采样率/声道数先按 48k/2ch 建流。
+        // ---- 按音轨真实格式打开 AAudio ----
         //
-        // 为什么不先问解码器真实格式：
-        //   MediaCodec 的音频输出格式要等 dequeue_output 的
-        //   OUTPUT_FORMAT_CHANGED 才知道，而 AAudio 流必须先建好才能
-        //   往里写。B 站 DASH 音频实际上全是 48kHz 立体声
-        //   （AAC-LC 44100/48000，实测都是 48000），按 48k/2ch 建立
-        //   是安全的。真遇到 44.1k 的源，AAudio 会自动重采样。
-        match crate::audio_out::AudioOutput::open(48_000, 2) {
+        // 这一步曾经写死成 48k/2ch，注释还写着"AAudio 会自动重采样"——
+        // 那是错的。AAudio 不做隐式重采样：按什么速率打开，就按什么速率
+        // 把字节播出去。B 站 DASH 的 AAC 有 44100 和 48000 两种，
+        // 喂 44.1k 的数据给 48k 的流 → 快 8.8%、音调偏高、周期性欠载爆音。
+        //
+        // 症状正好就是用户报的"时不时有杂音" + "有的视频音画极度不同步"：
+        // 取决于那个视频的音轨恰好是哪种采样率。
+        let (sr, ch) = crate::audio_decoder::probe_format(abuf.clone());
+        crate::mxprobe::log_public(&format!("[Audio] 按真实格式打开输出: {sr}Hz {ch}ch"));
+
+        match crate::audio_out::AudioOutput::open(sr as u32, ch as u32) {
             Ok(ao) => {
                 let ao = std::sync::Arc::new(ao);
                 let clock = ao.clock.clone();
@@ -1413,6 +1482,85 @@ fn spawn_stream_download(
     (buffer, rx_ready)
 }
 
+/// 播完了：按用户设置在「暂停 / 单个循环 / 自动连播」之间选择。
+///
+/// 优先级（后者的前提是前者不成立）：
+///   1. 单个循环  → 重播同一个视频
+///   2. 播完暂停  → 停在最后一帧，什么都不做
+///   3. 自动连播  → 播相关推荐的第一条
+///   4. 都没有    → 同样停在末尾
+///
+/// 为什么「单个循环」优先于「自动连播」：
+///   用户开了循环就是想反复看这一个，这时还跳下一个明显违背意图。
+///   UI 侧已经让 loop_single / loop_list 互斥，这里只处理优先级。
+fn on_playback_ended(window: slint::Weak<AppWindow>) {
+    let (loop_single, loop_list, pause_at_end, auto_next) = match window.upgrade() {
+        Some(w) => (
+            w.get_set_loop_single(),
+            w.get_set_loop_list(),
+            w.get_set_pause_at_end(),
+            w.get_set_auto_next(),
+        ),
+        None => return,
+    };
+
+    crate::mxprobe::log_public(&format!(
+        "[End] 播放结束 loop_single={loop_single} loop_list={loop_list} pause={pause_at_end} auto_next={auto_next}"
+    ));
+
+    let cur_bvid = CURRENT_BVID.lock().ok().and_then(|g| g.clone());
+
+    // 1. 单个循环
+    if loop_single {
+        if let Some(bvid) = cur_bvid {
+            crate::mxprobe::log_public("[End] 单个循环：重播当前视频");
+            let auto = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
+            play(window, bvid, auto);
+            return;
+        }
+    }
+
+    // 2. 播完暂停
+    if pause_at_end {
+        crate::mxprobe::log_public("[End] 播完暂停");
+        if let Some(w) = window.upgrade() {
+            w.set_play_paused(true);
+        }
+        return;
+    }
+
+    // 3. 自动连播 / 列表循环：播相关推荐的第一条
+    if auto_next || loop_list {
+        // 相关推荐列表里第一条不是当前视频的那条
+        let next = RELATED_MODEL.with(|cell| {
+            let m = cell.borrow();
+            let m = m.as_ref()?;
+            for i in 0..m.row_count() {
+                let row = m.row_data(i)?;
+                let bvid = row.bvid.to_string();
+                if Some(&bvid) != cur_bvid.as_ref() && !bvid.is_empty() {
+                    return Some(bvid);
+                }
+            }
+            None
+        });
+
+        match next {
+            Some(bvid) => {
+                crate::mxprobe::log_public(&format!("[End] 自动连播 -> {bvid}"));
+                let auto = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
+                play(window, bvid, auto);
+            }
+            None => {
+                crate::mxprobe::log_public("[End] 相关推荐为空，停在末尾");
+            }
+        }
+        return;
+    }
+
+    crate::mxprobe::log_public("[End] 未开启任何续播设置，停在末尾");
+}
+
 /// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
 fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_us: i64) {
     if duration_us <= 0 {
@@ -1434,20 +1582,30 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
     }
 
     std::thread::spawn(move || {
+        let mut handled_end = false;
         loop {
             if PLAY_SESSION.load(Ordering::SeqCst) != session {
                 return;
             }
 
-            let pts = {
+            let (pts, ended) = {
                 match CURRENT.lock() {
                     Ok(cur) => match cur.as_ref() {
-                        Some(d) => d.controls.last_pts_us(),
+                        Some(d) => (d.controls.last_pts_us(), d.controls.has_ended()),
                         None => return,
                     },
                     Err(_) => return,
                 }
             };
+
+            // ---- 播放结束：执行用户设置的动作 ----
+            //
+            // 只在第一次进入时处理（handled_end 保证），否则 250ms 一次
+            // 的轮询会把"自动连播"触发无数次。
+            if ended && !handled_end {
+                handled_end = true;
+                on_playback_ended(window.clone());
+            }
 
             // 注意：pts == 0 是**合法值**（首帧就从 0 开始），
             // 不能像之前那样 `pts <= 0` 直接跳过 —— 那会让进度条在
@@ -1951,6 +2109,72 @@ pub fn seek_by(secs: f32) {
     seek_all(target);
 }
 
+/// 用户点了清晰度菜单里的某一项。
+///
+/// `index == 0` 是"自动"，其余对应 QUALITY_LIST 里的第 index-1 项。
+///
+/// 切换清晰度必须**重新起播**：DASH 的每条轨道是独立的 m4s，
+/// 换了档位就是换了一个 URL，没法在现有解码器里热切。
+/// 这里走和 play() 一样的路径，但保留当前进度，
+/// 用 seek 跳回去 —— 否则用户切个清晰度就得从头看。
+pub fn set_quality(window: slint::Weak<AppWindow>, index: i32) {
+    let list = QUALITY_LIST.lock().map(|g| g.clone()).unwrap_or_default();
+
+    let qid = if index <= 0 {
+        0
+    } else {
+        list.get((index - 1) as usize).map(|(id, _)| *id).unwrap_or(0)
+    };
+
+    DESIRED_QN.store(qid, Ordering::SeqCst);
+    crate::mxprobe::log_public(&format!("[Quality] 用户选择 index={index} -> qn={qid}"));
+
+    // 记住当前进度，重播后跳回去
+    let resume_frac = {
+        let dur = DURATION_US.load(Ordering::SeqCst);
+        let pts = CURRENT
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|d| d.controls.last_pts_us()))
+            .unwrap_or(0)
+            .max(0);
+        if dur > 0 {
+            (pts as f32 / dur as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+
+    let bvid = match CURRENT_BVID.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let Some(bvid) = bvid else {
+        crate::mxprobe::log_public("[Quality] 当前没有播放中的视频");
+        return;
+    };
+
+    let auto = window
+        .upgrade()
+        .map(|w| w.get_auto_play())
+        .unwrap_or(true);
+
+    play(window.clone(), bvid, auto);
+
+    // 重播起播是异步的，等它拿到时长再 seek。
+    // 3 秒是实测够用的经验值（playurl + 首段下载 + 解码器启动）。
+    if resume_frac > 0.01 {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            seek_to(resume_frac);
+            crate::mxprobe::log_public(&format!(
+                "[Quality] 恢复到 {:.1}%",
+                resume_frac * 100.0
+            ));
+        });
+    }
+}
+
 /// 播放 / 暂停切换。
 ///
 /// 三种情形：
@@ -2009,6 +2233,27 @@ pub fn toggle_play(window: slint::Weak<AppWindow>) {
             });
         }
         None => crate::mxprobe::log_public("[Play] 解码器已消失，忽略"),
+    }
+}
+
+/// 听视频：关掉画面只放声音。
+///
+/// 实现就是隐藏视频层（alpha=0），**不**停解码器 —— 停了音频也会跟着停。
+/// 视频解码继续跑是有点浪费，但换来的是切回来时画面立刻有，
+/// 而不是重新等关键帧。这个取舍和"后台只放声音"那段代码一致。
+///
+/// 注意：不能用 INVISIBLE / 高度归零，那会销毁 Surface，
+/// 切回来再也 attach 不上（见 video_surface 里那段血的教训）。
+pub fn set_audio_only(on: bool) {
+    crate::mxprobe::log_public(&format!("[AudioOnly] -> {on}"));
+    if on {
+        crate::video_surface::set_visible(false);
+    } else {
+        // 只有当前确实在播时才恢复画面，否则会把详情页的封面垫底也盖掉
+        let playing = CURRENT.lock().map(|c| c.is_some()).unwrap_or(false);
+        if playing {
+            crate::video_surface::set_visible(true);
+        }
     }
 }
 

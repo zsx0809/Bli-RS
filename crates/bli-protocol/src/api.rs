@@ -11,7 +11,32 @@ pub const APP_BASE_URL: &str = "https://app.bilibili.com";
 
 /// 首页推荐（Web 端，需要 Wbi 签名）
 /// PiliPlus: Api.recommendListWeb
+///
+/// 注意这个接口是**游客视角**的：没有登录画像时返回的是通用热榜，
+/// 内容高度重复。真正个性化的推荐在 App 端接口（见 RECOMMEND_APP）。
 pub const RECOMMEND_WEB: &str = "/x/web-interface/wbi/index/top/feed/rcmd";
+
+/// 首页推荐（App 端，真正的个性化推荐）
+/// PiliPlus: Api.recommendListApp —— appBaseUrl + /x/v2/feed/index
+///
+/// 为什么必须用这个：
+///   Web 端 rcmd 接口在未登录 / 无画像时返回的是「热门」类内容，
+///   翻十几页都是同一批视频。App 端接口走推荐引擎，`idx` 游标
+///   每次推进都会给出全新的内容。
+pub const RECOMMEND_APP: &str = "/x/v2/feed/index";
+
+/// App 端请求标识（照抄 PiliPlus Constants.userAgentApp / statisticsApp）
+///
+/// 服务端按 UA 区分返回结构：带 app UA 才走推荐引擎，
+/// 用浏览器 UA 会被当成网页访客，又退回热榜。
+pub const APP_UA: &str = "Mozilla/5.0 BiliDroid/8.43.0 (bbcallen@gmail.com) \
+os/android model/android mobi_app/android build/8430300 channel/master \
+innerVer/8430300 osVer/15 network/2";
+
+pub const APP_STATISTICS: &str =
+    "{\"appId\":1,\"platform\":3,\"version\":\"8.43.0\",\"abtest\":\"\"}";
+
+pub const APP_TRACE_ID: &str = "11111111111111111111111111111111:1111111111111111:0:0";
 
 /// 用户信息 / Wbi 密钥
 pub const NAV: &str = "/x/web-interface/nav";
