@@ -233,6 +233,7 @@ pub fn spawn_ime_watcher() {
                 continue;
             }
             last = h;
+            crate::mxprobe::log_public(&format!("[IME] 键盘高度 -> {h}px"));
             let w2 = w.clone();
             let _ = w2.upgrade_in_event_loop(move |win| {
                 win.set_ime_height(h as f32);

@@ -197,13 +197,19 @@ mod imp {
     /// 占了屏幕下半部分 —— 输入框正好被压在键盘底下，用户看不见
     /// 自己打的字。实测就是这个现象。
     ///
-    /// API 选择：
-    ///   Android 11+ 用 WindowInsets.Type.ime()
-    ///   Android 10 及以下退化到 systemWindowInsetBottom 与
-    ///   displayFrame 高度差。minSdk 是 26，两条都要有。
+    /// 实现选择（踩过的坑）：
+    ///   最初用 WindowInsets.Type.ime()，实测在 NativeActivity 上
+    ///   恒返回 0 —— 因为 android:windowSoftInputMode 没声明 adjustResize，
+    ///   窗口根本不接收 IME insets。
+    ///
+    ///   现在两条路都试，取较大值：
+    ///     A. getWindowVisibleDisplayFrame：可见区域底边与屏幕高度的差。
+    ///        这条路只要窗口被 IME 挤压就有效，不依赖 insets 分发。
+    ///     B. WindowInsets.getInsets(Type.ime())：API 30+ 且窗口正确
+    ///        接收 insets 时最准。
     pub fn ime_height_px() -> i32 {
         with_env(|env, activity| {
-            let metrics = (|| -> Option<i32> {
+            let screen_h = (|| -> Option<i32> {
                 let res = env
                     .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
                     .ok()?
@@ -216,63 +222,26 @@ mod imp {
                     .ok()?;
                 env.get_field(&dm, "heightPixels", "I").ok()?.i().ok()
             })()
-            .unwrap_or(2400);
-
-            // ---- 路径 A：API 30+ WindowInsets.Type.ime() ----
-            let modern = (|| -> Option<i32> {
-                let window = env
-                    .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])
-                    .ok()?
-                    .l()
-                    .ok()?;
-                let decor = env
-                    .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
-                    .ok()?
-                    .l()
-                    .ok()?;
-                // getRootWindowInsets() 可能返回 null（还没 attach 完）
-                let insets = env
-                    .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])
-                    .ok()?
-                    .l()
-                    .ok()?;
-                if insets.is_null() {
-                    return None;
-                }
-                // WindowInsets.Type.ime() = 8
-                let cls = env.find_class("android/view/WindowInsets$Type").ok()?;
-                let mask = env
-                    .call_static_method(&cls, "ime", "()I", &[])
-                    .ok()?
-                    .i()
-                    .ok()?;
-                let bottom = env
-                    .call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &[JValue::Int(mask)])
-                    .ok()?
-                    .l()
-                    .ok()?;
-                if bottom.is_null() {
-                    return None;
-                }
-                env.get_field(&bottom, "bottom", "I").ok()?.i().ok()
-            })();
-
-            if let Some(h) = modern {
-                return h.max(0);
+            .unwrap_or(0);
+            if screen_h <= 0 {
+                return 0;
             }
 
-            // ---- 路径 B：旧 API，用可见区域高度差估算 ----
-            let visible = (|| -> Option<i32> {
+            let decor = (|| -> Option<JObject> {
                 let window = env
                     .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])
                     .ok()?
                     .l()
                     .ok()?;
-                let decor = env
-                    .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
+                env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])
                     .ok()?
                     .l()
-                    .ok()?;
+                    .ok()
+            })();
+            let Some(decor) = decor else { return 0 };
+
+            // ---- 路径 A：可见显示区域 ----
+            let by_visible = (|| -> Option<i32> {
                 let rect = env.new_object("android/graphics/Rect", "()V", &[]).ok()?;
                 env.call_method(
                     &decor,
@@ -282,55 +251,53 @@ mod imp {
                 )
                 .ok()?;
                 let bottom = env.get_field(&rect, "bottom", "I").ok()?.i().ok()?;
-                Some(bottom)
-            })();
+                Some((screen_h - bottom).max(0))
+            })()
+            .unwrap_or(0);
 
-            match visible {
-                Some(vis) => (metrics - vis).max(0),
-                None => 0,
-            }
-        })
-        .unwrap_or(0)
-    }
-
-    pub fn status_bar_height_px() -> i32 {
-        with_env(|env, activity| {
-            let res = env
-                .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let jpkg = env.new_string("android").ok()?;
-            let jtype = env.new_string("dimen").ok()?;
-            let jname = env.new_string("status_bar_height").ok()?;
-            let id = env
-                .call_method(
-                    &res,
-                    "getIdentifier",
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
-                    &[
-                        JValue::Object(&jname),
-                        JValue::Object(&jtype),
-                        JValue::Object(&jpkg),
-                    ],
-                )
-                .ok()?
-                .i()
-                .ok()?;
-            if id > 0 {
-                env.call_method(&res, "getDimensionPixelSize", "(I)I", &[JValue::Int(id)])
+            // ---- 路径 B：WindowInsets.Type.ime() ----
+            let by_insets = (|| -> Option<i32> {
+                let insets = env
+                    .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if insets.is_null() {
+                    return None;
+                }
+                let cls = env.find_class("android/view/WindowInsets$Type").ok()?;
+                let mask = env
+                    .call_static_method(&cls, "ime", "()I", &[])
                     .ok()?
                     .i()
-                    .ok()
-            } else {
-                None
+                    .ok()?;
+                if mask == 0 {
+                    return None;
+                }
+                let part = env
+                    .call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &[JValue::Int(mask)])
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if part.is_null() {
+                    return None;
+                }
+                env.get_field(&part, "bottom", "I").ok()?.i().ok()
+            })()
+            .unwrap_or(0);
+
+            let out = by_visible.max(by_insets).max(0);
+            // 只在非零时打日志，避免每 250ms 刷屏
+            if out > 0 {
+                crate::mxprobe::log_public(&format!(
+                    "[IME] visible={by_visible} insets={by_insets} screen_h={screen_h} -> {out}"
+                ));
             }
+            out
         })
-        .flatten()
         .unwrap_or(0)
     }
 
-    /// 获取屏幕密度 density
     pub fn display_density() -> f32 {
         with_env(|env, activity| {
             let res = env
