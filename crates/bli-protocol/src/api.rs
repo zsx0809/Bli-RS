@@ -38,6 +38,20 @@ pub const APP_STATISTICS: &str =
 
 pub const APP_TRACE_ID: &str = "11111111111111111111111111111111:1111111111111111:0:0";
 
+/// buvid 激活（设备指纹上报）
+///
+/// ★ 这是个性化推荐能不能生效的**关键一环**，很容易被漏掉。
+///
+///   本地随机生成的 buvid3 只是一个格式正确的字符串，服务端并不认识它。
+///   必须调一次这个接口上报设备指纹（payload 是一段 base64 编码的
+///   字段映射），服务端才会把这个 buvid 标记为"已激活的真实设备"，
+///   之后推荐引擎才愿意基于它算画像。
+///
+///   不激活的表现：推荐接口能正常返回，但内容是内容泛化的通用流，
+///   和用户实际兴趣无关。PiliPlus 在 Accounts.refresh() 里对所有
+///   账号（含匿名）都跑一遍 InitHttp.buvidActive()。
+pub const ACTIVATE_BUVID: &str = "/x/internal/gaia-gateway/ExClimbWuzhi";
+
 /// 用户信息 / Wbi 密钥
 pub const NAV: &str = "/x/web-interface/nav";
 

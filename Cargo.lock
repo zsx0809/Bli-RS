@@ -388,6 +388,7 @@ dependencies = [
 name = "bli-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "log",
  "md-5",
  "reqwest",

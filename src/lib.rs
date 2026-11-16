@@ -43,10 +43,56 @@ pub fn client() -> Option<bli_protocol::BiliClient> {
     if let Some(c) = GLOBAL_CLIENT.get() {
         return Some(c.clone());
     }
-    match bli_protocol::BiliClient::new() {
+
+    // ★ buvid 必须持久化，且首次要激活。
+    //
+    // 这是"推荐推的都不是一类东西"的根因：
+    //   本地随机生成的 buvid 每次启动都换新的 → 服务端每次都看到一台
+    //   全新设备 → 没有行为画像 → 只能给内容泛化的通用流。
+    //
+    // 两步都要做，缺一不可：
+    //   1. 存盘复用：让服务端能跨会话认出"还是这台设备"
+    //   2. 激活上报：让服务端把这个 buvid 标记为真实设备
+    //      （只持久化不激活，服务端仍然当它是来路不明的字符串）
+    const KEY_BUVID: &str = "buvid3";
+    let saved = settings::get_string(KEY_BUVID);
+    let (buvid, is_new) = if saved.is_empty() {
+        let fresh = bli_protocol::BiliClient::random_buvid3();
+        settings::set_string(KEY_BUVID, &fresh);
+        crate::mxprobe::log_public(&format!("[Buvid] 首次生成并持久化: {fresh}"));
+        (fresh, true)
+    } else {
+        (saved, false)
+    };
+
+    match bli_protocol::BiliClient::with_buvid(Some(buvid.clone())) {
         Ok(c) => {
-            let _ = GLOBAL_CLIENT.set(c);
-            GLOBAL_CLIENT.get().cloned()
+            let _ = GLOBAL_CLIENT.set(c.clone());
+
+            // 新 buvid 要激活一次。放到后台线程，不阻塞启动。
+            if is_new {
+                let c2 = c.clone();
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    match rt.block_on(c2.activate_buvid()) {
+                        Ok(()) => {
+                            crate::mxprobe::log_public("[Buvid] 激活请求已发出");
+                            settings::set_bool("buvid_activated", true);
+                        }
+                        Err(e) => {
+                            crate::mxprobe::log_public(&format!("[Buvid] 激活失败: {e}"));
+                        }
+                    }
+                });
+            }
+
+            Some(c)
         }
         Err(e) => {
             eprintln!("[Client] 创建全局 client 失败: {e}");

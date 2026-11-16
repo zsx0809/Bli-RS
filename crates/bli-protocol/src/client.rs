@@ -47,6 +47,20 @@ pub struct BiliClient {
 
 impl BiliClient {
     pub fn new() -> Result<Self> {
+        Self::with_buvid(None)
+    }
+
+    /// 用指定的 buvid3 创建客户端。传 None 则随机生成一个。
+    ///
+    /// ★ 为什么 buvid 必须持久化，不能每次启动都换新的：
+    ///
+    ///   buvid 是 B 站识别"这台设备"的唯一标识。推荐引擎用它累积
+    ///   行为画像（看过什么、看了多久、点了什么）。如果每次启动都
+    ///   生成一个新的，服务端看到的就是一台**全新的、零行为的设备**，
+    ///   只能给出内容泛化的通用流 —— 也就是"推的都不是一类东西"。
+    ///
+    ///   调用方应当把首次生成的 buvid 存盘，之后一直复用。
+    pub fn with_buvid(buvid: Option<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
             // 15 秒对 JSON 接口够用，但下载视频流会超时。
             // 这里统一放宽到 120 秒，接口层各自不需要再单独设置。
@@ -66,7 +80,7 @@ impl BiliClient {
         Ok(Self {
             http,
             mixin: Arc::new(tokio::sync::Mutex::new(None)),
-            buvid: gen_buvid3(),
+            buvid: buvid.unwrap_or_else(gen_buvid3),
             auth: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -167,6 +181,81 @@ impl BiliClient {
         }
 
         Ok(json)
+    }
+
+    /// 激活 buvid（设备指纹上报）。
+    ///
+    /// 只在**首次**拿到新 buvid 时调用一次。成功之后同一 buvid 不需要重复激活
+    /// （服务端已记住），失败也无所谓 —— 下次启动会再试。
+    ///
+    /// payload 结构与 PiliPlus `InitHttp.buvidActive` 完全一致：
+    ///   一段随机字节（尾部嵌 "IEND" 伪装成 PNG 尾）base64 编码后截取 50 字符，
+    ///   放进字段映射里。字段号（3064 / 39c8 / 3c43 / adca / bfe9）是
+    ///   服务端约定的，不能改。
+    ///
+    /// 返回值只是"请求是否发出去了"，服务端返回什么不影响判定 ——
+    /// 这个接口本身不返回有意义的业务数据。
+    pub async fn activate_buvid(&self) -> Result<()> {
+        use base64::Engine as _;
+
+        // 32 个随机字节 + 固定的 PNG 尾标记 + 4 个随机字节
+        let mut raw: Vec<u8> = Vec::with_capacity(45);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15);
+        let mut state = seed | 1;
+        for _ in 0..32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raw.push((state & 0xff) as u8);
+        }
+        for b in [0u8, 0, 0, 0, 73, 69, 78, 68] {
+            raw.push(b);
+        }
+        for _ in 0..4 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raw.push((state & 0xff) as u8);
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        // 取尾部 50 字符（PiliPlus 用 substring(len-50)）
+        let tail = if encoded.len() > 50 {
+            &encoded[encoded.len() - 50..]
+        } else {
+            &encoded[..]
+        };
+
+        let payload = serde_json::json!({
+            "3064": 1,
+            "39c8": "333.1387.fp.risk",
+            "3c43": {
+                "adca": "Linux",
+                "bfe9": tail,
+            },
+        });
+
+        let url = format!("{}{}", api::API_BASE_URL, api::ACTIVATE_BUVID);
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("user-agent", api::BROWSER_UA_PC)
+            .header("referer", api::REFERER)
+            .header("cookie", self.cookie_header())
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({ "payload": payload.to_string() }))
+            .send()
+            .await?;
+
+        log::debug!(
+            "[Buvid] 激活请求已发送，HTTP {}",
+            resp.status()
+        );
+        Ok(())
     }
 
     /// 暴露底层 HTTP 客户端。
@@ -529,6 +618,17 @@ impl BiliClient {
         let mut guard = self.mixin.lock().await;
         *guard = Some((key.clone(), today));
         Ok(key)
+    }
+}
+
+impl BiliClient {
+    /// 公开的 buvid3 生成器。
+    ///
+    /// 给宿主用：宿主负责把它存盘并在后续启动时复用一个固定值
+    /// （见 `with_buvid` 的注释 —— 换 buvid 等于换设备，
+    /// 推荐画像会被清零）。
+    pub fn random_buvid3() -> String {
+        gen_buvid3()
     }
 }
 
