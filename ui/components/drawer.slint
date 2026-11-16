@@ -468,16 +468,17 @@ export component NavigationDrawer inherits Rectangle {
                         padding: 3px;
                         alignment: root.auto_play ? end : start;
 
+                        // 布局接管 x，所以这里不能再写 animate x
+                        // （Slint 会报 "The property 'x' cannot be set
+                        // for elements placed in this layout"）。
+                        // 圆点的滑动感由 alignment 本身切换带来，
+                        // 视觉上已经足够 —— 想要逐帧动画就得改回绝对定位，
+                        // 但那会重新引入 parent.width 初值为 0 的问题。
                         Rectangle {
                             width: 18px;
                             height: 18px;
                             border-radius: 9px;
                             background: #ffffff;
-
-                            animate x {
-                                duration: Theme.animation_duration_fast;
-                                easing: ease-out;
-                            }
                         }
                     }
 
