@@ -1754,6 +1754,7 @@ export component VideoDetailView inherits Rectangle {
 
         fab_touch := TouchArea {
             clicked => {
+                debug("FAB clicked");
                 root.reply_target = "";
                 root.reply_panel_open = true;
             }
