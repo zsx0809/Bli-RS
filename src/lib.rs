@@ -411,8 +411,6 @@ fn android_main(app: slint::android::AndroidApp) {
 
     // 登记全局窗口弱引用：后台线程（登录轮询、评论回填）要用它写 UI
     login::set_window(main_window.as_weak());
-    // 键盘高度监听：评论区输入框要靠它避让软键盘
-    login::spawn_ime_watcher();
 
     if let Some(client) = login_client.clone() {
         // 从磁盘恢复登录态，并异步校验是否还活着

@@ -207,6 +207,11 @@ mod imp {
     ///        这条路只要窗口被 IME 挤压就有效，不依赖 insets 分发。
     ///     B. WindowInsets.getInsets(Type.ime())：API 30+ 且窗口正确
     ///        接收 insets 时最准。
+    /// 保留：目前没用它（改用 Manifest 的 adjustResize）。
+    /// 记录一下为什么这条路走不通 —— NativeActivity 上
+    /// getWindowVisibleDisplayFrame 与 WindowInsets 都拿不到 IME 高度，
+    /// 因为窗口本身不是 adjustResize，系统根本不分发 insets 给它。
+    #[allow(dead_code)]
     pub fn ime_height_px() -> i32 {
         with_env(|env, activity| {
             let screen_h = (|| -> Option<i32> {
@@ -604,6 +609,7 @@ pub fn status_bar_height_px() -> i32 {
 }
 
 #[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
 pub fn ime_height_px() -> i32 {
     0
 }

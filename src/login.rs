@@ -205,43 +205,6 @@ fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient) {
     });
 }
 
-/// 轮询软键盘高度并写进 UI。
-///
-/// 为什么用轮询而不是监听：
-///   Android 的 IME 高度变化没有 native 回调可用（ViewTreeObserver
-///   的 onGlobalLayout 是 Java 侧的东西，NativeActivity 拿不到）。
-///   Slint 的 android 后端会调 show_soft_input，但同样不向外暴露高度。
-///   250ms 一次的 JNI 调用开销可以忽略（两次 GetField + 一次
-///   getRootWindowInsets，微秒级），换来的是输入框永远不被键盘挡住。
-///
-/// 只在值变化时写 UI，避免每 250ms 触发一次重绘。
-pub fn spawn_ime_watcher() {
-    let Some(w) = global_window() else {
-        crate::mxprobe::log_public("[IME] 没有窗口，跳过键盘监听");
-        return;
-    };
-    std::thread::spawn(move || {
-        let mut last = -1i32;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            // 窗口没了就退出，别让线程常驻
-            if w.upgrade().is_none() {
-                return;
-            }
-            let h = crate::android_window::ime_height_px();
-            if h == last {
-                continue;
-            }
-            last = h;
-            crate::mxprobe::log_public(&format!("[IME] 键盘高度 -> {h}px"));
-            let w2 = w.clone();
-            let _ = w2.upgrade_in_event_loop(move |win| {
-                win.set_ime_height(h as f32);
-            });
-        }
-    });
-}
-
 /// 当前登录态快照。
 pub fn current() -> Option<Auth> {
     AUTH.lock().ok().and_then(|g| g.clone())

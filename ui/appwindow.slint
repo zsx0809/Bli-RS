@@ -202,12 +202,6 @@ export component AppWindow inherits Window {
     in-out property <string> login_status: "";
     in-out property <bool> login_qr_loading: false;
 
-    /// 软键盘高度（物理像素）。由 Rust 侧轮询 IME 状态写入。
-    ///
-    /// Slint 的 android 后端会弹键盘，但不把 IME 高度告诉 .slint 层，
-    /// 于是输入框被键盘盖住、用户看不见自己在打什么。这里自己补上。
-    in-out property <length> ime_height: 0px;
-
     // ---- 评论输入 ----
     in-out property <string> comment_text: "";
     in-out property <string> comment_status: "";
@@ -465,7 +459,6 @@ export component AppWindow inherits Window {
         }
 
         // 评论输入
-        ime_height: root.ime_height;
         logged_in: root.logged_in;
         comment_text <=> root.comment_text;
         comment_status: root.comment_status;
