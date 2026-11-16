@@ -89,6 +89,11 @@ export component VideoDetailView inherits Rectangle {
     // ---- 评论分页 ----
     in property <bool> comments_loading_more: false;
     in-out property <bool> comments_has_more: true;
+    /// 评论区总条数（服务端返回）。标题显示总数，不是已加载条数。
+    in-out property <int> comments_total: 0;
+    /// 排序：0 = 按时间，1 = 按热度。默认热度（和 B 站一致）
+    in-out property <int> comment_sort: 1;
+    callback change_comment_sort(int);
     callback load_more_comments();
 
     // ----------------------------------------------------------------------
@@ -951,9 +956,11 @@ export component VideoDetailView inherits Rectangle {
                         spacing: 5px;
 
                         Text {
-                            text: root.comments.length > 0
-                                ? "评论 " + root.comments.length
-                                : "评论";
+                            text: root.comments_total > 0
+                                ? "评论 " + root.comments_total
+                                : (root.comments.length > 0
+                                    ? "评论 " + root.comments.length
+                                    : "评论");
                             font-size: 14px;
                             font-weight: root.active_tab == 1 ? 700 : 500;
                             color: root.active_tab == 1 ? Theme.primary : Theme.on_surface_variant;
@@ -971,7 +978,54 @@ export component VideoDetailView inherits Rectangle {
                 }
             }
 
-            Rectangle {
+            // 右侧：评论 Tab 时是排序切换，简介 Tab 时是弹幕占位
+            //
+            // 排序必须有入口：按热度排序时刚发的评论会沉到底部，
+            // 用户发完看不到会以为没发出去。切到"最新"就能看到。
+            if root.active_tab == 1 : Rectangle {
+                width: 74px;
+                height: 28px;
+                border-radius: 14px;
+                background: sort_touch.pressed
+                    ? Theme.surface_container_high
+                    : Theme.surface_variant;
+                y: 9px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 4px;
+
+                    // 排序图标：三条长短线
+                    Path {
+                        width: 12px;
+                        height: 12px;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        commands: "M 4 6 L 20 6 M 4 12 L 14 12 M 4 18 L 9 18";
+                        stroke: Theme.on_surface_variant;
+                        stroke-width: 2px;
+                        stroke-line-cap: round;
+                        fill: transparent;
+                    }
+
+                    Text {
+                        text: root.comment_sort == 1 ? "最热" : "最新";
+                        color: Theme.on_surface_variant;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                sort_touch := TouchArea {
+                    clicked => {
+                        debug("DBG sort toggle");
+                        root.comment_sort = root.comment_sort == 1 ? 0 : 1;
+                        root.change_comment_sort(root.comment_sort);
+                    }
+                }
+            }
+
+            if root.active_tab == 0 : Rectangle {
                 width: 110px;
                 height: 28px;
                 border-radius: 14px;
@@ -1799,9 +1853,13 @@ export component VideoDetailView inherits Rectangle {
 
         panel := Rectangle {
             width: 100%;
+            // 尺寸**不做动画**，一次到位。
+            //
+            // 用户反馈：点了之后输入法立即呼出，而面板还在 160ms 的
+            // 升起动画里，于是键盘先盖住它、等截图时又缩回去。
+            // 面板尺寸跟键盘抢时序没有意义 —— 打开就直接是最终形态。
             height: focus_lift ? root.height * 0.5 : 236px;
             y: focus_lift ? 0px : root.height - self.height;
-            animate height, y { duration: 160ms; easing: ease-out; }
             background: Theme.surface_container;
             border-top-left-radius: focus_lift ? 0px : Theme.radius_md;
             border-top-right-radius: focus_lift ? 0px : Theme.radius_md;

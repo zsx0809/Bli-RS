@@ -500,9 +500,22 @@ pub fn post_comment(
                         win.set_comment_text("".into());
                         win.set_comment_sending(false);
                         win.set_comment_status("已发送".into());
+                        // 发完自动关面板，回到评论区
+                        win.set_reply_panel_open(false);
+                        win.set_reply_target("".into());
                     });
-                    // 重新拉评论，让新评论出现
-                    crate::player::reload_comments(client, bvid);
+
+                    // 关键：发完自动切到「最新」再重拉。
+                    //
+                    // 按热度排序时新评论几乎排到最后，用户翻几十页都
+                    // 看不到自己刚发的，会以为没发出去（用户实测反馈）。
+                    // 切到按时间排序，第一页就能看到。
+                    let w2 = w_weak.clone();
+                    let _ = w2.upgrade_in_event_loop(|win| {
+                        win.set_comment_sort(0);
+                    });
+                    crate::player::set_comment_sort(client, 0);
+                    let _ = bvid;
                 }
                 Err(e) => {
                     crate::mxprobe::log_public(&format!("[Comment] 发送失败: {e}"));

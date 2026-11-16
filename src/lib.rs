@@ -490,6 +490,14 @@ fn android_main(app: slint::android::AndroidApp) {
                 player::load_more_comments(c.clone());
             });
         }
+
+        // 切换评论排序
+        {
+            let c = client.clone();
+            main_window.on_change_comment_sort(move |mode| {
+                player::set_comment_sort(c.clone(), mode);
+            });
+        }
     }
 
     // 评论按钮的「回复」：记下目标昵称，UI 侧已改成回复模式

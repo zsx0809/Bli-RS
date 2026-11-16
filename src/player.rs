@@ -838,6 +838,8 @@ struct CommentPage {
     has_more: bool,
     /// 服务端报的总条数
     total: u64,
+    /// 排序：0 = 按时间，1 = 按热度
+    sort: u32,
 }
 
 static COMMENT_STATE: Mutex<CommentPage> = Mutex::new(CommentPage {
@@ -845,6 +847,7 @@ static COMMENT_STATE: Mutex<CommentPage> = Mutex::new(CommentPage {
     next_offset: String::new(),
     has_more: false,
     total: 0,
+    sort: 1,
 });
 
 /// 拉评论第一页并上屏。登录 / 退出 / 发评论之后都调它重刷。
@@ -860,9 +863,11 @@ pub fn spawn_comment_load(
     owner_mid: u64,
     session: u64,
 ) {
-    // 重置分页游标：这是"从头加载"
+    // 重置分页游标（保留当前排序）：这是"从头加载"
+    let keep_sort = COMMENT_STATE.lock().map(|g| g.sort).unwrap_or(1);
     if let Ok(mut g) = COMMENT_STATE.lock() {
         *g = CommentPage::default();
+        g.sort = keep_sort;
     }
     spawn_comment_page(window, client, aid, owner_mid, session, true);
 }
@@ -912,15 +917,15 @@ fn spawn_comment_page(
         let auth = crate::login::current();
         let is_login = auth.as_ref().map(|a| a.is_logged_in()).unwrap_or(false);
 
-        // 取出本轮要用的游标
-        let (pn, next_offset) = {
+        // 取出本轮要用的游标与排序
+        let (pn, next_offset, sort) = {
             let Ok(g) = COMMENT_STATE.lock() else {
                 return;
             };
             if fresh {
-                (1u32, String::new())
+                (1u32, String::new(), g.sort)
             } else {
-                (g.pn + 1, g.next_offset.clone())
+                (g.pn + 1, g.next_offset.clone(), g.sort)
             }
         };
 
@@ -928,7 +933,7 @@ fn spawn_comment_page(
             &client.raw_http(),
             auth.as_ref(),
             aid,
-            1, // sort=1 热度排序
+            sort,
             pn,
             &next_offset,
         )) {
@@ -1028,8 +1033,16 @@ fn spawn_comment_page(
             }
 
             w.set_comments_loading_more(false);
-            let has_more = COMMENT_STATE.lock().map(|g| g.has_more).unwrap_or(false);
+            let (has_more, total) = COMMENT_STATE
+                .lock()
+                .map(|g| (g.has_more, g.total))
+                .unwrap_or((false, 0));
             w.set_comments_has_more(has_more);
+            // 标题显示的必须是**服务端总数**，不是已加载条数。
+            // 用已加载条数会变成"下拉一次、数字涨一次"，看起来像故障。
+            if total > 0 {
+                w.set_comments_total(total as i32);
+            }
         });
 
         // 头像按新行的起始索引回填
@@ -1041,6 +1054,39 @@ fn spawn_comment_page(
         };
         spawn_comment_faces_from(w_list, face_urls, session, base);
     });
+}
+
+/// 切换评论排序并重新拉第一页。
+///
+/// sort: 0 = 按时间（最新在前），1 = 按热度。
+///
+/// 为什么必须有这个入口：
+///   按热度排序时，刚发的评论几乎排在最后，用户发完往下翻几十页
+///   都看不到，会以为没发出去（实测用户就是这么反馈的）。
+///   切到"按时间"就能在第一页看到自己刚发的。
+pub fn set_comment_sort(client: bli_protocol::BiliClient, sort: i32) {
+    let sort = if sort == 0 { 0u32 } else { 1u32 };
+    {
+        let Ok(mut g) = COMMENT_STATE.lock() else {
+            return;
+        };
+        g.sort = sort;
+    }
+    crate::mxprobe::log_public(&format!(
+        "[Comment] 切换排序 -> {}",
+        if sort == 0 { "最新" } else { "最热" }
+    ));
+
+    let aid = CURRENT_AID.load(Ordering::SeqCst);
+    if aid == 0 {
+        return;
+    }
+    let owner = CURRENT_OWNER.load(Ordering::SeqCst);
+    let session = PLAY_SESSION.load(Ordering::SeqCst);
+    let Some(window) = crate::login::global_window() else {
+        return;
+    };
+    spawn_comment_load(window, client, aid, owner, session);
 }
 
 /// 登录态变化后重新拉当前视频的评论。

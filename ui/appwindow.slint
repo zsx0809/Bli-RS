@@ -218,7 +218,10 @@ export component AppWindow inherits Window {
     // ---- 评论分页 ----
     in-out property <bool> comments_loading_more: false;
     in-out property <bool> comments_has_more: true;
+    /// 评论区总条数（服务端 page.count）。标题显示它，而不是已加载条数。
+    in-out property <int> comments_total: 0;
     callback load_more_comments();
+    callback change_comment_sort(int);
 
     in-out property <float> play_progress: 0.0;
     in property <string> play_time_total: "00:00";
@@ -470,7 +473,9 @@ export component AppWindow inherits Window {
         reply_panel_open <=> root.reply_panel_open;
         comments_loading_more: root.comments_loading_more;
         comments_has_more <=> root.comments_has_more;
+        comments_total <=> root.comments_total;
         load_more_comments => { root.load_more_comments(); }
+        change_comment_sort(mode) => { root.change_comment_sort(mode); }
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;
