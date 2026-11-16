@@ -53,7 +53,7 @@ pub fn set_window(w: slint::Weak<AppWindow>) {
 }
 
 /// 取全局窗口弱引用。
-pub fn window() -> Option<slint::Weak<AppWindow>> {
+pub fn global_window() -> Option<slint::Weak<AppWindow>> {
     WINDOW.lock().ok().and_then(|g| g.clone())
 }
 
@@ -159,7 +159,7 @@ fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient) {
 
     // ---- 第一段：文本状态，立即生效 ----
     let text_gen = FACE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    match window() {
+    match global_window() {
         Some(w) => {
             let uname_ui = uname.clone();
             let face_ui = face.clone();
@@ -193,7 +193,7 @@ fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient) {
             crate::mxprobe::log_public("[Login] 头像下载失败");
             return;
         };
-        let Some(w) = window() else { return };
+        let Some(w) = global_window() else { return };
         let _ = w.upgrade_in_event_loop(move |win| {
             if FACE_GEN.load(Ordering::SeqCst) != text_gen {
                 return; // 期间又登录了别的账号
@@ -338,7 +338,7 @@ pub fn start(window: &AppWindow, client: bli_protocol::BiliClient) {
 
                         // 先清掉"生成中"：否则登录成功了面板还停在 loading 态，
                         // 用户看到的就是"扫完了没反应"。
-                        if let Some(w) = window() {
+                        if let Some(w) = global_window() {
                             let _ = w.upgrade_in_event_loop(|win| {
                                 win.set_login_qr_loading(false);
                                 win.set_login_status("登录成功".into());

@@ -937,7 +937,7 @@ pub fn reload_comments(client: bli_protocol::BiliClient, _bvid: String) {
     if aid == 0 {
         return;
     }
-    let Some(window) = crate::login::window() else {
+    let Some(window) = crate::login::global_window() else {
         return;
     };
     spawn_comment_load(window, client, aid, owner, session);
@@ -967,7 +967,7 @@ pub fn current_aid() -> u64 {
 ///
 /// 找不到就返回 (0,0)：那就是发一条顶层评论，不会发错人。
 pub fn resolve_reply_target(name: &str) -> (u64, u64) {
-    let Some(window) = crate::login::window() else {
+    let Some(window) = crate::login::global_window() else {
         return (0, 0);
     };
     let Some(w) = window.upgrade() else {
