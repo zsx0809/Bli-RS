@@ -1795,7 +1795,7 @@ export component VideoDetailView inherits Rectangle {
         //   getWindowVisibleDisplayFrame 全拿不到值，白折腾），
         //   不如让面板本身就撑到半屏 —— 键盘占下半、面板占上半，
         //   视觉上正好贴在输入法上面。多出来的空间也让输入区更宽敞。
-        focus_lift := root.reply_input_focused;
+        property <bool> focus_lift: root.reply_input_focused;
 
         panel := Rectangle {
             width: 100%;
