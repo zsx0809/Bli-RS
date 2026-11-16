@@ -213,11 +213,18 @@ export component AppWindow inherits Window {
     in-out property <string> comment_status: "";
     in-out property <bool> comment_sending: false;
     in-out property <string> reply_target: "";
+    /// 回复面板是否展开。点 FAB 或点某条评论的"回复"都置 true。
+    in-out property <bool> reply_panel_open: false;
     callback comment_submit();
     callback comment_reply_cancel();
     callback request_login();
     callback cancel_login();
     callback do_logout();
+
+    // ---- 评论分页 ----
+    in-out property <bool> comments_loading_more: false;
+    in-out property <bool> comments_has_more: true;
+    callback load_more_comments();
 
     in-out property <float> play_progress: 0.0;
     in property <string> play_time_total: "00:00";
@@ -467,6 +474,10 @@ export component AppWindow inherits Window {
         comment_submit => { root.comment_submit(); }
         comment_cancel_reply => { root.comment_reply_cancel(); }
         request_login => { root.request_login(); }
+        reply_panel_open <=> root.reply_panel_open;
+        comments_loading_more: root.comments_loading_more;
+        comments_has_more <=> root.comments_has_more;
+        load_more_comments => { root.load_more_comments(); }
 
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;

@@ -635,23 +635,3 @@ fn render_qr(text: &str) -> Option<(u32, Vec<u8>)> {
 pub fn auth_opt() -> Option<Auth> {
     current()
 }
-
-/// 登录后重新拉评论时要用到的 UI 数据填充入口。
-///
-/// 放在这里而不是 player 里，是因为评论的解析逻辑（parse_reply）
-/// 已经在 detail.rs 里，这里只负责"把 json 变成 UI 模型"。
-pub fn build_comment_models(
-    json: &serde_json::Value,
-    owner_mid: u64,
-) -> Vec<bli_protocol::CommentItem> {
-    let replies = json["data"]["replies"]
-        .as_array()
-        .or_else(|| json["data"]["top_replies"].as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    replies
-        .iter()
-        .map(|r| bli_protocol::detail::parse_reply_public(r, owner_mid))
-        .collect()
-}

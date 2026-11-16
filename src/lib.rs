@@ -484,6 +484,14 @@ fn android_main(app: slint::android::AndroidApp) {
                 }
             });
         }
+
+        // 加载更多评论（滑到底部触发）
+        {
+            let c = client.clone();
+            main_window.on_load_more_comments(move || {
+                player::load_more_comments(c.clone());
+            });
+        }
     }
 
     // 评论按钮的「回复」：记下目标昵称，UI 侧已改成回复模式
@@ -494,6 +502,10 @@ fn android_main(app: slint::android::AndroidApp) {
             if let Some(w) = weak.upgrade() {
                 w.set_reply_target(name.clone());
                 w.set_comment_status("".into());
+                // 关键：点"回复"要把输入面板调出来。
+                // 上一版只设置昵称、不展开面板，用户点了回复什么都没发生。
+                w.set_logged_in(crate::login::is_logged_in());
+                w.set_reply_panel_open(true);
             }
         });
     }

@@ -77,7 +77,7 @@ export component VideoDetailView inherits Rectangle {
     // 全部状态都在 Rust 侧（src/login.rs 的 post_comment）。
     // UI 只做：显示输入框 / 收集文本 / 转发提交动作。
     in property <bool> logged_in: false;
-    /// 软键盘高度（物理像素）。>0 时评论输入区要整体上浮到键盘之上。
+    /// 软键盘高度（物理像素）。>0 时把回复面板整体顶上去。
     in property <length> ime_height: 0px;
     in-out property <string> comment_text: "";
     in property <string> comment_status: "";
@@ -87,6 +87,24 @@ export component VideoDetailView inherits Rectangle {
     callback comment_submit();
     callback comment_cancel_reply();
     callback request_login();
+
+    // ---- 评论分页 ----
+    in property <bool> comments_loading_more: false;
+    in-out property <bool> comments_has_more: true;
+    callback load_more_comments();
+
+    // ----------------------------------------------------------------------
+    // 浮动"写评论"按钮（FAB）
+    //
+    // 交互照 PiliPlus 的 BaseFabMixin（lib/pages/common/fab_mixin.dart）：
+    //   UserScrollNotification 方向为 forward（向下滚，看新内容）→ 显示
+    //   方向为 reverse（向上滚，回看）→ 隐藏
+    // 我们这里是自管滚动，用 scroll_y 的增量判断方向，
+    // 停手 600ms 后无条件显示（PiliPlus 也不会让按钮一直消失）。
+    // ----------------------------------------------------------------------
+    in-out property <bool> fab_visible: true;
+    /// 回复面板是否展开（点 FAB 或点某条评论的"回复"都展开）
+    in-out property <bool> reply_panel_open: false;
 
     // 详情页根背景必须透明：整个组件是 100% 铺满 AppWindow 的，
     // 如果这里填不透明色，播放区的视频（下层 SurfaceView）就看不见了。
@@ -246,7 +264,51 @@ export component VideoDetailView inherits Rectangle {
                 return;
             }
             root.scroll_y = next;
+            root.note_scroll_for_fab();
             root.fling_vel = root.fling_vel * 0.965;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // FAB 显隐
+    //
+    // 语义照 PiliPlus BaseFabMixin：
+    //   用户向下滚（看更新的内容）→ 显示，方便随时写评论
+    //   用户向上滚（回看历史）→ 隐藏，别挡内容
+    // 停手 600ms 后无条件显示 —— 按钮不该长时间不出现。
+    // ----------------------------------------------------------------------
+    property <length> fab_scroll_base: 0px;
+
+    fab_idle_timer := Timer {
+        interval: 600ms;
+        running: false;
+        triggered => { root.fab_visible = true; }
+    }
+
+    function note_scroll_for_fab() {
+        let delta = root.scroll_y - root.fab_scroll_base;
+        root.fab_scroll_base = root.scroll_y;
+        // 只有明显位移才算"在滚动"，避免手指轻微抖动就切显隐
+        if (Math.abs(delta) < 6px) {
+            return;
+        }
+        root.fab_visible = delta < 0px;
+        fab_idle_timer.running = false;
+        fab_idle_timer.running = true;
+
+        // 触底加载更多评论。
+        //
+        // 为什么在滚动里判而不是用一个"底部哨兵元素"：
+        //   我们的滚动是自管的（scroll_y + content_h 都是算出来的），
+        //   没有真实的列表容器可以挂"滚到这一项时回调"。
+        //   直接判 scroll_y 距底部小于一屏的 1/3 就预加载，
+        //   用户滑到底时数据已经在了，体感和 PiliPlus 的自动翻页一致。
+        if (root.active_tab == 1
+            && !root.comments_loading_more
+            && root.comments_has_more
+            && root.max_scroll > 0px
+            && root.max_scroll - root.scroll_y < root.viewport_h / 3) {
+            root.load_more_comments();
         }
     }
 
@@ -270,6 +332,7 @@ export component VideoDetailView inherits Rectangle {
     function pan_move(dx: length, dy: length) {
         if (root.active_axis == PanAxis.Vertical) {
             root.scroll_y = Math.max(0px, Math.min(root.max_scroll, root.drag_base - dy));
+            root.note_scroll_for_fab();
         } else if (root.active_axis == PanAxis.Horizontal) {
             // 到头了还继续往外拖 → 30% 阻尼（"墙"）
             let at_left = (root.active_tab == 0 && dx > 0px);
@@ -1308,137 +1371,6 @@ export component VideoDetailView inherits Rectangle {
                     padding-bottom: 48px;
                     spacing: 0px;
 
-                    // ------------------------------------------------------
-                    // 评论输入区
-                    //
-                    // 未登录时不显示输入框，改成一个"登录后参与评论"的
-                    // 引导条 —— 让用户点进输入框、打完字、提交，才发现
-                    // 要登录，是很糟的体验。
-                    // ------------------------------------------------------
-                    if !root.logged_in : Rectangle {
-                        height: 44px;
-                        border-radius: Theme.radius_full;
-                        background: Theme.surface_variant;
-
-                        Text {
-                            x: 14px;
-                            y: (parent.height - self.height) / 2;
-                            text: "登录后参与评论";
-                            color: Theme.on_surface_variant;
-                            font-size: 13px;
-                        }
-
-                        TouchArea {
-                            clicked => { root.request_login(); }
-                        }
-                    }
-
-                    // 注意：这里不能用
-                    //   Rectangle { height: input_col.preferred-height;
-                    //               input_col := VerticalLayout {...} }
-                    // 父的 height 依赖子的 preferred-height，子的可用高度
-                    // 又受父约束 —— Slint 在这种循环下取值塌陷，
-                    // 实际表现是"回复提示条画出来了、输入框被压没"。
-                    // 直接把 VerticalLayout 放进来，让它自己撑开。
-                    if root.logged_in : VerticalLayout {
-                        spacing: 6px;
-                        alignment: start;
-
-                            // 「回复 @某人」提示条
-                            if root.reply_target != "" : Rectangle {
-                                height: 26px;
-                                border-radius: Theme.radius_sm;
-                                background: Theme.primary.transparentize(88%);
-
-                                Text {
-                                    x: 10px;
-                                    y: (parent.height - self.height) / 2;
-                                    text: "回复 @" + root.reply_target;
-                                    color: Theme.primary;
-                                    font-size: 12px;
-                                }
-
-                                Text {
-                                    x: parent.width - self.width - 10px;
-                                    y: (parent.height - self.height) / 2;
-                                    text: "取消";
-                                    color: Theme.on_surface_variant;
-                                    font-size: 12px;
-
-                                    TouchArea {
-                                        clicked => { root.comment_cancel_reply(); }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                height: 42px;
-                                border-radius: Theme.radius_sm;
-                                background: Theme.surface_variant;
-
-                                // 占位提示：Slint 1.9 的 TextInput 没有
-                                // placeholder-text，用一个仅在有焦点/有内容时
-                                // 隐藏的 Text 叠在下面（TextInput 背景透明，
-                                // 空内容时能看见它）。
-                                if root.comment_text == "" : Text {
-                                    x: 12px;
-                                    y: (parent.height - self.height) / 2;
-                                    text: root.reply_target == ""
-                                        ? "发一条友善的评论"
-                                        : "回复 @" + root.reply_target;
-                                    color: Theme.outline;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
-                                }
-
-                                TextInput {
-                                    x: 12px;
-                                    y: (parent.height - self.height) / 2;
-                                    width: parent.width - 96px;
-                                    height: 24px;
-                                    text <=> root.comment_text;
-                                    font-size: 13px;
-                                    color: Theme.on_surface;
-                                    single-line: true;
-                                }
-
-                                // 发送按钮
-                                Rectangle {
-                                    x: parent.width - self.width - 8px;
-                                    y: (parent.height - self.height) / 2;
-                                    width: 66px;
-                                    height: 28px;
-                                    border-radius: Theme.radius_full;
-                                    background: root.comment_sending
-                                        ? Theme.outline_variant
-                                        : (send_touch.pressed
-                                            ? Theme.primary.transparentize(20%)
-                                            : Theme.primary);
-
-                                    Text {
-                                        text: root.comment_sending ? "发送中" : "发送";
-                                        color: Theme.on_primary;
-                                        font-size: 12px;
-                                        font-weight: 600;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-
-                                    send_touch := TouchArea {
-                                        enabled: !root.comment_sending
-                                            && root.comment_text != "";
-                                        clicked => { root.comment_submit(); }
-                                    }
-                                }
-                            }
-
-                            if root.comment_status != "" : Text {
-                                text: root.comment_status;
-                                color: Theme.on_surface_variant;
-                                font-size: 11px;
-                            }
-                        }
-
                     Rectangle { height: 10px; background: transparent; }
 
                     if root.comments.length == 0 : Rectangle {
@@ -1779,6 +1711,197 @@ export component VideoDetailView inherits Rectangle {
         height: root.height;
         background: Theme.primary.transparentize(70%);
     }
+    // ======================================================================
+    // 浮动"写评论"按钮 + 回复面板
+    //
+    // 设计照 PiliPlus（lib/pages/video/reply/view.dart 的 fab 参数）：
+    //   · FAB 固定在评论区右下角，滑动时按方向显隐
+    //   · 点它 → 从底部升起一个输入面板（PiliPlus 是 ReplyPage，
+    //     一个 bottom sheet），不是把输入框塞进列表
+    //   · 点某条评论的"回复" → 同一个面板，但带上 @某人
+    //
+    // 为什么要弹层而不是行内输入框：
+    //   行内输入框会被软键盘压住（Slint 不把 IME 高度告诉 UI），
+    //   而且列表滚动时输入框跟着跑，体验很差。弹层固定在底部，
+    //   键盘弹出时整体上移，输入区永远可见。
+    // ======================================================================
+    if root.logged_in && root.active_tab == 1 && !root.is_fullscreen && !root.reply_panel_open : Rectangle {
+        width: 52px;
+        height: 52px;
+        x: root.width - self.width - 16px;
+        // 显隐 = 淡出 + 下移 24px。两个属性都写在同一个表达式里，
+        // Slint 不支持 `y+:` 这种增量语法。
+        y: root.height - self.height - root.safe_bottom - 20px
+           + (root.fab_visible ? 0px : 24px);
+        opacity: root.fab_visible ? 1.0 : 0.0;
+        animate opacity, y { duration: 120ms; easing: ease-in-out; }
+        border-radius: 26px;
+        background: fab_touch.pressed
+            ? Theme.primary.transparentize(20%)
+            : Theme.primary;
+
+        // 一支笔的矢量
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M 4 20 L 4.6 16.2 L 16.4 4.4 C 17.2 3.6 18.5 3.6 19.3 4.4 L 19.6 4.7 C 20.4 5.5 20.4 6.8 19.6 7.6 L 7.8 19.4 Z M 14.8 6 L 18 9.2";
+            stroke: Theme.on_primary;
+            stroke-width: 1.6;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+            fill: transparent;
+        }
+
+        fab_touch := TouchArea {
+            clicked => {
+                root.reply_target = "";
+                root.reply_panel_open = true;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // 回复面板：底部升起的一层
+    //
+    // 结构（对齐 PiliPlus ReplyPage 的视觉）：
+    //   标题行（正在回复谁 / 关闭）
+    //   多行输入框
+    //   发送按钮
+    // 面板整体贴在键盘上沿：y 随 ime_height 上移。
+    // ----------------------------------------------------------------------
+    if root.reply_panel_open : Rectangle {
+        // 遮罩：点空白处关掉
+        width: 100%;
+        height: 100%;
+        background: #00000066;
+
+        TouchArea {
+            clicked => {
+                root.reply_panel_open = false;
+                root.reply_target = "";
+            }
+        }
+
+        panel := Rectangle {
+            width: 100%;
+            height: panel_col.preferred-height + 16px;
+            y: root.height - self.height - root.ime_height;
+            background: Theme.surface_container;
+            border-top-left-radius: Theme.radius_md;
+            border-top-right-radius: Theme.radius_md;
+
+            panel_col := VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+
+                // 标题行
+                Rectangle {
+                    height: 26px;
+                    background: transparent;
+
+                    Text {
+                        x: 0px;
+                        y: (parent.height - self.height) / 2;
+                        text: root.reply_target == ""
+                            ? "发表评论"
+                            : "回复 @" + root.reply_target;
+                        color: Theme.on_surface;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+
+                    Text {
+                        x: parent.width - self.width;
+                        y: (parent.height - self.height) / 2;
+                        text: "关闭";
+                        color: Theme.on_surface_variant;
+                        font-size: 13px;
+
+                        TouchArea {
+                            clicked => {
+                                root.reply_panel_open = false;
+                                root.reply_target = "";
+                            }
+                        }
+                    }
+                }
+
+                // 输入框：多行，白底卡片
+                Rectangle {
+                    height: 88px;
+                    border-radius: Theme.radius_sm;
+                    background: Theme.surface_variant;
+
+                    if root.comment_text == "" : Text {
+                        x: 12px;
+                        y: 10px;
+                        text: root.reply_target == ""
+                            ? "发一条友善的评论"
+                            : "回复 @" + root.reply_target;
+                        color: Theme.outline;
+                        font-size: 14px;
+                    }
+
+                    TextInput {
+                        x: 12px;
+                        y: 8px;
+                        width: parent.width - 24px;
+                        height: parent.height - 16px;
+                        text <=> root.comment_text;
+                        font-size: 14px;
+                        color: Theme.on_surface;
+                        wrap: word-wrap;
+                        single-line: false;
+                    }
+                }
+
+                // 状态提示 + 发送
+                Rectangle {
+                    height: 34px;
+                    background: transparent;
+
+                    Text {
+                        x: 0px;
+                        y: (parent.height - self.height) / 2;
+                        text: root.comment_status;
+                        color: Theme.on_surface_variant;
+                        font-size: 11px;
+                    }
+
+                    Rectangle {
+                        x: parent.width - self.width;
+                        y: (parent.height - self.height) / 2;
+                        width: 76px;
+                        height: 32px;
+                        border-radius: Theme.radius_full;
+                        background: root.comment_sending
+                            ? Theme.outline_variant
+                            : (panel_send_touch.pressed
+                                ? Theme.primary.transparentize(20%)
+                                : Theme.primary);
+
+                        Text {
+                            text: root.comment_sending ? "发送中" : "发送";
+                            color: Theme.on_primary;
+                            font-size: 13px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        panel_send_touch := TouchArea {
+                            enabled: !root.comment_sending && root.comment_text != "";
+                            clicked => { root.comment_submit(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
 
     // ======================================================================
     // 实时诊断日志弹层浮窗 (Log Dialog Overlay)

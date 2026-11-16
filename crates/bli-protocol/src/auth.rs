@@ -307,6 +307,7 @@ pub async fn fetch_nav(client: &reqwest::Client, auth: &mut Auth) -> Result<()> 
 ///   parent = 被回复的那条 rpid（楼中楼里回复别人时传）
 ///   message= 正文，最多 1000 字
 ///   csrf   = cookie 里的 bili_jct
+///   plat   = 2（安卓客户端，风控容忍度比 web 高）
 ///
 /// root / parent 都为 0 时就是发一条顶层评论。
 pub async fn reply_add(
@@ -363,78 +364,4 @@ pub async fn reply_add(
     }
 
     Ok(())
-}
-
-/// 拉已登录态下的评论列表。
-///
-/// 这是「评论区永远只有三条」的根因所在 —— 两条路径**完全不同**：
-///
-///   未登录：GET /x/v2/reply/wbi/main
-///           参数 oid / type / mode / pagination_str
-///           只给 3 条热门，reply_control 里**没有 location**（IP 属地）
-///
-///   已登录：GET /x/v2/reply
-///           参数 oid / type / sort / pn / ps
-///           按页给 20 条，带 location、楼中楼预置、rcount
-///
-/// 对照 PiliPlus lib/http/reply.dart:replyList —— 它也是这么分叉的
-/// （`isLogin ? Api.replyList : '${Api.replyList}/main'`）。
-///
-/// sort: 0 = 按时间，1 = 按热度（PiliPlus 里的 `sort + 2` 是给未登录
-///       那条路径折算 mode 用的，登录路径直接传 sort）。
-pub async fn comments_page(
-    client: &reqwest::Client,
-    auth: Option<&Auth>,
-    aid: u64,
-    sort: u32,
-    pn: u32,
-) -> Result<serde_json::Value> {
-    let logged_in = auth.map(|a| a.is_logged_in()).unwrap_or(false);
-
-    let (path, params): (&str, Vec<(&str, String)>) = if logged_in {
-        (
-            "/x/v2/reply",
-            vec![
-                ("oid", aid.to_string()),
-                ("type", "1".to_string()),
-                ("sort", sort.to_string()),
-                ("pn", pn.to_string()),
-                ("ps", "20".to_string()),
-            ],
-        )
-    } else {
-        // 未登录：仍然用 wbi/main，分页靠 pagination_str。
-        // 第一页给空 offset 即可（服务端会返回下一页的 offset 在
-        // data.cursor.pagination_reply.next_offset 里）。
-        (
-            "/x/v2/reply/wbi/main",
-            vec![
-                ("oid", aid.to_string()),
-                ("type", "1".to_string()),
-                ("mode", "3".to_string()),
-                ("pagination_str", "{\"offset\":\"\"}".to_string()),
-            ],
-        )
-    };
-
-    let url = format!("{}{path}", api::API_BASE_URL);
-
-    let mut req = client
-        .get(&url)
-        .header("user-agent", api::BROWSER_UA_PC)
-        .header("referer", api::REFERER)
-        .query(&params);
-
-    if let Some(a) = auth {
-        if a.is_logged_in() {
-            req = req.header("cookie", &a.cookie);
-        }
-    }
-
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        return Err(Error::Network(format!("HTTP {}", resp.status())));
-    }
-
-    Ok(resp.json().await?)
 }

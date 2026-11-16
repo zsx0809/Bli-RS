@@ -822,21 +822,86 @@ fn start_playback(
     spawn_progress_poller(w_clone.clone(), my_session, duration_us);
 }
 
-/// 拉评论并上屏。登录 / 退出 / 发评论之后都调它重刷。
+/// 评论分页状态。
 ///
-/// 为什么要抽成独立函数：
-///   未登录时接口只给 3 条热门评论，而且没有 IP 属地
-///   （reply_control 里就是没有 location 字段）。
-///   登录之后同一条评论会带属地，列表也变成 20 条/页 ——
-///   所以登录态一变就必须整份重拉，不能只补一点。
+/// PiliPlus 用一个 nextOffset 字符串 + isEnd 标志维护（见
+/// lib/pages/common/reply/reply_controller.dart:handlePagination）。
+/// 我们走 REST，登录态下用 pn 翻页，未登录用 pagination_str 偏移，
+/// 两种都要记，所以两个都存。
+#[derive(Default)]
+struct CommentPage {
+    /// 已加载到第几页（登录路径用）
+    pn: u32,
+    /// 下一页的 offset（未登录路径用）
+    next_offset: String,
+    /// 还有没有更多
+    has_more: bool,
+    /// 服务端报的总条数
+    total: u64,
+}
+
+static COMMENT_STATE: Mutex<CommentPage> = Mutex::new(CommentPage {
+    pn: 0,
+    next_offset: String::new(),
+    has_more: false,
+    total: 0,
+});
+
+/// 拉评论第一页并上屏。登录 / 退出 / 发评论之后都调它重刷。
 ///
-/// `session` 用来防串台：用户切走视频后，在途的请求结果要丢掉。
+/// 为什么要整份重拉而不是本地补一条：
+///   未登录时接口只给 3 条热门评论，而且 reply_control 里没有 location
+///   （IP 属地）。登录之后同一条评论会带属地，列表也变成 20 条/页。
+///   本地插入会漏掉服务端算好的字段（相对时间、等级徽章、楼中楼预置）。
 pub fn spawn_comment_load(
     window: slint::Weak<AppWindow>,
     client: bli_protocol::BiliClient,
     aid: u64,
     owner_mid: u64,
     session: u64,
+) {
+    // 重置分页游标：这是"从头加载"
+    if let Ok(mut g) = COMMENT_STATE.lock() {
+        *g = CommentPage::default();
+    }
+    spawn_comment_page(window, client, aid, owner_mid, session, true);
+}
+
+/// 加载下一页（下拉到底部时调）。
+pub fn load_more_comments(client: bli_protocol::BiliClient) {
+    let aid = CURRENT_AID.load(Ordering::SeqCst);
+    if aid == 0 {
+        return;
+    }
+    let owner = CURRENT_OWNER.load(Ordering::SeqCst);
+    let session = PLAY_SESSION.load(Ordering::SeqCst);
+
+    let has_more = COMMENT_STATE.lock().map(|g| g.has_more).unwrap_or(false);
+    if !has_more {
+        crate::mxprobe::log_public("[Comment] 没有更多评论了");
+        return;
+    }
+
+    let Some(window) = crate::login::global_window() else {
+        return;
+    };
+    // 通知 UI 进入"加载中"
+    if let Some(w) = window.upgrade() {
+        w.set_comments_loading_more(true);
+    }
+    spawn_comment_page(window, client, aid, owner, session, false);
+}
+
+/// 真正干活的分页加载。
+///
+/// `fresh` 为 true 表示覆盖（第一页），false 表示追加。
+fn spawn_comment_page(
+    window: slint::Weak<AppWindow>,
+    client: bli_protocol::BiliClient,
+    aid: u64,
+    owner_mid: u64,
+    session: u64,
+    fresh: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -847,17 +912,32 @@ pub fn spawn_comment_load(
         let auth = crate::login::current();
         let is_login = auth.as_ref().map(|a| a.is_logged_in()).unwrap_or(false);
 
-        // sort=1 热度排序（和未登录那条路径的 mode=3 对齐）
+        // 取出本轮要用的游标
+        let (pn, next_offset) = {
+            let Ok(g) = COMMENT_STATE.lock() else {
+                return;
+            };
+            if fresh {
+                (1u32, String::new())
+            } else {
+                (g.pn + 1, g.next_offset.clone())
+            }
+        };
+
         let json = match rt.block_on(bli_protocol::auth::comments_page(
             &client.raw_http(),
             auth.as_ref(),
             aid,
-            1,
-            1,
+            1, // sort=1 热度排序
+            pn,
+            &next_offset,
         )) {
             Ok(j) => j,
             Err(e) => {
-                crate::mxprobe::log_public(&format!("[Comment] 拉取失败: {e}"));
+                crate::mxprobe::log_public(&format!("[Comment] 第 {pn} 页拉取失败: {e}"));
+                if let Some(w) = window.upgrade() {
+                    w.set_comments_loading_more(false);
+                }
                 return;
             }
         };
@@ -866,66 +946,109 @@ pub fn spawn_comment_load(
             return;
         }
 
-        let items = crate::login::build_comment_models(&json, owner_mid);
+        let code = json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = json
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("未知错误");
+            crate::mxprobe::log_public(&format!("[Comment] 第 {pn} 页返回 code={code}: {msg}"));
+            if let Some(w) = window.upgrade() {
+                w.set_comments_loading_more(false);
+            }
+            return;
+        }
+
+        let items = bli_protocol::auth::parse_replies(&json, owner_mid);
+        let (has_more, next_off) = bli_protocol::auth::parse_page_state(&json, pn);
         let total = json["data"]["page"]["count"].as_u64().unwrap_or(0);
+
+        {
+            let Ok(mut g) = COMMENT_STATE.lock() else {
+                return;
+            };
+            g.pn = pn;
+            g.next_offset = next_off;
+            g.has_more = has_more;
+            if total > 0 {
+                g.total = total;
+            }
+        }
+
         crate::mxprobe::log_public(&format!(
-            "[Comment] 已登录={is_login} 拿到 {} 条 / 共 {total} 条",
+            "[Comment] 已登录={is_login} 第 {pn} 页 {} 条，累计更多={has_more} 总 {total}",
             items.len()
         ));
 
         let face_urls: Vec<String> = items.iter().map(|c| c.user_face.clone()).collect();
-
-        let raw: Vec<RawComment> = items
+        let start_idx = if fresh {
+            0
+        } else {
+            COMMENT_STATE.lock().map(|g| g.pn.saturating_sub(1) * 20).unwrap_or(0)
+        };
+        // 更可靠的追加位置：直接读 UI 模型当前的条数
+        let w_list = window.clone();
+        let raw: Vec<CommentItemData> = items
             .into_iter()
-            .map(|c| RawComment {
-                rpid: c.rpid,
-                sub_authors: c.sub_replies.iter().map(|s| s.user_name.clone()).collect(),
-                sub_contents: c.sub_replies.iter().map(|s| s.content.clone()).collect(),
-                user_name: c.user_name,
-                user_face: c.user_face,
-                content: c.content,
-                likes: c.likes,
-                pubtime: c.pubtime,
-                level: c.level,
-                is_vip: c.is_vip,
-                is_up: c.is_up,
-                location: c.location,
-                reply_count: c.reply_count,
+            .map(|c| {
+                let sub_authors: Vec<slint::SharedString> =
+                    c.sub_replies.iter().map(|s| s.user_name.as_str().into()).collect();
+                let sub_replies: Vec<slint::SharedString> =
+                    c.sub_replies.iter().map(|s| s.content.as_str().into()).collect();
+                CommentItemData {
+                    rpid: c.rpid as i32,
+                    user_name: c.user_name.into(),
+                    user_face: Image::default(),
+                    content: c.content.into(),
+                    likes: c.likes.into(),
+                    pubtime: c.pubtime.into(),
+                    level: c.level as i32,
+                    is_vip: c.is_vip,
+                    is_up: c.is_up,
+                    location: c.location.into(),
+                    reply_count: c.reply_count as i32,
+                    sub_replies: ModelRc::new(VecModel::from(sub_replies)),
+                    sub_authors: ModelRc::new(VecModel::from(sub_authors)),
+                }
             })
             .collect();
 
-        // 先把文字上屏（头像留空），头像随后异步补 ——
-        // 评论主体是文字，等头像下载完再整体渲染会让评论区白屏好几秒。
-        let w_list = window.clone();
+        let _ = start_idx;
         let _ = window.upgrade_in_event_loop(move |w| {
-            let ui_comments: Vec<CommentItemData> = raw
-                .into_iter()
-                .map(|c| {
-                    let sub_authors: Vec<slint::SharedString> =
-                        c.sub_authors.iter().map(|s| s.as_str().into()).collect();
-                    let sub_replies: Vec<slint::SharedString> =
-                        c.sub_contents.iter().map(|s| s.as_str().into()).collect();
-                    CommentItemData {
-                        rpid: c.rpid as i32,
-                        user_name: c.user_name.into(),
-                        user_face: Image::default(),
-                        content: c.content.into(),
-                        likes: c.likes.into(),
-                        pubtime: c.pubtime.into(),
-                        level: c.level as i32,
-                        is_vip: c.is_vip,
-                        is_up: c.is_up,
-                        location: c.location.into(),
-                        reply_count: c.reply_count as i32,
-                        sub_replies: ModelRc::new(VecModel::from(sub_replies)),
-                        sub_authors: ModelRc::new(VecModel::from(sub_authors)),
+            if fresh {
+                let model = VecModel::from(raw);
+                w.set_video_comments(ModelRc::new(Rc::new(model)));
+            } else {
+                // 追加：
+                //   Slint 的 VecModel 一旦交给 ModelRc 就没有"push 一行"
+                //   的安全入口（set_row_data 只能改已有行，越界会被忽略）。
+                //   稳妥做法是把现有行读出来、拼上新行、整份重设。
+                //   代价是一次 O(n) 的模型重建；20 条/页、翻到几百条时
+                //   也只是几毫秒，比"翻页不生效"可接受得多。
+                let model = w.get_video_comments();
+                let mut merged: Vec<CommentItemData> = Vec::with_capacity(model.row_count() + raw.len());
+                for i in 0..model.row_count() {
+                    if let Some(row) = model.row_data(i) {
+                        merged.push(row);
                     }
-                })
-                .collect();
-            w.set_video_comments(ModelRc::new(Rc::new(VecModel::from(ui_comments))));
+                }
+                merged.extend(raw);
+                let new_model = VecModel::from(merged);
+                w.set_video_comments(ModelRc::new(Rc::new(new_model)));
+            }
+            w.set_comments_loading_more(false);
+            let has_more = COMMENT_STATE.lock().map(|g| g.has_more).unwrap_or(false);
+            w.set_comments_has_more(has_more);
         });
 
-        spawn_comment_faces(w_list, face_urls, session);
+        // 头像按新行的起始索引回填
+        let base = if fresh {
+            0
+        } else {
+            window.upgrade().map(|w| w.get_video_comments().row_count()).unwrap_or(0)
+                .saturating_sub(face_urls.len())
+        };
+        spawn_comment_faces_from(w_list, face_urls, session, base);
     });
 }
 
@@ -994,10 +1117,23 @@ pub fn resolve_reply_target(name: &str) -> (u64, u64) {
 /// 为什么要单独一个函数、还要带 session：
 ///   用户在评论区翻着，切走了视频，这些下载中的头像必须能自我终止，
 ///   否则会往已经换掉的列表里写数据（表现为新视频评论区混进旧头像）。
-fn spawn_comment_faces(
+/// 评论头像批量下载并逐条回填。
+///
+/// `index_of` 把 urls 的下标映射成模型行号。
+///
+/// 为什么需要映射而不是直接用 urls 的下标：
+///   第一页时模型行号 == urls 下标；
+///   但"加载更多"是往同一个模型追加，第二页的第一个头像应该写进
+///   第 20 行，不是第 0 行。上一版直接拿 enumerate 的下标去
+///   set_row_data，翻页后头像会全串到前 20 条上。
+///
+/// 用闭包而不是 base 整数：调用方可以在 UI 线程里按当时的
+/// row_count 动态算，避免"下载期间又追加了一页"导致错位。
+fn spawn_comment_faces_from(
     window: slint::Weak<AppWindow>,
     urls: Vec<String>,
     session: u64,
+    base: usize,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -1018,16 +1154,18 @@ fn spawn_comment_faces(
                 continue;
             };
 
+            let target = base + idx;
             let w_ui = window.clone();
             let _ = w_ui.upgrade_in_event_loop(move |ui| {
                 // 通过 AppWindow 重新取当前模型，避免跨线程持有 ModelRc
                 let model = ui.get_video_comments();
-                if let Some(mut row) = model.row_data(idx) {
-                    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
-                    row.user_face = Image::from_rgba8(buf);
-                    model.set_row_data(idx, row);
+                if target < model.row_count() {
+                    if let Some(mut row) = model.row_data(target) {
+                        let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                        row.user_face = Image::from_rgba8(buf);
+                        model.set_row_data(target, row);
+                    }
                 }
-                let _ = &ui;
             });
         }
     });
