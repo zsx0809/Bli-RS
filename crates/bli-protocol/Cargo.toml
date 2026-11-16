@@ -16,9 +16,6 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md-5 = "0.10"
-# 二维码渲染：纯 Rust、零依赖、编到 wasm 都能用，体积几十 KB。
-# 只用来把登录 URL 画成位图矩阵，不做图片编解码。
-qrcodegen = "1.8"
 log = "0.4"
 # 只用 tokio 的同步原语（Mutex）来缓存 mixin_key，
 # 不启用 runtime —— 运行时由宿主（Android 入口）提供。

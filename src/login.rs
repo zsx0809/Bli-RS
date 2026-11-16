@@ -18,7 +18,7 @@
 // ==============================================================================
 
 
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;

@@ -21,6 +21,13 @@ path = "src/main.rs"
 slint = { version = "1.9", default-features = false, features = ["std", "compat-1-2", "backend-android-activity-06", "renderer-femtovg"] }
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time", "sync"] }
 log = "0.4"
+# 扫码登录：把 B 站给的 URL 本地画成二维码位图。
+# 纯 Rust、零依赖、几十 KB —— 比起造一个不可见 WebView 让 JS 画，
+# 这个方案在 native 侧干净得多。
+qrcodegen = "1.8"
+# 评论接口返回的是自由格式 JSON（字段随登录态变化），
+# 用 Value 直取比定义一堆 struct 更实际。
+serde_json = "1"
 
 # 协议层独立成 crate：它不依赖 UI，可以单独跑 probe 验证接口
 bli-protocol = { path = "crates/bli-protocol" }
