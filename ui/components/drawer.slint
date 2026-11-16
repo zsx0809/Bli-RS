@@ -177,7 +177,6 @@ export component NavigationDrawer inherits Rectangle {
                                 height: 100%;
                                 source: root.user_face;
                                 image-fit: cover;
-                                border-radius: Theme.radius_full;
                             }
                         }
 
@@ -309,7 +308,6 @@ export component NavigationDrawer inherits Rectangle {
                         height: 176px;
                         background: #ffffff;
                         border-radius: Theme.radius_sm;
-                        horizontal-alignment: center;
 
                         if root.login_qr_loading : Rectangle {
                             width: 176px;
@@ -326,6 +324,8 @@ export component NavigationDrawer inherits Rectangle {
                         }
 
                         Image {
+                            x: 4px;
+                            y: 4px;
                             width: 168px;
                             height: 168px;
                             source: root.login_qr;
