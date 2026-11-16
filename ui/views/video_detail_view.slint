@@ -1799,8 +1799,14 @@ export component VideoDetailView inherits Rectangle {
         width: 100%;
         height: 54px;
         background: Theme.surface_container;
-        border-top-width: 1px;
-        border-color: Theme.outline_variant;
+
+        // 顶部一条 1px 分隔线（Rectangle 没有 border-top-width，
+        // 单独画一条线更直接）
+        Rectangle {
+            width: 100%;
+            height: 1px;
+            background: Theme.outline_variant;
+        }
 
         TextInput {
             x: Spacing.page_margin;
