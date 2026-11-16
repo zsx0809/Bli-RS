@@ -1039,7 +1039,6 @@ export component VideoDetailView inherits Rectangle {
 
                 sort_touch := TouchArea {
                     clicked => {
-                        debug("DBG sort toggle");
                         root.comment_sort = root.comment_sort == 1 ? 0 : 1;
                         root.change_comment_sort(root.comment_sort);
                     }
@@ -1674,7 +1673,6 @@ export component VideoDetailView inherits Rectangle {
 
                                                 reply_btn_touch := TouchArea {
                                                     clicked => {
-                                                        debug("DBG reply-btn tap");
                                                         root.reply_target = comment.user_name;
                                                         root.reply_panel_open = true;
                                                         root.reply_clicked(
@@ -1833,7 +1831,6 @@ export component VideoDetailView inherits Rectangle {
 
         fab_touch := TouchArea {
             clicked => {
-                debug("DBG fab tap");
                 root.reply_target = "";
                 root.reply_panel_open = true;
             }
@@ -1926,7 +1923,6 @@ export component VideoDetailView inherits Rectangle {
 
                     TouchArea {
                         clicked => {
-                            debug("DBG panel close");
                             root.reply_panel_open = false;
                             root.reply_target = "";
                             root.reply_input_focused = false;
@@ -2006,7 +2002,6 @@ export component VideoDetailView inherits Rectangle {
                     // "面板被键盘挡住了"。让用户自己点输入框，
                     // 时序就完全由系统控制，不会互相打架。
                     changed has-focus => {
-                        debug("DBG input focus changed");
                         root.reply_input_focused = self.has-focus;
                     }
                 }
