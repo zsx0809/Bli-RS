@@ -418,9 +418,12 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
     /// 当前是否全屏。视频分辨率后到（set_video_size）时要用它决定走哪套几何。
     static CUR_FULLSCREEN: AtomicBool = AtomicBool::new(false);
     /// 当前视频是否竖屏。
-    static CUR_VERTICAL: AtomicBool = AtomicBool::new(false);
+    pub(crate) static CUR_VERTICAL: AtomicBool = AtomicBool::new(false);
     /// 当前视频分辨率，旋转后重算几何时要用。
-    static CUR_VIDEO: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+    ///
+    /// pub(crate)：外层的 set_video_size 也要写它 —— 两份缓存不同步
+    /// 曾导致竖屏视频按错误的宽高比布局（详见 set_video_size 的注释）。
+    pub(crate) static CUR_VIDEO: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
     /// 取当前屏幕物理尺寸与密度。**返回值与旋转方向无关** ——
     /// 返回 (短边, 长边, density)，调用方永远拿竖屏基准去算。
@@ -472,6 +475,41 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         }
     }
 
+    /// 竖屏视频的播放区宽度（物理像素）。
+    ///
+    /// ★ 为什么必须按视频真实宽高比反算，而不是铺满屏宽：
+    ///
+    ///   SurfaceView 的 buffer 尺寸由 LayoutParams 决定。之前竖屏时
+    ///   宽度用 MATCH_PARENT（-1），高度取 45% 屏高 —— 于是容器是一个
+    ///   「屏宽 × 屏高45%」的横长条，比如 1240 × 586（宽高比 2.1:1）。
+    ///   可竖屏视频本身是 1080×1920（0.5625:1）。
+    ///   把一个竖视频塞进横条里，只能左右拉满 → 画面被横向撑扁，
+    ///   观感就是"这明明是竖屏视频，怎么宽宽的、比例不对"。
+    ///
+    ///   正确做法按高度反算宽度：w = h * video_w / video_h。
+    ///   高度仍是 45% 屏高时，宽度自然收成一条竖着的窄条，
+    ///   两侧留黑，比例才对。
+    ///
+    ///   上下限夹住：视频比例异常（超宽/超窄）时也不至于算出 0 或超屏宽。
+    fn portrait_target_w(short: i32, target_h: i32, is_vertical: bool) -> i32 {
+        if !is_vertical {
+            // 横屏视频：铺满屏宽，高度按 16:9 算过，比例天然正确
+            return -1;
+        }
+        let (vw, vh) = CUR_VIDEO
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or((0, 0));
+        if vw <= 0 || vh <= 0 || vw >= vh {
+            // 还不知道真实分辨率 / 不是竖视频 → 退回铺满
+            return -1;
+        }
+        // 保留 9:16 附近的常见竖屏比例，但不允许超过屏宽
+        let want = (target_h as f64 * vw as f64 / vh as f64) as i32;
+        want.clamp(1, short)
+    }
+
     /// 旋转落定之后，用**新鲜**的 DisplayMetrics 重新落一遍竖屏几何。
     ///
     /// 为什么必须有这一步：
@@ -510,16 +548,21 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             .unwrap_or(CUR_VERTICAL.load(Ordering::SeqCst));
 
         let h = portrait_target_h(short, long, density, is_video_vertical);
+        // 竖屏视频同样要按比例收窄，不能用 match_parent ——
+        // 旋转后重落几何这条路径如果铺满宽度，前面修好的比例会被打回去。
+        let w = portrait_target_w(short, h, is_video_vertical);
         let top = crate::android_window::status_bar_height_px();
 
         let Ok(lp) = env.new_object(
             "android/widget/FrameLayout$LayoutParams",
             "(II)V",
-            &[JValue::Int(-1), JValue::Int(h)],
+            &[JValue::Int(w), JValue::Int(h)],
         ) else {
             return;
         };
-        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48));
+        // 收窄之后水平居中（Gravity.TOP | CENTER_HORIZONTAL = 49）
+        let gravity = if w > 0 { 49 } else { 48 };
+        let _ = env.set_field(&lp, "gravity", "I", JValue::Int(gravity));
         let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top));
         let _ = env.call_method(
             sv.as_obj(),
@@ -544,7 +587,7 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         }
 
         crate::mxprobe::log_public(&format!(
-            "[Surface] 旋转后重落竖屏几何 -> 宽=match_parent x 高={h}, top={top}, short={short}, long={long}"
+            "[Surface] 旋转后重落竖屏几何 -> 宽={w} x 高={h}, top={top}, 竖屏视频={is_video_vertical}, short={short}, long={long}"
         ));
     }
 
@@ -942,15 +985,23 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
         // 竖屏与横屏尺寸与 Slint DSL 保持严格对齐，且留出顶部状态栏与控制条空间
         let target_h = portrait_target_h(short, long, density, is_vertical);
 
+        // 竖屏视频要按比例收窄宽度，否则会被横向拉扁。
+        let target_w = portrait_target_w(short, target_h, is_vertical);
+
         let Ok(lp) = env.new_object(
             "android/widget/FrameLayout$LayoutParams",
             "(II)V",
-            &[JValue::Int(-1), JValue::Int(target_h)],
+            &[JValue::Int(target_w), JValue::Int(target_h)],
         ) else {
             return;
         };
 
         let _ = env.set_field(&lp, "gravity", "I", JValue::Int(48)); // Gravity.TOP
+        // 收窄之后要水平居中，否则会贴着左边、右边一大片黑
+        if target_w > 0 {
+            // Gravity.TOP | Gravity.CENTER_HORIZONTAL = 48 | 1 = 49
+            let _ = env.set_field(&lp, "gravity", "I", JValue::Int(49));
+        }
         let _ = env.set_field(&lp, "topMargin", "I", JValue::Int(top_px)); // 状态栏留白
 
         let _ = env.call_method(
@@ -975,8 +1026,13 @@ let _ = env.call_method(&sv, "setVisibility", "(I)V", &[JValue::Int(0)]);
             *lock = Some((target_h, top_px));
         }
 
+        let (vw_dbg, vh_dbg) = CUR_VIDEO
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or((0, 0));
         crate::mxprobe::log_public(&format!(
-            "[Surface] 自适应布局 -> 高={target_h}, top={top_px}, 竖屏视频={is_vertical}, short={short}, long={long}"
+            "[Surface] 自适应布局 -> 宽={target_w}, 高={target_h}, top={top_px}, 竖屏视频={is_vertical}, 视频={vw_dbg}x{vh_dbg}, short={short}, long={long}"
         ));
     }
 }
@@ -1071,10 +1127,32 @@ pub fn set_fullscreen_surface(fullscreen: bool, video_w: i32, video_h: i32) {
 /// 记录当前视频分辨率，供全屏时算 letterbox
 static VIDEO_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
-/// 由 player 在拿到播放地址后调用
+/// 由 player 在拿到播放地址后调用。
+///
+/// ★ 这里必须**同时**写 imp 模块里的 CUR_VIDEO。
+///
+///   原本有两份互不相干的分辨率缓存：
+///     · 外层 VIDEO_SIZE —— 只有全屏 letterbox 用它
+///     · imp::CUR_VIDEO  —— 自适应布局用它
+///   而 set_video_size 只写前者，imp 那边永远停在"占位值"。
+///   后果：竖屏视频算宽度时拿不到真实比例（拿到 480x852 的假值），
+///   于是按 9:16 硬套 —— 遇到 3:4、1:1 的竖屏视频比例就不对。
+///
+///   现在两边都写，并且写完立刻重算一次布局：真实分辨率是异步到的，
+///   来之前布局已经按占位值做了一次，必须刷新一次才能纠正。
 pub fn set_video_size(w: u32, h: u32) {
     if let Ok(mut g) = VIDEO_SIZE.lock() {
         *g = Some((w as i32, h as i32));
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        if let Ok(mut g) = imp::CUR_VIDEO.lock() {
+            *g = Some((w as i32, h as i32));
+        }
+        // 分辨率刚到，按真实宽高比重算一次几何
+        let vertical = imp::CUR_VERTICAL.load(std::sync::atomic::Ordering::SeqCst);
+        set_adaptive_layout(vertical);
     }
 }
 
