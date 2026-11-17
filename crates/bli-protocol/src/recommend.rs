@@ -154,26 +154,45 @@ impl BiliClient {
         params.insert("statistics".to_string(), api::APP_STATISTICS.to_string());
         params.insert("voice_balance".to_string(), "0".to_string());
 
+        // ★ 关键：App 端请求必须做 appsign 签名。
+        //
+        // 不做签名的请求，服务端认得出来是"带了个 App UA 的网页请求"，
+        // 于是按网页访客处理 —— 推荐退化成通用流。
+        // 这是"怎么刷都是不相干内容"的最后一个缺口。
+        self.app_sign(&mut params);
+
         let url = format!("{}{}", api::APP_BASE_URL, api::RECOMMEND_APP);
 
-        let headers = vec![
+        // 请求头照抄 PiliPlus Constants.baseHeaders + LoginAccount.headers：
+        //   app-key=android64 / env=prod / x-bili-aurora-zone=sh001
+        //   登录时再加 x-bili-mid 与 x-bili-aurora-eid
+        let mut headers = vec![
             ("user-agent", api::APP_UA.to_string()),
-            ("app-key", "android_hd".to_string()),
+            ("app-key", "android64".to_string()),
             ("env", "prod".to_string()),
             ("buvid", self.buvid_string()),
-            // PiliPlus 送的是一串 1 的假指纹。真实指纹缺失时服务端照样
-            // 走推荐链路，而这串 1 是它实测可用的值，照抄最稳。
             ("fp_local", "1".repeat(64)),
             ("fp_remote", "1".repeat(64)),
             ("session_id", "11111111".to_string()),
             ("x-bili-trace-id", api::APP_TRACE_ID.to_string()),
-            ("x-bili-aurora-eid", String::new()),
-            ("x-bili-aurora-zone", String::new()),
+            ("x-bili-aurora-zone", "sh001".to_string()),
             ("bili-http-engine", "cronet".to_string()),
         ];
 
+        let eid = self.aurora_eid();
+        if !eid.is_empty() {
+            headers.push(("x-bili-aurora-eid", eid));
+        }
+        if let Some(a) = self.auth() {
+            if a.mid > 0 {
+                headers.push(("x-bili-mid", a.mid.to_string()));
+            }
+        }
+
+        // App 端接口**不**走 cookie（PiliPlus 里 isApp 分支明确跳过 cookie 管理），
+        // 所以这里不能用 get_with_headers（它会注入 cookie）。
         let json = self
-            .get_with_headers(&url, &params, &headers)
+            .get_app(&url, &params, &headers)
             .await?;
 
         let raw_items = json["data"]["items"]

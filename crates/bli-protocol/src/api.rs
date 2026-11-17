@@ -38,6 +38,19 @@ pub const APP_STATISTICS: &str =
 
 pub const APP_TRACE_ID: &str = "11111111111111111111111111111111:1111111111111111:0:0";
 
+/// App 端签名密钥（照抄 PiliPlus Constants.appKey / appSec）
+///
+/// ★ App 端接口要求每个请求带 appsign：
+///     params["appkey"] = appKey
+///     params["ts"]     = 当前秒级时间戳
+///     params["sign"]   = MD5(按 key 排序后的 query + appSec)
+///
+///   只带 App UA 而不签名，服务端认得出来是"伪装成 App 的网页请求"，
+///   于是仍按网页访客处理 —— 拿不到个性化推荐。这是之前
+///   "推荐怎么刷都不相关"的最后一个缺口。
+pub const APP_KEY: &str = "dfca71928277209b";
+pub const APP_SEC: &str = "b5475a8825547a4fc26c7d518eaaa02e";
+
 /// buvid 激活（设备指纹上报）
 ///
 /// ★ 这是个性化推荐能不能生效的**关键一环**，很容易被漏掉。

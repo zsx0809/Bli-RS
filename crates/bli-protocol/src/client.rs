@@ -25,7 +25,7 @@ pub struct BiliClient {
     http: reqwest::Client,
     /// 缓存 mixin_key，避免每个请求都去拉 nav。
     /// 用 Arc<Mutex> 是因为要跨 await 点共享，且 Clone 给多个并发任务用。
-    mixin: Arc<tokio::sync::Mutex<Option<(String, i64)>>>,
+    mixin: Arc<tokio::sync::Mutex<Option<(String, i64, bool)>>>,
     /// 设备指纹 cookie（buvid3）。
     ///
     /// 为什么必须有：推荐流不需要它，但 playurl / view 这类接口会校验。
@@ -138,6 +138,55 @@ impl BiliClient {
         Ok(json)
     }
 
+    /// App 端接口专用 GET：签名 + 完整 App 头，**不带 cookie**。
+    ///
+    /// 为什么单独一个方法而不是复用 get_with_headers：
+    ///   1. App 端接口不认 cookie（PiliPlus 的 isApp 分支明确跳过
+    ///      cookie 管理），带上反而可能与 sign 冲突
+    ///   2. App 端要求 referer 缺失时补 www.bilibili.com，但不要
+    ///      网页那套 cookie 逻辑
+    ///
+    /// 签名由调用方先做好（见 app_sign）。
+    pub async fn get_app(
+        &self,
+        url: &str,
+        params: &BTreeMap<String, String>,
+        headers: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        let mut req = self.http.get(url);
+
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        if !headers.iter().any(|(k, _)| *k == "referer") {
+            req = req.header("referer", api::REFERER);
+        }
+
+        if !params.is_empty() {
+            req = req.query(params);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Network(format!("HTTP {status}")));
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        let code = json.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code != 0 {
+            let msg = json
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("未知错误")
+                .to_string();
+            return Err(Error::Api { code, message: msg });
+        }
+
+        Ok(json)
+    }
+
     /// 带自定义请求头的 GET（绝对 URL，不签名）。
     ///
     /// 用于 App 端接口：它们不用 WBI 签名，但要求一整套 App 请求头
@@ -181,6 +230,72 @@ impl BiliClient {
         }
 
         Ok(json)
+    }
+
+    /// App 端请求签名（appsign）。
+    ///
+    /// 算法照抄 PiliPlus `AppSign.appSign`：
+    ///   1. params 里塞 appkey 与 ts（秒级时间戳字符串）
+    ///   2. 按 key 字典序排序
+    ///   3. 拼成 `k1=v1&k2=v2`（每个 key/value 都做 URL 编码）
+    ///   4. sign = MD5(那个串 + appSec)
+    ///
+    /// 返回的 sign 要作为 **query 参数** 一起发出去，不是 header。
+    ///
+    /// 为什么这个不能省：App 端推荐接口靠它区分"真 App 请求"和
+    /// "带了个 App UA 的网页请求"。不签名的请求会被降级成网页访客，
+    /// 推荐退化成通用流 —— 症状恰好就是"怎么刷都是不相干的内容"。
+    pub(crate) fn app_sign(&self, params: &mut BTreeMap<String, String>) {
+        use md5::{Digest, Md5};
+
+        params.insert("appkey".into(), api::APP_KEY.into());
+        params.insert(
+            "ts".into(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .to_string(),
+        );
+
+        // BTreeMap 天然按 key 排序，正好符合要求
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let mut hasher = Md5::new();
+        hasher.update(query.as_bytes());
+        hasher.update(api::APP_SEC.as_bytes());
+        let sign = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        params.insert("sign".into(), sign);
+    }
+
+    /// 登录用户的 `x-bili-aurora-eid`：mid 的字节与固定密钥逐位异或后 base64。
+    ///
+    /// 照抄 PiliPlus `IdUtils.genAuroraEid`。未登录返回空串。
+    pub(crate) fn aurora_eid(&self) -> String {
+        use base64::Engine as _;
+
+        let mid = match self.auth() {
+            Some(a) if a.mid > 0 => a.mid,
+            _ => return String::new(),
+        };
+
+        const KEY: &[u8] = b"ad1va46a7lza";
+        let mut bytes = mid.to_string().into_bytes();
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b ^= KEY[i % KEY.len()];
+        }
+        base64::engine::general_purpose::STANDARD
+            .encode(&bytes)
+            .replace('=', "")
     }
 
     /// 激活 buvid（设备指纹上报）。
@@ -608,14 +723,27 @@ impl BiliClient {
     /// 关键点：nav 接口在**未登录**时返回 `code: -101`，但 `data.wbi_img`
     /// 是完全有效的。所以这里必须用 `get_raw` 而不是 `get_checked` ——
     /// 否则未登录用户永远拿不到签名密钥，推荐流直接不可用。
+    /// WBI 密钥缓存键：(key, day, 是否登录).
+    ///
+    /// ★ 为什么要把"是否登录"放进缓存键：
+    ///
+    ///   WBI 密钥是**按身份签发**的。游客拿到的 mixin_key 与登录态拿到的
+    ///   通常一致（都来自当日固定值），但混用会导致 w_rid 校验失败或
+    ///   被服务端降级为游客视角 —— 表现就是"明明登录了，推荐还是泛化流"。
+    ///
+    ///   之前的实现只在 set_auth 时清缓存，但启动阶段是「先 client()、
+    ///   再 restore 登录态、再立刻发 feed 请求」，中间任何一个用到
+    ///   mixin_key 的调用都可能把游客密钥写进缓存。把登录态纳入键值
+    ///   之后，两种状态的缓存互不干扰，换状态也必然重新取。
     pub async fn mixin_key(&self) -> Result<String> {
         let today = utc_day();
+        let logged_in = self.is_logged_in();
 
-        // 快速路径：已有当天缓存
+        // 快速路径：已有当天、同身份的缓存
         {
             let guard = self.mixin.lock().await;
-            if let Some((key, day)) = guard.as_ref() {
-                if *day == today {
+            if let Some((key, day, was_logged_in)) = guard.as_ref() {
+                if *day == today && *was_logged_in == logged_in {
                     return Ok(key.clone());
                 }
             }
@@ -635,7 +763,7 @@ impl BiliClient {
         let key = wbi::get_mixin_key(&format!("{}{}", file_stem(img), file_stem(sub)));
 
         let mut guard = self.mixin.lock().await;
-        *guard = Some((key.clone(), today));
+        *guard = Some((key.clone(), today, logged_in));
         Ok(key)
     }
 }
@@ -655,6 +783,22 @@ impl BiliClient {
 ///
 /// 格式：8-4-4-4-12 的大写十六进制 UUID + 5 位十进制随机数 + "infoc"。
 /// B 站只校验形态，不做服务端签发，所以本地随机即可。
+/// 百分号编码，与 Dart 的 `Uri.encodeComponent` 行为一致：
+/// 只保留 A-Z a-z 0-9 - _ . ! ~ * ' ( )
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
+            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn gen_buvid3() -> String {
     // 不引 uuid crate：这里只需要"看起来随机且形态正确"，
     // 用系统时间的纳秒位混一个简单的线性同余就够了。

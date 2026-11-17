@@ -370,18 +370,28 @@ fn spawn_page_request(weak: slint::Weak<AppWindow>, mode: Mode, quiet: bool) {
             }
         };
 
-        // ★ 走 **App 端** 推荐接口，不是 Web 端。
+        // ★ 用 **Web 端** 推荐接口。
         //
-        // Web 端 /x/web-interface/wbi/index/top/feed/rcmd 在"无画像"
-        // 情况下返回的是通用热榜，翻多少页都是同一批视频 ——
-        // 这正是"怎么刷都是那几个视频"的根因。
+        // 这里走过一次弯路，记下来免得再犯：
+        //   先按"PiliPlus 默认 RcmdSource.app"去接 App 端
+        //   /x/v2/feed/index，还照着补了 appsign、x-bili-mid、
+        //   x-bili-aurora-eid。结果是内容仍然泛化（英语听力、字幕组片段），
+        //   和账号的实际兴趣无关。
         //
-        // App 端 /x/v2/feed/index 走推荐引擎，idx 每推进一次就是一批
-        // 全新内容。PiliPlus 默认也用这个（RcmdSource.app）。
+        //   同一时刻对比 Web 端 /x/web-interface/wbi/index/top/feed/rcmd
+        //   （带登录 cookie + 同一个 buvid），返回的是 DeepSeek、
+        //   AI 音乐、县城创作这类真正跟着账号历史走的内容。
+        //
+        //   原因推测：Web 端推荐接口直接读网页端的观看历史与兴趣标签，
+        //   而 App 端接口另有一套推荐链路，对第三方客户端的鉴权等级
+        //   更低，拿不到同等质量的画像。
+        //
+        //   PiliPlus 的 appRcmd 开关默认确实是 true，但用户实际看到
+        //   哪一档取决于他自己切过什么 —— 不能拿默认值当结论。
         let result = rt.block_on(async {
             let client = crate::client().ok_or_else(|| "初始化网络失败".to_string())?;
             client
-                .recommend_feed_app(fresh_idx)
+                .recommend_feed(fresh_idx, 20)
                 .await
                 .map_err(|e| e.to_string())
         });
