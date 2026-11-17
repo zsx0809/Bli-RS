@@ -2169,7 +2169,15 @@ pub fn set_quality(window: slint::Weak<AppWindow>, index: i32) {
         .map(|w| w.get_auto_play())
         .unwrap_or(true);
 
-    play(window.clone(), bvid, auto);
+    // play() 内部有 stop_current()（要 join 解码线程）和
+    // cache::retain_only()（要遍历删文件），都是阻塞操作。
+    // 这里是被 UI 的清晰度菜单回调直接调用的，**不能**在 UI 线程上跑。
+    {
+        let w = window.clone();
+        std::thread::spawn(move || {
+            play(w, bvid, auto);
+        });
+    }
 
     // 重播起播是异步的，等它拿到时长再 seek。
     // 3 秒是实测够用的经验值（playurl + 首段下载 + 解码器启动）。
@@ -2294,21 +2302,39 @@ fn start_pending(window: slint::Weak<AppWindow>) {
         w.set_current_detail(d);
     });
 
-    let client = match crate::client() {
-        Some(c) => c,
-        None => {
-            report_fail(&window, "初始化网络失败".into());
-            return;
-        }
-    };
+    // ★ 整条起播链路必须放到后台线程。
+    //
+    // 这个函数是被 toggle_play 调用的，而 toggle_play 又是 Slint 的
+    // 点击回调 —— 也就是说它跑在 **UI 线程** 上。而 start_playback
+    // 内部全是阻塞调用：
+    //   · probe_content_length  → 网络请求（最多 15 秒超时）
+    //   · wait_surface()        → 循环 sleep，最多 7.5 秒
+    //   · rx_ready.recv_timeout → 最多 12 秒
+    //
+    // 在外面直接调它的后果就是症状里描述的那样：
+    //   「点播放后整个 App 卡住，详情页滑不动，后台一直在下载但不出画面」
+    // —— UI 线程被这些阻塞调用钉死，连滑动都渲染不了；
+    // 而下载线程是独立的，照样在跑，于是看到持续的 1~3MB/s 流量。
+    //
+    // 启动 play() 那条路径本来就在 `std::thread::spawn` 里（见 play），
+    // 只有这个"手动起播"入口漏了。现在补齐。
+    std::thread::spawn(move || {
+        let client = match crate::client() {
+            Some(c) => c,
+            None => {
+                report_fail(&window, "初始化网络失败".into());
+                return;
+            }
+        };
 
-    start_playback(
-        window,
-        p.session,
-        p.bvid,
-        p.url,
-        p.audio_url,
-        client,
-        p.duration_us,
-    );
+        start_playback(
+            window,
+            p.session,
+            p.bvid,
+            p.url,
+            p.audio_url,
+            client,
+            p.duration_us,
+        );
+    });
 }

@@ -150,7 +150,13 @@ pub fn probe_format(buffer: Arc<crate::stream_source::SharedBuffer>) -> (i32, i3
             crate::video_decoder::raw_extractor::AMediaFormat_delete(fmt);
         }
 
+        // extractor 与 datasource 都要释放。
+        //
+        // AMediaExtractor_delete 只会通知 datasource 走 close 回调，
+        // 不会自己 delete 它 —— 少这一句就是一个 AMediaDataSource 泄漏，
+        // 并且那段 Box::leak 出去的 SourceCtx 也回收不回来。
         crate::video_decoder::raw_extractor::AMediaExtractor_delete(ex);
+        unsafe { ndk_sys::AMediaDataSource_delete(ds) };
         if out.0 <= 0 || out.1 <= 0 {
             DEFAULT
         } else {
