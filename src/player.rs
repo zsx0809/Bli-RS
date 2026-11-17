@@ -36,6 +36,8 @@ static PLAY_SESSION: AtomicU64 = AtomicU64::new(0);
 /// 登录状态变化后要重新拉评论区（未登录 3 条，登录后 20 条/页），
 /// 那时播放上下文早就散在栈上了，只能靠这几个全局量。
 static CURRENT_AID: AtomicU64 = AtomicU64::new(0);
+/// 当前视频的 cid。切换清晰度时要重新请求 playurl，那时得知道 cid。
+static CURRENT_CID: AtomicU64 = AtomicU64::new(0);
 static CURRENT_OWNER: AtomicU64 = AtomicU64::new(0);
 static CURRENT_BVID: Mutex<Option<String>> = Mutex::new(None);
 /// 当前视频总时长（微秒）。UI 传来的进度是 0.0~1.0，换算成 PTS 要用它。
@@ -68,6 +70,16 @@ static ACTUAL_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// 当前视频的清晰度候选（id, 文案），供 UI 菜单用
 static QUALITY_LIST: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
+/// 用户在清晰度菜单里选中的**下标**（0 = 自动）。
+///
+/// 为什么存下标而不是 qid：不同视频支持的档位不同（这个视频有 1080P，
+/// 那个只有 720P），qid 直接套到别的视频上会指向不存在的档位。
+/// 下标也存在同一份菜单结构上（labels 的下标），语义一致。
+///
+/// 持久化到 settings 的键 `quality_index` —— 重启 App 后要还原，
+/// 否则用户每次打开都得重选一次。
+static QUALITY_LIST_INDEX: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// 相关推荐视频模型句柄（仅在 UI 线程访问，杜绝跨线程 Send 冲突）
@@ -449,6 +461,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         // 3.2 异步拉取真实评论列表
         // 记住当前视频身份，登录态变化时要靠它重刷评论
         CURRENT_AID.store(aid, Ordering::SeqCst);
+        CURRENT_CID.store(cid, Ordering::SeqCst);
         CURRENT_OWNER.store(owner_mid, Ordering::SeqCst);
         if let Ok(mut g) = CURRENT_BVID.lock() {
             *g = Some(bvid.clone());
@@ -580,146 +593,154 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
             return;
         }
 
-        // ---- 清晰度选择 ----
-        //
-        // 优先级：
-        //   1. 用户手动指定了 id 且该档位可用 → 用它
-        //   2. 否则自动：**该账号能拿到的最高档**（受 max_height 兜底）
-        //
-        // 自动档的取舍：
-        //   早先写死上限 720P，理由是"1080P60 单集 200MB+，起播慢"。
-        //   但这个上限现在是错的 —— 用户登录了，能拿到 1080P，
-        //   直接砍到 720P 等于白登录。改成取可用的最高档，
-        //   用户嫌慢就自己去清晰度菜单调低。
-        //
-        //   4K/8K 只在账号有对应权限时才会出现在轨道列表里，
-        //   所以"取最高"不会把无权限的用户顶到播不了的档位。
-        let desired = DESIRED_QN.load(Ordering::SeqCst);
-
-        // 先把候选档位存起来给 UI（无论最后选了哪个）
-        let options = info.quality_options();
-        if let Ok(mut g) = QUALITY_LIST.lock() {
-            *g = options.clone();
-        }
-        {
-            let w_q = w_clone.clone();
-            let labels: Vec<String> = std::iter::once("自动".to_string())
-                .chain(options.iter().map(|(_, l)| l.clone()))
-                .collect();
-            let _ = w_q.upgrade_in_event_loop(move |w| {
-                let model: Vec<slint::SharedString> =
-                    labels.iter().map(|s| s.as_str().into()).collect();
-                w.set_quality_options(slint::ModelRc::new(slint::VecModel::from(model)));
-            });
-        }
-
-        let picked = if desired > 0 {
-            // 指定档位不可用（比如账号没权限）→ 退回自动，别黑屏
-            info.pick_video_by_id(desired)
-                .or_else(|| info.pick_video(Some(1080)))
-        } else {
-            // 自动：优先 1080P（覆盖绝大多数场景且体积可控），
-            // 没有 1080P 就退到可用的最高档
-            info.pick_video(Some(1080))
-        };
-
-        let Some(vtrack) = picked else {
-            report_fail(&w_clone, "该视频没有可用的视频流（可能是充电专属或地区限制）".into());
-            return;
-        };
-
-        ACTUAL_HEIGHT.store(vtrack.height.unwrap_or(0) as u64, Ordering::SeqCst);
-        crate::mxprobe::log_public(&format!(
-            "[Player] 清晰度: 请求 {desired} -> 实际 {}P (id={})",
-            vtrack.height.unwrap_or(0),
-            vtrack.id
-        ));
-        let Some(url) = vtrack.primary_url().map(|s| s.to_string()) else {
-            report_fail(&w_clone, "视频流地址为空".into());
-            return;
-        };
-
-        // 音轨：DASH 是音视频分离的，必须单独拿一条。
-        //
-        // pick_audio() 取码率最高的可用音轨（通常是 192K）。
-        // 之前完全没有接音频 —— 这是"没有声音"的直接原因，
-        // 也是音画同步无从谈起的前提。
-        let audio_url = info
-            .audio
-            .iter()
-            .find(|t| t.primary_url().is_some())
-            .and_then(|t| t.primary_url().map(|s| s.to_string()));
-
-        match &audio_url {
-            Some(_) => {
-                if let Some(a) = info.pick_audio() {
-                    crate::mxprobe::log_public(&format!(
-                        "[Player] 选中音轨: {} {} {}bps",
-                        a.id, a.codecs, a.bandwidth
-                    ));
-                }
-            }
-            None => crate::mxprobe::log_public("[Player] 没有可用音轨，将静音播放"),
-        }
-
-        crate::mxprobe::log_public(&format!(
-            "[Player] 选中分辨率: {}x{} 编码: {}",
-            vtrack.width.unwrap_or(0),
-            vtrack.height.unwrap_or(0),
-            vtrack.codecs
-        ));
-
-        // 记下分辨率：全屏时按它算 letterbox，避免画面被拉伸
-        let vw = vtrack.width.unwrap_or(0) as i32;
-        let vh = vtrack.height.unwrap_or(0) as i32;
-        if let Ok(mut g) = VIDEO_SIZE.lock() {
-            *g = Some((vw, vh));
-        }
-        crate::video_surface::set_video_size(vw as u32, vh as u32);
-
-        // 记录总时长（playurl 给的是秒，内部统一用微秒）。
-        // UI 的手势进度是 0.0~1.0，seek 时要用它换算成 PTS。
-        let dur_us = info.duration.saturating_mul(1_000_000) as i64;
-        DURATION_US.store(dur_us, Ordering::SeqCst);
-        crate::mxprobe::log_public(&format!("[Player] 总时长: {}s", info.duration));
-
-        // ---- 自动播放开关 ----
-        //
-        // 关闭时不下载视频流：这是"进入详情页但不播放"的核心 ——
-        // 既不浪费流量，也不会占着解码器。播放地址已经拿到并缓存在下面，
-        // 用户点播放时直接用，不需要再请求一次 playurl。
-        if !auto_play {
-            crate::mxprobe::log_public("[Player] 自动播放已关闭，等待用户手动起播");
-            // 把地址存起来，供 start_playback 使用
-            if let Ok(mut pending) = PENDING_STREAM.lock() {
-                *pending = Some(PendingStream {
-                    session: my_session,
-                    bvid: bvid.clone(),
-                    url: url.clone(),
-                    audio_url: audio_url.clone(),
-                    duration_us: dur_us,
-                });
-            }
-            // 显示中央播放按钮：封面已垫底，用户看到的是"封面 + 大播放键"，
-            // 语义清楚，不需要对着黑屏猜。
-            let w_wait = w_clone.clone();
-            let _ = w_wait.upgrade_in_event_loop(move |w| {
-                w.set_awaiting_play(true);
-            });
-            return;
-        }
-
-        // 自动播放：直接起播
-        start_playback(
+        // 挑轨道 + 起播。抽成函数是因为切换清晰度也要走同一条路
+        //（但那条路不该重拉详情/评论/相关推荐）。
+        start_from_playinfo(
             w_clone.clone(),
             my_session,
             bvid.clone(),
-            url,
-            audio_url,
             client.clone(),
-            dur_us,
+            info,
+            auto_play,
         );
     });
+}
+
+/// 从磁盘恢复用户的清晰度选择。启动时调一次。
+///
+/// 两个值分开存：
+///   quality_qn    —— 档位 id（127/80/64/…），0 表示自动
+///   quality_index —— 菜单下标，用来还原 UI 上的选中态
+///
+/// 为什么都要：qid 用来真正挑轨道；下标用来让菜单显示"当前选中哪一项"。
+/// 只有 qid 的话，UI 不知道 80 对应菜单里第几行（每个视频档位不同）。
+pub fn restore_quality_pref() {
+    let qn = crate::settings::get_u64("quality_qn");
+    let idx = crate::settings::get_u64("quality_index");
+    DESIRED_QN.store(qn, Ordering::SeqCst);
+    QUALITY_LIST_INDEX.store(idx, Ordering::SeqCst);
+    if qn > 0 || idx > 0 {
+        crate::mxprobe::log_public(&format!(
+            "[Quality] 恢复偏好: qn={qn} index={idx}"
+        ));
+    }
+}
+
+/// 拿到 playurl 结果后：挑轨道 → 更新清晰度菜单 → 起播（或暂存待播）。
+///
+/// 从 `play()` 里抽出来，是因为「切换清晰度」也需要这个流程 ——
+/// 但它**不该**连带重拉详情、评论、相关推荐（那会让用户在切档位时
+/// 看到标题变回"正在获取视频数据…"、评论区清空重来）。
+///
+/// 参数 `cid` 只为日志与 audio 选择的一致性；真正的轨道挑选全在 `info` 里。
+fn start_from_playinfo(
+    window: slint::Weak<AppWindow>,
+    my_session: u64,
+    bvid: String,
+    client: bli_protocol::BiliClient,
+    info: bli_protocol::playurl::DashPlayInfo,
+    auto_play: bool,
+) {
+    let w_clone = window.clone();
+
+    let desired = DESIRED_QN.load(Ordering::SeqCst);
+
+    // 先把候选档位存起来给 UI（无论最后选了哪个）
+    let options = info.quality_options();
+    if let Ok(mut g) = QUALITY_LIST.lock() {
+        *g = options.clone();
+    }
+    {
+        let w_q = w_clone.clone();
+        let labels: Vec<String> = std::iter::once("自动".to_string())
+            .chain(options.iter().map(|(_, l)| l.clone()))
+            .collect();
+        // UI 侧的索引是 labels 的下标；用户选了哪一项也按下标回传。
+        // 记住用户选的那一档，重启后要还原。
+        let sel = QUALITY_LIST_INDEX.load(Ordering::SeqCst) as i32;
+        let _ = w_q.upgrade_in_event_loop(move |w| {
+            let model: Vec<slint::SharedString> =
+                labels.iter().map(|s| s.as_str().into()).collect();
+            w.set_quality_options(slint::ModelRc::new(slint::VecModel::from(model)));
+            w.set_quality_index(sel);
+        });
+    }
+
+    let picked = if desired > 0 {
+        info.pick_video_by_id(desired)
+            .or_else(|| info.pick_video(Some(1080)))
+    } else {
+        info.pick_video(Some(1080))
+    };
+
+    let Some(vtrack) = picked else {
+        report_fail(&w_clone, "该视频没有可用的视频流（可能是充电专属或地区限制）".into());
+        return;
+    };
+
+    ACTUAL_HEIGHT.store(vtrack.height.unwrap_or(0) as u64, Ordering::SeqCst);
+    crate::mxprobe::log_public(&format!(
+        "[Player] 清晰度: 请求 {desired} -> 实际 {}P (id={})",
+        vtrack.height.unwrap_or(0),
+        vtrack.id
+    ));
+    let Some(url) = vtrack.primary_url().map(|s| s.to_string()) else {
+        report_fail(&w_clone, "视频流地址为空".into());
+        return;
+    };
+
+    let audio_url = info
+        .audio
+        .iter()
+        .find(|t| t.primary_url().is_some())
+        .and_then(|t| t.primary_url().map(|s| s.to_string()));
+
+    if let Some(a) = info.pick_audio() {
+        crate::mxprobe::log_public(&format!(
+            "[Player] 选中音轨: {} {} {}bps",
+            a.id, a.codecs, a.bandwidth
+        ));
+    } else {
+        crate::mxprobe::log_public("[Player] 没有可用音轨，将静音播放");
+    }
+
+    crate::mxprobe::log_public(&format!(
+        "[Player] 选中分辨率: {}x{} 编码: {}",
+        vtrack.width.unwrap_or(0),
+        vtrack.height.unwrap_or(0),
+        vtrack.codecs
+    ));
+
+    let vw = vtrack.width.unwrap_or(0) as i32;
+    let vh = vtrack.height.unwrap_or(0) as i32;
+    if let Ok(mut g) = VIDEO_SIZE.lock() {
+        *g = Some((vw, vh));
+    }
+    crate::video_surface::set_video_size(vw as u32, vh as u32);
+
+    let dur_us = info.duration.saturating_mul(1_000_000) as i64;
+    DURATION_US.store(dur_us, Ordering::SeqCst);
+    crate::mxprobe::log_public(&format!("[Player] 总时长: {}s", info.duration));
+
+    if !auto_play {
+        crate::mxprobe::log_public("[Player] 自动播放已关闭，等待用户手动起播");
+        if let Ok(mut pending) = PENDING_STREAM.lock() {
+            *pending = Some(PendingStream {
+                session: my_session,
+                bvid: bvid.clone(),
+                url: url.clone(),
+                audio_url: audio_url.clone(),
+                duration_us: dur_us,
+            });
+        }
+        let w_wait = w_clone.clone();
+        let _ = w_wait.upgrade_in_event_loop(move |w| {
+            w.set_awaiting_play(true);
+        });
+        return;
+    }
+
+    start_playback(window, my_session, bvid, url, audio_url, client, dur_us);
 }
 
 /// 真正启动播放：下载视频流 → 等 Surface → 起解码器 → 回填进度。
@@ -2141,9 +2162,31 @@ pub fn set_quality(window: slint::Weak<AppWindow>, index: i32) {
     };
 
     DESIRED_QN.store(qid, Ordering::SeqCst);
-    crate::mxprobe::log_public(&format!("[Quality] 用户选择 index={index} -> qn={qid}"));
+    QUALITY_LIST_INDEX.store(index.max(0) as u64, Ordering::SeqCst);
 
-    // 记住当前进度，重播后跳回去
+    // 持久化。重启后 start_from_playinfo 会读回下标并还原菜单选中态。
+    crate::settings::set_u64("quality_qn", qid);
+    crate::settings::set_u64("quality_index", index.max(0) as u64);
+
+    crate::mxprobe::log_public(&format!(
+        "[Quality] 用户选择 index={index} -> qn={qid}（已持久化）"
+    ));
+
+    let bvid = match CURRENT_BVID.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let Some(bvid) = bvid else {
+        crate::mxprobe::log_public("[Quality] 当前没有播放中的视频");
+        return;
+    };
+    let cid = CURRENT_CID.load(Ordering::SeqCst);
+    if cid == 0 {
+        crate::mxprobe::log_public("[Quality] 缺少 cid，无法重新请求播放地址");
+        return;
+    }
+
+    // 记住当前进度，重新起播后跳回去
     let resume_frac = {
         let dur = DURATION_US.load(Ordering::SeqCst);
         let pts = CURRENT
@@ -2159,42 +2202,82 @@ pub fn set_quality(window: slint::Weak<AppWindow>, index: i32) {
         }
     };
 
-    let bvid = match CURRENT_BVID.lock() {
-        Ok(g) => g.clone(),
-        Err(_) => None,
-    };
-    let Some(bvid) = bvid else {
-        crate::mxprobe::log_public("[Quality] 当前没有播放中的视频");
-        return;
-    };
-
     let auto = window
         .upgrade()
         .map(|w| w.get_auto_play())
         .unwrap_or(true);
 
-    // play() 内部有 stop_current()（要 join 解码线程）和
-    // cache::retain_only()（要遍历删文件），都是阻塞操作。
-    // 这里是被 UI 的清晰度菜单回调直接调用的，**不能**在 UI 线程上跑。
-    {
-        let w = window.clone();
-        std::thread::spawn(move || {
-            play(w, bvid, auto);
-        });
-    }
+    let my_session = PLAY_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
 
-    // 重播起播是异步的，等它拿到时长再 seek。
-    // 3 秒是实测够用的经验值（playurl + 首段下载 + 解码器启动）。
-    if resume_frac > 0.01 {
-        std::thread::spawn(move || {
+    // ★ 这里**不**走 play()。
+    //
+    // play() 是"从零打开一个视频"的完整流程：重置详情为"正在获取视频数据…"、
+    // 清空评论、重拉详情、重拉评论、重拉相关推荐。切个清晰度触发这一整套
+    // 完全没必要 —— 用户只是想把 720P 换成 1080P，不需要标题闪一下空白、
+    // 评论区从头加载。
+    //
+    // 真正要做的只有三件事：停旧解码器、重新请求 playurl、用新地址起播。
+    // 详情/评论/相关推荐全都保持原样。
+    //
+    // 注意依然要在后台线程：stop_current 要 join 解码线程，
+    // playurl 是网络请求，都会阻塞 UI。
+    std::thread::spawn(move || {
+        stop_current();
+
+        let client = match crate::client() {
+            Some(c) => c,
+            None => {
+                report_fail(&window, "初始化网络失败".into());
+                return;
+            }
+        };
+
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                report_fail(&window, format!("初始化运行时失败: {e}"));
+                return;
+            }
+        };
+
+        let info = match rt.block_on(client.play_url(&bvid, cid)) {
+            Ok(v) => v,
+            Err(e) => {
+                report_fail(&window, format!("获取播放地址失败: {e}"));
+                return;
+            }
+        };
+
+        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+            crate::mxprobe::log_public("[Quality] 会话已切换，放弃这次切换");
+            return;
+        }
+
+        // 切档位不重拉详情，所以要把 is_ready 清掉让封面重新垫上，
+        // 否则新流起播前会看到上一档的最后一帧停在那里。
+        let w_reset = window.clone();
+        let _ = w_reset.upgrade_in_event_loop(|w| {
+            let mut d = w.get_current_detail();
+            d.is_ready = false;
+            w.set_current_detail(d);
+            w.set_playback_started(false);
+        });
+
+        start_from_playinfo(window.clone(), my_session, bvid, client, info, auto);
+
+        // 恢复进度
+        if resume_frac > 0.01 {
             std::thread::sleep(std::time::Duration::from_secs(3));
             seek_to(resume_frac);
             crate::mxprobe::log_public(&format!(
                 "[Quality] 恢复到 {:.1}%",
                 resume_frac * 100.0
             ));
-        });
-    }
+        }
+    });
 }
 
 /// 播放 / 暂停切换。

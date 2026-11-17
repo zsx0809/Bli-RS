@@ -525,6 +525,8 @@ fn android_main(app: slint::android::AndroidApp) {
     main_window.set_set_loop_list(settings::get_bool("loop_list", false));
     main_window.set_set_pause_at_end(settings::get_bool("pause_at_end", false));
     main_window.set_set_audio_only(settings::get_bool("audio_only", false));
+    // 清晰度偏好：重启后要还原上次选的档位
+    player::restore_quality_pref();
 
     // ------------------------------------------------------------------------
     // 登录
