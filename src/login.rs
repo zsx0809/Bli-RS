@@ -58,13 +58,36 @@ fn buvid_key(mid: u64) -> String {
     format!("authbuvid.{mid}")
 }
 
-/// 取该账号的 buvid，没有就生成一个并存下来。
+/// 取该账号的 buvid，没有就分配一个。
+///
+/// 分配顺序（**不能反过来**）：
+///   1. 该账号已经有了 → 直接用
+///   2. 旧版本把 buvid 存在全局 `buvid3` 里 → **迁移过来**
+///   3. 都没有 → 生成新的
+///
+/// 第 2 步为什么重要：
+///   上一版把 buvid 做成了全局设备级，已有用户的那份就存在 `buvid3` 键下。
+///   如果这里直接生成新的，等于给这个账号又换了一次设备 ——
+///   画像刚要开始累积又被清零，前面那些功夫全废。
+///   把旧值接管过来，账号的设备身份才是连续的。
 fn ensure_account_buvid(mid: u64) -> String {
     let key = buvid_key(mid);
     let saved = crate::settings::get_string(&key);
     if !saved.is_empty() {
         return saved;
     }
+
+    // 迁移旧版全局 buvid（存在就用它，不重新生成）
+    const LEGACY_KEY: &str = "buvid3";
+    let legacy = crate::settings::get_string(LEGACY_KEY);
+    if !legacy.is_empty() {
+        crate::settings::set_string(&key, &legacy);
+        crate::mxprobe::log_public(&format!(
+            "[Buvid] 账号 {mid} 继承旧版设备标识: {legacy}"
+        ));
+        return legacy;
+    }
+
     let fresh = bli_protocol::BiliClient::random_buvid3();
     crate::settings::set_string(&key, &fresh);
     crate::mxprobe::log_public(&format!("[Buvid] 账号 {mid} 首次分配 buvid: {fresh}"));
