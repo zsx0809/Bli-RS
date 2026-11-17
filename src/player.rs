@@ -1544,9 +1544,6 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
     ));
 
     let cur_bvid = CURRENT_BVID.lock().ok().and_then(|g| g.clone());
-    // 提前取值：后面要 move window 进 play()，闭包会借住它
-    let auto_play_on = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
-
     // 四个开关在 UI 侧已经互斥，这里按"选中了哪一个"直接分派。
     //
     // 用 if/else if 而不是一堆并列 if + ||：
@@ -1557,7 +1554,14 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
         match cur_bvid {
             Some(bvid) => {
                 crate::mxprobe::log_public("[End] 单个循环：重播当前视频");
-                play(window, bvid, auto_play_on);
+                // 循环**必须**真的起播，不能尊重 auto_play。
+                //
+                // auto_play=false 的语义是"进详情页时先停在封面，等用户点播放"，
+                // 那是针对**用户主动打开新视频**的场景。
+                // 而循环是"这条播完了，再放一遍"——用户开了循环就是要它自己转，
+                // 这里如果沿用 auto_play=false，play() 只会把流暂存起来、
+                // 界面停在封面不动，用户看到的就是"循环了但没播"。
+                play(window, bvid, true);
             }
             None => crate::mxprobe::log_public("[End] 单个循环：但不知道当前 bvid，停在末尾"),
         }
@@ -1589,7 +1593,9 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
         match next {
             Some(bvid) => {
                 crate::mxprobe::log_public(&format!("[End] {kind} -> {bvid}"));
-                play(window, bvid, auto_play_on);
+                // 同「单个循环」：自动连播/列表循环是自己往下走，
+                // 不该被 auto_play 拦住（理由见上面那段注释）。
+                play(window, bvid, true);
             }
             None => {
                 crate::mxprobe::log_public(&format!("[End] {kind}：相关推荐为空，停在末尾"));
@@ -1797,6 +1803,14 @@ fn stop_current() {
         }
     }
     if let Ok(mut g) = AUDIO_CLOCK.lock() {
+        // 先 kill 再摘掉。
+        //
+        // 只置 None 是不够的：视频解码器启动时拷贝过一份 Arc，
+        // 那份拷贝不受这里影响，会继续读到冻结的时间。
+        // kill() 之后 position_us() 返回 -1，视频侧就退回内部时钟了。
+        if let Some(clk) = g.as_ref() {
+            clk.kill();
+        }
         *g = None;
     }
     if let Ok(mut g) = CURRENT_BUFFER.lock() {

@@ -126,6 +126,21 @@ pub struct PlayClock {
     sample_rate: AtomicU64,
     /// 暂停
     paused: AtomicBool,
+    /// 这条时钟是否已作废。
+    ///
+    /// ★ 为什么需要它：
+    ///
+    ///   视频解码器启动时拷贝了一份 `Arc<PlayClock>`。循环播放时
+    ///   stop_current() 只是把全局 AUDIO_CLOCK 置 None，**那份拷贝
+    ///   仍然活着**。于是新一轮视频解码器如果拿到旧时钟，会一直
+    ///   跟一个"数值冻结"的时钟比较：
+    ///     audio_pos 恒定不变（比如永远 47032ms）
+    ///     而 video_pts 在涨 → diff 永远极大 → 每帧都被判定落后
+    ///   症状正是"循环了，但画面卡住/显示停在某一点"。
+    ///
+    ///   标记失效之后，position_us() 返回 -1，视频侧据此退回
+    ///   内部时钟（按 PTS 自己走），而不是跟一具尸体对齐。
+    dead: AtomicBool,
     /// 已播放到的 PTS（微秒），由解码侧按"写入了多少"换算写入
     last_pts_us: AtomicI64,
     /// 音频轨道起始 PTS（用于对齐视频）
@@ -144,6 +159,7 @@ impl PlayClock {
             frame_bytes: AtomicU64::new(4),
             sample_rate: AtomicU64::new(48000),
             paused: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
             last_pts_us: AtomicI64::new(-1),
             base_pts_us: AtomicI64::new(0),
         })
@@ -161,6 +177,11 @@ impl PlayClock {
     /// 退路：时间戳取不到（流刚起、驱动不支持）时，用已消费字节数估算。
     /// 估算值会偏大最多一个 AAudio 内部缓冲周期，所以只作为兜底。
     pub fn position_us(&self) -> i64 {
+        // 已作废的时钟不供数。返回 -1 让视频侧退回内部时钟，
+        // 而不是跟一个冻结的值死磕（见 dead 字段的注释）。
+        if self.dead.load(Ordering::Relaxed) {
+            return -1;
+        }
         let base = self.base_pts_us.load(Ordering::Relaxed);
         let fb = self.frame_bytes.load(Ordering::Relaxed).max(1);
         let sr = self.sample_rate.load(Ordering::Relaxed).max(1);
@@ -269,6 +290,15 @@ impl PlayClock {
 
     pub fn set_paused(&self, p: bool) {
         self.paused.store(p, Ordering::Relaxed);
+    }
+
+    /// 标记这条时钟不再有效。停播 / 切视频时调用。
+    ///
+    /// 不可逆：要重新播放就建一条新的 PlayClock。
+    /// 已作废之后再改 paused / base_pts 都不会让它复活 ——
+    /// 这是刻意的，避免"复活一个半死不活的时钟"这种更难查的状态。
+    pub fn kill(&self) {
+        self.dead.store(true, Ordering::Relaxed);
     }
 
     /// 诊断用：已消费字节数的原始值

@@ -541,6 +541,10 @@ fn decode_loop(
                         //
                         // 判据：音频位置 <= 0 说明还没真正开始播放
                         // （首帧未消费 / 流被关），此时退回内部时钟。
+                        // position_us() 返回 -1 表示"这条时钟已作废"
+                        //（见 PlayClock::dead）。此时必须退回内部时钟 ——
+                        // 否则会拿一个冻结的值做比较，diff 永远极大，
+                        // 每一帧都被判"落后"而丢弃，画面就卡住了。
                         let audio_pos_opt = clock
                             .as_ref()
                             .map(|c| c.position_us())
@@ -582,10 +586,58 @@ fn decode_loop(
                                 // 上限 100ms，避免异常大间隔把线程睡死。
                                 let wait = diff_us.min(100_000) as u64;
                                 std::thread::sleep(Duration::from_micros(wait));
-                            } else if diff_us < -300_000 {
-                                // 视频落后超过 300ms：直接丢弃这一帧。
-                                // 这是"追帧"而不是"慢放"，观感更接近正常播放。
+                            } else if diff_us < -2_000_000 {
+                                // 视频落后超过 **2 秒**：逐帧丢弃已经没用了。
+                                //
+                                // 丢帧最多让视频以"解码速度"前进（一帧 33ms），
+                                // 而音频是实时走的。落后 29 秒的话，
+                                // 就算把每一帧都丢掉，也得花 29 秒的**解码时间**
+                                // 才能追上 —— 期间画面上什么都没有，进度条也不动，
+                                // 用户看到的就是"卡住了"。
+                                //
+                                // 正确做法：直接让 extractor 跳到音频当前的位置。
+                                // 代价是一次关键帧重定位（几十毫秒），
+                                // 换来瞬间对齐。
+                                crate::mxprobe::log_public(&format!(
+                                    "[AVSync] 落后 {}ms，直接跳转到音频位置",
+                                    -diff_us / 1000
+                                ));
                                 codec.release_output_buffer(buf, false).ok();
+                                if let Some(pos) = audio_pos_opt {
+                                    // 复用 seek 通道：下一轮循环会执行
+                                    // extractor.seekTo + flush + 丢帧校正
+                                    controls.request_seek(pos);
+                                }
+                                if eos {
+                                    output_done = true;
+                                    controls.mark_ended();
+                                    break;
+                                }
+                                continue;
+                            } else if diff_us < -300_000 {
+                                // 视频落后 300ms ~ 2s：跳过这一帧，快速追赶。
+                                //
+                                // ★ 这里绝不能 `continue` 跳过 EOS 处理。
+                                //
+                                //   踩过的坑：本帧带 BUFFER_FLAG_END_OF_STREAM 时，
+                                //   如果也走"丢帧 + continue"，下面那段
+                                //   `if eos { controls.mark_ended() }` 永远不会执行。
+                                //   于是解码线程自己结束了，播放器却不知道"播完了"——
+                                //   自动连播 / 循环 / 播完暂停 全部失效。
+                                //
+                                //   实际症状：音频先播完（比如 47 秒），视频还在
+                                //   慢慢追帧，进度条卡在 46 秒不动，也不循环。
+                                //
+                                //   所以丢帧要"丢完接着往下走"，让 EOS 分支照常执行。
+                                codec.release_output_buffer(buf, false).ok();
+
+                                // 这一点很关键：丢帧之后若已到流尾，直接标结束并退出，
+                                // 不要再去渲染一帧过时的画面。
+                                if eos {
+                                    output_done = true;
+                                    controls.mark_ended();
+                                    break;
+                                }
                                 continue;
                             }
                         } else {
