@@ -520,10 +520,33 @@ fn android_main(app: slint::android::AndroidApp) {
 
     // 读回持久化的播放设置
     main_window.set_auto_play(settings::get_bool("auto_play", true));
-    main_window.set_set_auto_next(settings::get_bool("auto_next", true));
-    main_window.set_set_loop_single(settings::get_bool("loop_single", false));
-    main_window.set_set_loop_list(settings::get_bool("loop_list", false));
-    main_window.set_set_pause_at_end(settings::get_bool("pause_at_end", false));
+    // 这四个是互斥的"播完之后去哪"。读盘时也要保证互斥 ——
+    // 旧版本可能把多个都写成 true（那时 UI 没有互斥逻辑），
+    // 直接全部照搬会让结束行为进入未定义的分支。
+    //
+    // 决议顺序按"优先级"来：单个循环 > 播完暂停 > 列表循环 > 自动连播。
+    // 全都没开时保持全 false（播完就停在末尾）。
+    {
+        let ls = settings::get_bool("loop_single", false);
+        let pa = settings::get_bool("pause_at_end", false);
+        let ll = settings::get_bool("loop_list", false);
+        let an = settings::get_bool("auto_next", true);
+
+        let (ls, pa, ll, an) = if ls {
+            (true, false, false, false)
+        } else if pa {
+            (false, true, false, false)
+        } else if ll {
+            (false, false, true, false)
+        } else {
+            (false, false, false, an)
+        };
+
+        main_window.set_set_loop_single(ls);
+        main_window.set_set_pause_at_end(pa);
+        main_window.set_set_loop_list(ll);
+        main_window.set_set_auto_next(an);
+    }
     main_window.set_set_audio_only(settings::get_bool("audio_only", false));
     // 清晰度偏好：重启后要还原上次选的档位
     player::restore_quality_pref();

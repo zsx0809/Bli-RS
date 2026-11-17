@@ -70,6 +70,48 @@ export component VideoDetailView inherits Rectangle {
     in-out property <bool> set_audio_only: false;   // 听视频
     callback setting_changed(string, bool);
 
+    /// 播完之后的"去向"只能有一个。
+    ///
+    /// 这四个开关描述的是同一件事的四种互斥答案：
+    ///   自动连播   → 播下一个
+    ///   单个循环   → 重播这一个
+    ///   列表循环   → 播下一个（到尾回头）
+    ///   播完暂停   → 什么都不做
+    /// 同时开两个语义就冲突了（既要重播又要暂停？），所以必须互斥。
+    ///
+    /// 「听视频」不参与互斥 —— 它管的是"要不要画面"，与播完之后去哪无关，
+    /// 可以和任意一项共存。
+    ///
+    /// 交互约定：点一个开关 = 选中它并清掉其余三个。
+    ///   再点一次已选中的那个 = 全部关掉（"播完就停"的默认行为）。
+    /// 这样既保证永远只有一个生效，又允许用户关干净。
+    function pick_exclusive(which: string) {
+        let turning_on = !(
+            (which == "auto_next" && root.set_auto_next)
+            || (which == "loop_single" && root.set_loop_single)
+            || (which == "loop_list" && root.set_loop_list)
+            || (which == "pause_at_end" && root.set_pause_at_end)
+        );
+
+        root.set_auto_next = false;
+        root.set_loop_single = false;
+        root.set_loop_list = false;
+        root.set_pause_at_end = false;
+
+        if (turning_on) {
+            if (which == "auto_next") { root.set_auto_next = true; }
+            if (which == "loop_single") { root.set_loop_single = true; }
+            if (which == "loop_list") { root.set_loop_list = true; }
+            if (which == "pause_at_end") { root.set_pause_at_end = true; }
+        }
+
+        // 四个都报一遍，保证持久化的四人组始终一致
+        root.setting_changed("auto_next", root.set_auto_next);
+        root.setting_changed("loop_single", root.set_loop_single);
+        root.setting_changed("loop_list", root.set_loop_list);
+        root.setting_changed("pause_at_end", root.set_pause_at_end);
+    }
+
     // ---- 清晰度选择 ----
     in property <[string]> quality_options: ["自动"];
     in-out property <int> quality_index: 0;
@@ -2197,10 +2239,7 @@ export component VideoDetailView inherits Rectangle {
                     }
 
                     ar_touch := TouchArea {
-                        clicked => {
-                            root.set_auto_next = !root.set_auto_next;
-                            root.setting_changed("auto_next", root.set_auto_next);
-                        }
+                        clicked => { root.pick_exclusive("auto_next"); }
                     }
                 }
 
@@ -2242,15 +2281,7 @@ export component VideoDetailView inherits Rectangle {
                     }
 
                     loop1_touch := TouchArea {
-                        clicked => {
-                            root.set_loop_single = !root.set_loop_single;
-                            // 与列表循环互斥：两个同时开语义就冲突了
-                            if (root.set_loop_single) { root.set_loop_list = false; }
-                            root.setting_changed("loop_single", root.set_loop_single);
-                            if (root.set_loop_single) {
-                                root.setting_changed("loop_list", false);
-                            }
-                        }
+                        clicked => { root.pick_exclusive("loop_single"); }
                     }
                 }
 
@@ -2292,14 +2323,7 @@ export component VideoDetailView inherits Rectangle {
                     }
 
                     loopn_touch := TouchArea {
-                        clicked => {
-                            root.set_loop_list = !root.set_loop_list;
-                            if (root.set_loop_list) { root.set_loop_single = false; }
-                            root.setting_changed("loop_list", root.set_loop_list);
-                            if (root.set_loop_list) {
-                                root.setting_changed("loop_single", false);
-                            }
-                        }
+                        clicked => { root.pick_exclusive("loop_list"); }
                     }
                 }
 
@@ -2341,10 +2365,7 @@ export component VideoDetailView inherits Rectangle {
                     }
 
                     pause_touch := TouchArea {
-                        clicked => {
-                            root.set_pause_at_end = !root.set_pause_at_end;
-                            root.setting_changed("pause_at_end", root.set_pause_at_end);
-                        }
+                        clicked => { root.pick_exclusive("pause_at_end"); }
                     }
                 }
 

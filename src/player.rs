@@ -1544,29 +1544,35 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
     ));
 
     let cur_bvid = CURRENT_BVID.lock().ok().and_then(|g| g.clone());
+    // 提前取值：后面要 move window 进 play()，闭包会借住它
+    let auto_play_on = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
 
-    // 1. 单个循环
+    // 四个开关在 UI 侧已经互斥，这里按"选中了哪一个"直接分派。
+    //
+    // 用 if/else if 而不是一堆并列 if + ||：
+    //   互斥是**约束**，不是巧合。写成并列的 `if auto_next || loop_list`
+    //   会让后来读代码的人以为这两项可以同开，进而把互斥逻辑改坏。
+    //   这里保持"只可能命中一个分支"的结构，约束在代码里可见。
     if loop_single {
-        if let Some(bvid) = cur_bvid {
-            crate::mxprobe::log_public("[End] 单个循环：重播当前视频");
-            let auto = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
-            play(window, bvid, auto);
-            return;
+        match cur_bvid {
+            Some(bvid) => {
+                crate::mxprobe::log_public("[End] 单个循环：重播当前视频");
+                play(window, bvid, auto_play_on);
+            }
+            None => crate::mxprobe::log_public("[End] 单个循环：但不知道当前 bvid，停在末尾"),
         }
-    }
-
-    // 2. 播完暂停
-    if pause_at_end {
+    } else if pause_at_end {
         crate::mxprobe::log_public("[End] 播完暂停");
         if let Some(w) = window.upgrade() {
             w.set_play_paused(true);
         }
-        return;
-    }
+    } else if auto_next || loop_list {
+        // 自动连播与列表循环行为一致（都播相关推荐第一条）；
+        // 区别只在列表循环到末尾后回头 —— 目前相关推荐是有限列表，
+        // 真到头了就停在末尾，日志会写清楚。
+        let kind = if loop_list { "列表循环" } else { "自动连播" };
 
-    // 3. 自动连播 / 列表循环：播相关推荐的第一条
-    if auto_next || loop_list {
-        // 相关推荐列表里第一条不是当前视频的那条
+        // 相关推荐里第一条不是当前视频的
         let next = RELATED_MODEL.with(|cell| {
             let m = cell.borrow();
             let m = m.as_ref()?;
@@ -1582,18 +1588,16 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
 
         match next {
             Some(bvid) => {
-                crate::mxprobe::log_public(&format!("[End] 自动连播 -> {bvid}"));
-                let auto = window.upgrade().map(|w| w.get_auto_play()).unwrap_or(true);
-                play(window, bvid, auto);
+                crate::mxprobe::log_public(&format!("[End] {kind} -> {bvid}"));
+                play(window, bvid, auto_play_on);
             }
             None => {
-                crate::mxprobe::log_public("[End] 相关推荐为空，停在末尾");
+                crate::mxprobe::log_public(&format!("[End] {kind}：相关推荐为空，停在末尾"));
             }
         }
-        return;
+    } else {
+        crate::mxprobe::log_public("[End] 未选中任何续播方式，停在末尾");
     }
-
-    crate::mxprobe::log_public("[End] 未开启任何续播设置，停在末尾");
 }
 
 /// 播放进度搬运线程：解码器 PTS → Slint 的 progress / 时间文案。
@@ -1639,7 +1643,18 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
             // 的轮询会把"自动连播"触发无数次。
             if ended && !handled_end {
                 handled_end = true;
-                on_playback_ended(window.clone());
+                // 另起线程处理"播完之后去哪"。
+                //
+                // 为什么不在这里直接调：on_playback_ended 内部可能走 play()，
+                // 而 play() 第一步就是 stop_current() —— 它要 join 视频/音频
+                // 解码线程。虽然当前线程是进度轮询线程、不是被 join 的那个，
+                // 但 stop_current 本身是阻塞的（等解码器退出可能要几百毫秒），
+                // 放在轮询线程里会拖慢它，而且后续 play 里的网络请求更久。
+                // 让轮询线程继续干它该干的事（刷进度），结束动作交给新线程。
+                let w_end = window.clone();
+                std::thread::spawn(move || {
+                    on_playback_ended(w_end);
+                });
             }
 
             // 注意：pts == 0 是**合法值**（首帧就从 0 开始），
