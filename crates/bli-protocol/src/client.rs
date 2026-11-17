@@ -282,10 +282,29 @@ impl BiliClient {
                 if a.cookie.contains("buvid3=") {
                     a.cookie.clone()
                 } else {
-                    format!("{}; buvid3={}", a.cookie, self.buvid)
+                    // 用**账号自带的** buvid，不是 client 上那个。
+                    // 已登录时 a.buvid 才是这个账号的稳定设备标识。
+                    let b = if a.buvid.is_empty() {
+                        &self.buvid
+                    } else {
+                        &a.buvid
+                    };
+                    format!("{}; buvid3={}", a.cookie, b)
                 }
             }
             _ => format!("buvid3={}", self.buvid),
+        }
+    }
+
+    /// 当前生效的 buvid：已登录用账号的，未登录用 client 的（游客）。
+    pub fn effective_buvid(&self) -> String {
+        let guard = match self.auth.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(a) if !a.buvid.is_empty() => a.buvid.clone(),
+            _ => self.buvid.clone(),
         }
     }
 
@@ -294,7 +313,7 @@ impl BiliClient {
     /// App 端接口把这个值放在 **HTTP header `buvid`** 里，而不是 cookie。
     /// 两者必须一致，否则风控会把请求与设备对不上而降级。
     pub fn buvid_string(&self) -> String {
-        self.buvid.clone()
+        self.effective_buvid()
     }
 
     /// 装入 / 清空登录态。传 None 表示退出登录。

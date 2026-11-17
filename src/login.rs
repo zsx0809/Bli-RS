@@ -44,6 +44,32 @@ static WINDOW: Mutex<Option<slint::Weak<AppWindow>>> = Mutex::new(None);
 
 const KEY_COOKIE: &str = "auth.cookie";
 const KEY_MID: &str = "auth.mid";
+/// 该账号专属的 buvid3。
+///
+/// 按 mid 分开存：`authbuvid.<mid>`。
+///
+/// 为什么必须按账号存而不是一个全局键：
+///   推荐画像是 (mid, buvid) 的组合。同一个账号在别的设备登录，
+///   服务端靠 mid 能接上历史；但如果本地每次登录都重新生成 buvid，
+///   就等于"这个账号又换了台新设备"，画像会被稀释。
+///   反过来，换个账号登录却复用上一个账号的 buvid，也会让两个账号
+///   的设备行为互相污染 —— 所以必须一个账号一份。
+fn buvid_key(mid: u64) -> String {
+    format!("authbuvid.{mid}")
+}
+
+/// 取该账号的 buvid，没有就生成一个并存下来。
+fn ensure_account_buvid(mid: u64) -> String {
+    let key = buvid_key(mid);
+    let saved = crate::settings::get_string(&key);
+    if !saved.is_empty() {
+        return saved;
+    }
+    let fresh = bli_protocol::BiliClient::random_buvid3();
+    crate::settings::set_string(&key, &fresh);
+    crate::mxprobe::log_public(&format!("[Buvid] 账号 {mid} 首次分配 buvid: {fresh}"));
+    fresh
+}
 
 /// 登记全局窗口引用（init 时调一次）。
 pub fn set_window(w: slint::Weak<AppWindow>) {
@@ -71,6 +97,10 @@ pub fn restore(client: bli_protocol::BiliClient) {
     }
 
     let mut a = Auth::from_cookie_string(&cookie);
+    // 恢复登录态时把账号绑定的 buvid 一起还原
+    if a.mid > 0 {
+        a.buvid = ensure_account_buvid(a.mid);
+    }
     if !a.is_logged_in() {
         crate::mxprobe::log_public("[Login] 已保存的 cookie 缺 bili_jct，丢弃");
         crate::settings::remove(KEY_COOKIE);
@@ -117,6 +147,28 @@ pub fn restore(client: bli_protocol::BiliClient) {
                         "[Login] 登录态有效: {} (LV{}) —— 回填 UI",
                         a.uname, a.level
                     ));
+
+                    // 这个账号的 buvid 如果是刚分配的，激活一次。
+                    //
+                    // 激活让服务端把这个 buvid 标记为"真实设备"。
+                    // 不做的话推荐引擎会把它当成来路不明的字符串，
+                    // 画像照样算不准（见 api::ACTIVATE_BUVID 的注释）。
+                    let akey = format!("authbuvid_activated.{}", a.mid);
+                    if !crate::settings::get_bool(&akey, false) {
+                        match client_for_check.activate_buvid().await {
+                            Ok(()) => {
+                                crate::settings::set_bool(&akey, true);
+                                crate::mxprobe::log_public(&format!(
+                                    "[Buvid] 账号 {} 的 buvid 已激活",
+                                    a.mid
+                                ));
+                            }
+                            Err(e) => {
+                                crate::mxprobe::log_public(&format!("[Buvid] 激活失败: {e}"));
+                            }
+                        }
+                    }
+
                     persist_and_apply(a, client_for_check);
                 }
                 Err(e) => {
@@ -147,9 +199,15 @@ pub fn restore(client: bli_protocol::BiliClient) {
 ///
 /// `window` 参数已废弃，统一用全局弱引用 —— restore() 在启动阶段
 /// 没有 AppWindow 句柄，走参数的话那条路径永远不更新 UI。
-fn persist_and_apply(a: Auth, client: bli_protocol::BiliClient) {
+fn persist_and_apply(mut a: Auth, client: bli_protocol::BiliClient) {
     crate::settings::set_string(KEY_COOKIE, &a.cookie);
     crate::settings::set_u64(KEY_MID, a.mid);
+
+    // 给这个账号挂上它自己那份 buvid。
+    // 已经登录过一次的账号会读回上次那份，画像因此能接上。
+    if a.buvid.is_empty() {
+        a.buvid = ensure_account_buvid(a.mid);
+    }
 
     // client 里的 cookie 影响所有后续请求（评论分页 / playurl 高清 / 发评论）
     client.set_auth(Some(a.clone()));

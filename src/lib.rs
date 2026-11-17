@@ -44,22 +44,23 @@ pub fn client() -> Option<bli_protocol::BiliClient> {
         return Some(c.clone());
     }
 
-    // ★ buvid 必须持久化，且首次要激活。
+    // ★ buvid 是**账号维度**的，不是设备维度。
     //
-    // 这是"推荐推的都不是一类东西"的根因：
-    //   本地随机生成的 buvid 每次启动都换新的 → 服务端每次都看到一台
-    //   全新设备 → 没有行为画像 → 只能给内容泛化的通用流。
+    // B 站的推荐画像键是 (mid, buvid)。同一个账号换设备登录，
+    // 服务端靠 mid 认出你、画像照旧 —— 前提是每个账号自己那份
+    // buvid 不被清掉。PiliPlus 为每个 Account 各存一个 cookieJar，
+    // buvid3 就在里面（用 `??=` 写入，已有值不覆盖）。
     //
-    // 两步都要做，缺一不可：
-    //   1. 存盘复用：让服务端能跨会话认出"还是这台设备"
-    //   2. 激活上报：让服务端把这个 buvid 标记为真实设备
-    //      （只持久化不激活，服务端仍然当它是来路不明的字符串）
+    // 所以这里存的是**游客的** buvid；登录之后由 login.rs 换成
+    // 该账号自己的那份（见 Auth::buvid）。两者互不干扰：
+    //   游客态 → 用这里存的 buvid
+    //   登录态 → 用账号绑定的 buvid
     const KEY_BUVID: &str = "buvid3";
     let saved = settings::get_string(KEY_BUVID);
     let (buvid, is_new) = if saved.is_empty() {
         let fresh = bli_protocol::BiliClient::random_buvid3();
         settings::set_string(KEY_BUVID, &fresh);
-        crate::mxprobe::log_public(&format!("[Buvid] 首次生成并持久化: {fresh}"));
+        crate::mxprobe::log_public(&format!("[Buvid] 游客 buvid 首次生成: {fresh}"));
         (fresh, true)
     } else {
         (saved, false)
@@ -69,7 +70,11 @@ pub fn client() -> Option<bli_protocol::BiliClient> {
         Ok(c) => {
             let _ = GLOBAL_CLIENT.set(c.clone());
 
-            // 新 buvid 要激活一次。放到后台线程，不阻塞启动。
+            // 游客 buvid 首次生成后激活一次。
+            //
+            // 注意时序：client() 是在 login::restore() **之前**调用的，
+            // 此刻还没有登录态，所以这次激活的一定是游客 buvid，
+            // 不会误激活成账号 buvid（账号的激活在 login.rs 里另做）。
             if is_new {
                 let c2 = c.clone();
                 std::thread::spawn(move || {
@@ -82,11 +87,11 @@ pub fn client() -> Option<bli_protocol::BiliClient> {
                     };
                     match rt.block_on(c2.activate_buvid()) {
                         Ok(()) => {
-                            crate::mxprobe::log_public("[Buvid] 激活请求已发出");
+                            crate::mxprobe::log_public("[Buvid] 游客 buvid 激活已发出");
                             settings::set_bool("buvid_activated", true);
                         }
                         Err(e) => {
-                            crate::mxprobe::log_public(&format!("[Buvid] 激活失败: {e}"));
+                            crate::mxprobe::log_public(&format!("[Buvid] 游客激活失败: {e}"));
                         }
                     }
                 });

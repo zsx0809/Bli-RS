@@ -59,6 +59,22 @@ pub struct Auth {
     pub is_vip: bool,
     /// 等级
     pub level: u32,
+    /// 这个账号专属的设备指纹（buvid3）。
+    ///
+    /// ★ 为什么 buvid 跟着账号走而不是全局一份：
+    ///
+    ///   B 站的推荐画像键是 (账号 mid, 设备 buvid) 这个组合。
+    ///   换设备登录同一个账号，服务端靠 mid 认出你，画像照旧 ——
+    ///   前提是**每个账号自己那份 buvid 不被清掉**。
+    ///
+    ///   PiliPlus 的做法可以印证：每个 Account 各持一个 cookieJar，
+    ///   buvid3 就存在 jar 里（见 BiliCookieJar.setBuvid3，
+    ///   用的是 `??=` —— 已有值就不覆盖）。新建账号从匿名账号
+    ///   继承初值，之后独立演化。
+    ///
+    ///   早先把 buvid 做成全局一份，等于"换账号就换设备"，
+    ///   这就是"登录完还得重新养号"的来源。
+    pub buvid: String,
 }
 
 impl Auth {
