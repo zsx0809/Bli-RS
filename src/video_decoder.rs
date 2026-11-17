@@ -188,6 +188,21 @@ impl Controls {
     }
 }
 
+/// 重同步冷却判定：距上一次重同步不足 3 秒就拒绝再跳。
+///
+/// 抽成函数是为了让调用点读起来是一句话 —— 这个条件本身承载了
+/// "防止 seek/flush 死循环"的职责，值得单独命名。
+fn resync_ok(now: std::time::Instant, last: &mut Option<std::time::Instant>) -> bool {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+    match *last {
+        Some(t) if now.duration_since(t) < COOLDOWN => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
 /// 视频解码器。持有 extractor、codec 与停止标志。
 pub struct VideoDecoder {
     stop: Arc<AtomicBool>,
@@ -401,6 +416,9 @@ fn decode_loop(
         let mut seek_drop_until_us: Option<i64> = None;
         let mut avsync_tick: u32 = 0;
         let mut aligned_once = false;
+        // 上一次"视频落后太多"重同步的时刻。用来做冷却，
+        // 防止 seek→flush→仍落后→seek 的死循环（见下面重同步分支的注释）。
+        let mut last_resync: Option<std::time::Instant> = None;
 
         while !output_done && !stop.load(Ordering::Relaxed) {
             // ---- 外部控制：暂停 ----
@@ -586,28 +604,33 @@ fn decode_loop(
                                 // 上限 100ms，避免异常大间隔把线程睡死。
                                 let wait = diff_us.min(100_000) as u64;
                                 std::thread::sleep(Duration::from_micros(wait));
-                            } else if diff_us < -2_000_000 {
-                                // 视频落后超过 **2 秒**：逐帧丢弃已经没用了。
+                            } else if diff_us < -3_000_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
+                                // 视频落后超过 3 秒：做一次**受控**的重同步。
                                 //
-                                // 丢帧最多让视频以"解码速度"前进（一帧 33ms），
-                                // 而音频是实时走的。落后 29 秒的话，
-                                // 就算把每一帧都丢掉，也得花 29 秒的**解码时间**
-                                // 才能追上 —— 期间画面上什么都没有，进度条也不动，
-                                // 用户看到的就是"卡住了"。
+                                // ★ 这里曾经写成"只要落后就 request_seek"，
+                                //   结果是一个能把 App 打死活锁：
+                                //     seek → codec.flush()（丢掉刚解出的帧）
+                                //       → 再解一点 → 仍然落后（音频实时在走）
+                                //       → 又 seek → 又 flush …
+                                //   每轮都把刚解出的帧扔掉，于是一帧都渲染不出来
+                                //   （只剩声音），同时这个循环以极高频率空转，
+                                //   把 CPU 吃满 —— 表现就是"视频不动 + 整个 App 卡死"。
                                 //
-                                // 正确做法：直接让 extractor 跳到音频当前的位置。
-                                // 代价是一次关键帧重定位（几十毫秒），
-                                // 换来瞬间对齐。
+                                //   修法是三条：
+                                //     1. 冷却时间：两次重同步至少隔 3 秒
+                                //     2. 门槛提到 3 秒（普通丢帧能追的差距不去打扰 extractor）
+                                //     3. 重同步后把内部时钟基准也清掉，
+                                //        让新落点成为新的起算点
                                 crate::mxprobe::log_public(&format!(
-                                    "[AVSync] 落后 {}ms，直接跳转到音频位置",
+                                    "[AVSync] 落后 {}ms，执行一次重同步",
                                     -diff_us / 1000
                                 ));
                                 codec.release_output_buffer(buf, false).ok();
                                 if let Some(pos) = audio_pos_opt {
-                                    // 复用 seek 通道：下一轮循环会执行
-                                    // extractor.seekTo + flush + 丢帧校正
                                     controls.request_seek(pos);
                                 }
+                                first_pts = None;
+                                start_instant = None;
                                 if eos {
                                     output_done = true;
                                     controls.mark_ended();
