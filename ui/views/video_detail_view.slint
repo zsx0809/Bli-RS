@@ -232,6 +232,16 @@ export component VideoDetailView inherits Rectangle {
     property <float> gesture_base_value: 0.0;
     property <float> gesture_base_progress: 0.0;
 
+    /// 由 Rust 侧显式写入的"首帧已送显"信号，只用于驱动下面的 changed。
+    ///
+    /// 为什么不用 `changed detail.is_ready`：
+    ///   Slint 的 `changed` 只能挂在组件自己的属性上，不支持子属性路径；
+    ///   而在本组件内写 `property <bool> x: root.detail.is_ready;` 得到的
+    ///   是派生属性，它的 changed 触发时机不可靠（取决于绑定的求值时机）。
+    ///
+    /// 所以让 Rust 在首帧回调里同时 set 这个属性，语义明确、时序可控。
+    in-out property <bool> playback_started: false;
+
     // 控制条自动隐藏
     //
     // awaiting_play 期间不休眠：那时控制条里的播放键是唯一的起播入口，
@@ -248,6 +258,23 @@ export component VideoDetailView inherits Rectangle {
     changed awaiting_play => {
         if (root.awaiting_play) {
             root.controls_visible = true;
+        }
+    }
+
+    // 首帧送达（is_ready 变 true）时重新开始计时。
+    //
+    // 为什么必须显式 restart：
+    //   自动播放关闭时，用户点播放键 → awaiting_play 立刻变 false，
+    //   controls_timer 的 running 条件里 `!awaiting_play` 这一项满足了，
+    //   但 `is_ready` 还要等首帧解码出来才变 true。Timer 的 running
+    //   是"边沿触发"的：它在这两次变化之间的某一刻已经启动过一次，
+    //   之后 is_ready 再变 true 不会让它重新从 4 秒算起 ——
+    //   结果是控制条要么早就隐了、要么卡住不隐。
+    //   实测症状就是"开始播放后控制条不自动消失"。
+    changed playback_started => {
+        if (root.playback_started) {
+            root.controls_visible = true;
+            controls_timer.restart();
         }
     }
 
@@ -848,7 +875,18 @@ export component VideoDetailView inherits Rectangle {
                         tint: play_btn.pressed ? #ffffffaa : #ffffff;
                         fill_mode: true;
                         stroke_w: 0px;
-                        commands: root.paused
+                        // 图标语义：**只有真的在播时才显示暂停键**。
+                        //
+                        // 判据是 `paused || !is_ready`：
+                        //   · 还没起播（!is_ready，例如自动播放关闭时停在封面）
+                        //     → 三角，语义是"点我开始播"
+                        //   · 已暂停 → 三角
+                        //   · 正在播 → 双竖线
+                        //
+                        // 之前只看 paused，而 paused 的初始值是 false，
+                        // 于是刚进详情页、画面还停在封面时就已经显示暂停键 ——
+                        // 用户点它"暂停"，实际却是开始播放，非常反直觉。
+                        commands: (root.paused || !root.detail.is_ready)
                             ? "M 4.5 2.5 L 14.5 8 L 4.5 13.5 Z"
                             : "M 4.5 2.5 L 7.5 2.5 L 7.5 13.5 L 4.5 13.5 Z M 10.5 2.5 L 13.5 2.5 L 13.5 13.5 L 10.5 13.5 Z";
                     }

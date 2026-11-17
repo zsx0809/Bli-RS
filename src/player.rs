@@ -294,6 +294,7 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
         w.set_app_mode(1);
         // 新视频进来先把"等待起播"清掉，避免沿用上一个视频的状态
         w.set_awaiting_play(false);
+        w.set_playback_started(false);
         let mut detail = w.get_current_detail();
         detail.bvid = bvid_initial.into();
         detail.title = "正在获取视频数据…".into();
@@ -912,6 +913,9 @@ fn start_playback(
                 let mut d = w.get_current_detail();
                 d.is_ready = true;
                 w.set_current_detail(d);
+                // 通知 UI：首帧到了，控制条该开始 4 秒倒数了。
+                // 单靠 is_ready 不可靠 —— 见 playback_started 的注释。
+                w.set_playback_started(true);
             });
         },
         move |e| {
@@ -2296,6 +2300,7 @@ fn start_pending(window: slint::Weak<AppWindow>) {
     let w_ui = window.clone();
     let _ = w_ui.upgrade_in_event_loop(move |w| {
         w.set_awaiting_play(false);
+        w.set_playback_started(false);
         let mut d = w.get_current_detail();
         d.is_ready = false;
         d.load_error = "".into();
