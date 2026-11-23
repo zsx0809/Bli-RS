@@ -218,7 +218,7 @@ export component VideoDetailView inherits Rectangle {
     // 全部是纯 UI 状态，先让交互跑通、可看、可测；
     // 真正的 seek / 调亮度 / 调音量由 Rust 侧接回调实现（见文件底部 callback）。
     // ----------------------------------------------------------------------
-    in-out property <bool> controls_visible: true;
+    in-out property <bool> controls_visible: !root.auto_play;
 
     /// 已加载好但还没起播（自动播放关闭时的状态）。
     /// 由 Rust 侧在拿到播放地址后置 true；用户点播放后置 false。
@@ -303,20 +303,10 @@ export component VideoDetailView inherits Rectangle {
         }
     }
 
-    // 首帧送达（is_ready 变 true）时重新开始计时。
-    //
-    // 为什么必须显式 restart：
-    //   自动播放关闭时，用户点播放键 → awaiting_play 立刻变 false，
-    //   controls_timer 的 running 条件里 `!awaiting_play` 这一项满足了，
-    //   但 `is_ready` 还要等首帧解码出来才变 true。Timer 的 running
-    //   是"边沿触发"的：它在这两次变化之间的某一刻已经启动过一次，
-    //   之后 is_ready 再变 true 不会让它重新从 4 秒算起 ——
-    //   结果是控制条要么早就隐了、要么卡住不隐。
-    //   实测症状就是"开始播放后控制条不自动消失"。
+    // 首帧送达时：开启自动播放直接保持控件隐藏，不遮挡画面
     changed playback_started => {
-        if (root.playback_started) {
-            root.controls_visible = true;
-            controls_timer.restart();
+        if (root.playback_started && root.auto_play) {
+            root.controls_visible = false;
         }
     }
 
@@ -558,11 +548,10 @@ export component VideoDetailView inherits Rectangle {
             respect_system_gesture: false;
 
             tap(x, y) => {
-                // 等待起播时，点画面就等于按播放键 —— 不用非得去够控制条。
-                // 这是去掉中央大播放键之后补上的手感损失：用户看到封面
-                // 第一反应就是点画面，这个入口不能没有。
+                // 等待起播时，点画面就等于按播放键起播，且控件立刻消失
                 if (root.awaiting_play) {
                     root.awaiting_play = false;
+                    root.controls_visible = false;
                     root.toggle_play();
                 } else {
                     root.controls_visible = !root.controls_visible;
@@ -908,7 +897,13 @@ export component VideoDetailView inherits Rectangle {
                     width: 64px;
                     height: 52px;
 
-                    tap(x, y) => { root.toggle_play(); }
+                    tap(x, y) => {
+                        if (root.awaiting_play) {
+                            root.awaiting_play = false;
+                            root.controls_visible = false;
+                        }
+                        root.toggle_play();
+                    }
 
                     IconBase {
                         x: (parent.width - 28px) / 2;

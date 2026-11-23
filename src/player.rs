@@ -310,8 +310,8 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
     let bvid_initial = bvid.clone();
     let _ = window.upgrade_in_event_loop(move |w| {
         w.set_app_mode(1);
-        // 新视频进来先把"等待起播"清掉，避免沿用上一个视频的状态
-        w.set_awaiting_play(false);
+        // 根据是否自动播放设置等待起播状态
+        w.set_awaiting_play(!auto_play);
         w.set_playback_started(false);
         let mut detail = w.get_current_detail();
         detail.bvid = bvid_initial.into();
@@ -1662,12 +1662,19 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
                 }
             };
 
+            let is_at_end = duration_us > 0 && pts >= duration_us.saturating_sub(600_000);
+
             // ---- 播放结束：执行用户设置的动作 ----
             //
             // 只在第一次进入时处理（handled_end 保证），否则 250ms 一次
             // 的轮询会把"自动连播"触发无数次。
-            if ended && !handled_end {
+            if (ended || is_at_end) && !handled_end {
                 handled_end = true;
+                crate::mxprobe::log_public(&format!(
+                    "[End] 触发播放结束处理 (ended={ended}, pts={}ms, dur={}ms)",
+                    pts / 1000,
+                    duration_us / 1000
+                ));
                 // 另起线程处理"播完之后去哪"。
                 //
                 // 为什么不在这里直接调：on_playback_ended 内部可能走 play()，

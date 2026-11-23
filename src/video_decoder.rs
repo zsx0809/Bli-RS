@@ -416,6 +416,7 @@ fn decode_loop(
         let mut seek_drop_until_us: Option<i64> = None;
         let mut avsync_tick: u32 = 0;
         let mut aligned_once = false;
+        let mut empty_after_input_done: u32 = 0;
         // 上一次"视频落后太多"重同步的时刻。用来做冷却，
         // 防止 seek→flush→仍落后→seek 的死循环（见下面重同步分支的注释）。
         let mut last_resync: Option<std::time::Instant> = None;
@@ -518,6 +519,16 @@ fn decode_loop(
                     let eos = buf.info().flags() & BUFFER_FLAG_END_OF_STREAM != 0;
                     let pts_us = buf.info().presentation_time_us();
 
+                    if eos {
+                        crate::mxprobe::log_public("[Decoder] 收到 BUFFER_FLAG_END_OF_STREAM，标记播放结束");
+                        codec.release_output_buffer(buf, false).ok();
+                        output_done = true;
+                        controls.mark_ended();
+                        break;
+                    }
+
+                    empty_after_input_done = 0;
+
                     // seek 落点校正：extractor 只能 seek 到关键帧，
                     // 目标时间之前的帧必须丢弃，否则会先闪回一段旧内容。
                     // render=false 让这些帧直接不进入合成器。
@@ -603,8 +614,8 @@ fn decode_loop(
                                 // 视频超前 > 10ms：精准等到该显示的时刻
                                 let wait = diff_us.min(80_000) as u64;
                                 std::thread::sleep(Duration::from_micros(wait));
-                            } else if diff_us < -2_500_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
-                                // 视频落后超过 2.5 秒：执行一次受控重同步
+                            } else if !input_done && pts_us > 1_000_000 && diff_us < -2_500_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
+                                // 视频落后超过 2.5 秒（且非流尾、非异常 0 时间戳）：执行一次受控重同步
                                 crate::mxprobe::log_public(&format!(
                                     "[AVSync] 落后 {}ms，执行一次重同步",
                                     -diff_us / 1000
@@ -683,7 +694,17 @@ fn decode_loop(
                     // 输出格式变化（首帧常见），继续即可
                 }
                 Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
-                Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
+                Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {
+                    if input_done {
+                        empty_after_input_done += 1;
+                        if empty_after_input_done >= 25 {
+                            crate::mxprobe::log_public("[Decoder] 输入已结束且无更多输出，判定播放结束");
+                            output_done = true;
+                            controls.mark_ended();
+                            break;
+                        }
+                    }
+                }
                 Err(e) => return Err(format!("dequeue_output 失败: {e:?}")),
             }
         }
