@@ -816,7 +816,7 @@ fn start_playback(
         client.clone(),
         url.clone(),
         path.clone(),
-        512_000,
+        1_500_000,
     );
 
     crate::mxprobe::log_public("[Player] 启动边下边播（AMediaDataSource 流式解码）…");
@@ -1676,12 +1676,19 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
             };
 
             let is_at_end = duration_us > 0 && pts >= duration_us.saturating_sub(600_000);
+            // 防误触保护：当收到 ended 时，必须确认当前进度真正接近片尾（距末尾 2s 内或播完 85% 以上，或未知时长），
+            // 绝不允许中途网络波动导致的异常假 EOS 误判为播放结束触发切片
+            let valid_end = is_at_end
+                || (ended
+                    && (duration_us <= 0
+                        || pts >= duration_us.saturating_sub(2_000_000)
+                        || (duration_us > 0 && pts >= duration_us * 85 / 100)));
 
             // ---- 播放结束：执行用户设置的动作 ----
             //
             // 只在第一次进入时处理（handled_end 保证），否则 250ms 一次
             // 的轮询会把"自动连播"触发无数次。
-            if (ended || is_at_end) && !handled_end {
+            if valid_end && !handled_end {
                 handled_end = true;
                 crate::mxprobe::log_public(&format!(
                     "[End] 触发播放结束处理 (ended={ended}, pts={}ms, dur={}ms)",
@@ -1692,6 +1699,12 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
                 std::thread::spawn(move || {
                     on_playback_ended(w_end);
                 });
+            } else if ended && !handled_end {
+                crate::mxprobe::log_public(&format!(
+                    "[Player] 异常提前收到 EOS (pts={}ms, dur={}ms)，忽略假结束",
+                    pts / 1000,
+                    duration_us / 1000
+                ));
             }
 
             // 注意：pts == 0 是**合法值**（首帧就从 0 开始），

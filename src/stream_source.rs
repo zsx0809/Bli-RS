@@ -119,21 +119,17 @@ impl SharedBuffer {
         self.cv.notify_all();
     }
 
-    /// 解码线程用：等 offset 起至少有 size 字节可读（或下载结束/失败）。
+    /// 解码线程用：等 offset 处至少有数据可读（或下载结束/失败）。
     ///
     /// 返回 (可用字节数, 是否已结束, 是否失败)
-    fn wait_for(&self, offset: u64, size: usize) -> (u64, bool, bool) {
-        let need = offset + size as u64;
-        let start_wait = std::time::Instant::now();
-        const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
-
+    fn wait_for(&self, offset: u64) -> (u64, bool, bool) {
         let mut s = match self.inner.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         loop {
-            // 外部主动终止或下载失败：立即退出，绝不死锁
-            if s.stopped || s.failed {
+            // 外部主动终止：立即退出
+            if s.stopped {
                 return (0, true, true);
             }
 
@@ -145,28 +141,28 @@ impl SharedBuffer {
                 }
             }
 
-            if s.available >= need {
+            // 只要 offset 后面有任何可用数据，哪怕只有 1 字节，即可返回供读取，
+            // 遵循 readAt 语义，无需死等满足整个请求 buffer
+            if s.available > offset {
                 return (s.available, false, false);
             }
+
+            // 已经读到或超过可用数据，且全片已下完 —— 这才是真正的片尾 EOF
             if s.finished {
-                // 下完了但不够 —— 这是真正的 EOF
                 return (s.available, true, false);
             }
 
-            // 超时防护：最多等待 1.5 秒，弱网或卡顿不能永久死锁底层 C 库读取
-            if start_wait.elapsed() >= MAX_WAIT {
-                return (s.available, false, false);
+            // 下载失败且已经没有更多缓冲数据
+            if s.failed {
+                return (s.available, false, true);
             }
 
             // 数据还没到，等下载线程推一把
-            let (guard, timeout) = match self.cv.wait_timeout(s, std::time::Duration::from_millis(200)) {
+            let (guard, _timeout) = match self.cv.wait_timeout(s, std::time::Duration::from_millis(250)) {
                 Ok(v) => v,
                 Err(e) => e.into_inner(),
             };
             s = guard;
-            if timeout.timed_out() && s.available < need && !s.finished && !s.stopped {
-                continue;
-            }
         }
     }
 }
@@ -190,25 +186,20 @@ unsafe extern "C" fn ds_read_at(
 ) -> isize {
     use std::os::unix::fs::FileExt;
 
-    if userdata.is_null() || buffer.is_null() {
+    if userdata.is_null() || buffer.is_null() || size == 0 {
         return -1;
     }
     let ctx = &*(userdata as *const SourceCtx);
     let offset = offset.max(0) as u64;
 
-    let (avail, finished, failed) = ctx.buf.wait_for(offset, size);
+    let (avail, finished, failed) = ctx.buf.wait_for(offset);
     if failed {
-        // 下载失败：返回 0（EOF）而不是 -1（错误）。
-        //
-        // 为什么：返回 -1 会让 AMediaExtractor 立即判定整个数据源不可用，
-        // 直接把 setDataSourceCustom 打成失败(-10000)，连已经解出来的
-        // 部分都保不住。返回 0 至少让解码器把手上已有的数据播完再结束，
-        // 比硬失败体验好。
-        return 0;
+        return -1;
     }
     if offset >= avail {
-        // 没有更多数据：下完了就是 EOF，没下完就是还没到（返回 0 让框架稍后再来）
-        return 0;
+        // 关键：只有在全片真正下载完成（finished == true）时，才允许返回 0 (EOF)！
+        // 如果文件还在边下边播中，返回 -1 告知底层暂时不可读，绝不能误报片尾导致提前触发连播！
+        return if finished { 0 } else { -1 };
     }
 
     let path = {
@@ -226,7 +217,7 @@ unsafe extern "C" fn ds_read_at(
     // 只读到"确实已写入"的部分，绝不越过 available 边界去读空洞
     let to_read = std::cmp::min(size as u64, avail - offset) as usize;
     if to_read == 0 {
-        return if finished { 0 } else { 0 };
+        return if finished { 0 } else { -1 };
     }
 
     let slice = std::slice::from_raw_parts_mut(buffer as *mut u8, to_read);
