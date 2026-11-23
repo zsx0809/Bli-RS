@@ -257,7 +257,9 @@ impl VideoDecoder {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            std::thread::spawn(move || {
+                let _ = h.join();
+            });
         }
     }
 }
@@ -638,26 +640,8 @@ fn decode_loop(
                                 // 视频超前 > 10ms：精准等到该显示的时刻
                                 let wait = diff_us.min(80_000) as u64;
                                 std::thread::sleep(Duration::from_micros(wait));
-                            } else if !input_done && pts_us > 1_000_000 && diff_us < -2_500_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
-                                // 视频落后超过 2.5 秒（且非流尾、非异常 0 时间戳）：执行一次受控重同步
-                                crate::mxprobe::log_public(&format!(
-                                    "[AVSync] 落后 {}ms，执行一次重同步",
-                                    -diff_us / 1000
-                                ));
-                                codec.release_output_buffer(buf, false).ok();
-                                if let Some(pos) = audio_pos_opt {
-                                    controls.request_seek(pos);
-                                }
-                                first_pts = None;
-                                start_instant = None;
-                                if eos {
-                                    output_done = true;
-                                    controls.mark_ended();
-                                    break;
-                                }
-                                continue;
                             } else if diff_us < -120_000 {
-                                // 视频落后超过 120ms（约 3~4 帧）：跳过这一帧快速追平，杜绝持续落后 150ms 播完的死区
+                                // 视频落后超过 120ms：跳过当前帧快速追平，绝不盲目向未下载未来区域执行 seek（防止 readAt 卡死）
                                 codec.release_output_buffer(buf, false).ok();
 
                                 // 丢帧之后若已到流尾，直接标结束并退出

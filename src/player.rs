@@ -1858,7 +1858,9 @@ fn stop_current() {
         *g = None;
     }
     if let Ok(mut g) = CURRENT_BUFFER.lock() {
-        *g = None;
+        if let Some(buf) = g.take() {
+            buf.cancel();
+        }
     }
 }
 

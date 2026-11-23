@@ -52,6 +52,8 @@ struct BufState {
     finished: bool,
     /// 下载是否失败（失败后 readAt 返回错误而不是一直等）
     failed: bool,
+    /// 外部主动取消或停止播放
+    stopped: bool,
     /// 最终总长度（finished 后有效；未知时为 None）
     total: Option<u64>,
     /// 落盘文件路径
@@ -67,11 +69,20 @@ impl SharedBuffer {
                 available: 0,
                 finished: false,
                 failed: false,
+                stopped: false,
                 total: None,
                 path,
             }),
             cv: Condvar::new(),
         })
+    }
+
+    /// 外部主动取消：退出播放 / 切换视频时唤醒所有等待者，防止解码线程卡死在 readAt
+    pub fn cancel(&self) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.stopped = true;
+        }
+        self.cv.notify_all();
     }
 
     /// 当前已可读字节数（下载线程用于计算增量）
@@ -113,17 +124,20 @@ impl SharedBuffer {
     /// 返回 (可用字节数, 是否已结束, 是否失败)
     fn wait_for(&self, offset: u64, size: usize) -> (u64, bool, bool) {
         let need = offset + size as u64;
+        let start_wait = std::time::Instant::now();
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
         let mut s = match self.inner.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         loop {
-            // 以**实际文件大小**为准，而不是下载线程上报的计数。
-            //
-            // 为什么：下载线程是按 chunk 写入的，但 reqwest 的 chunk 边界
-            // 和"已 flush 到磁盘"的时刻并不一致；而且续传重试时会有
-            // 多个写入阶段。直接 stat 文件既简单又不会漏。
-            // 这条也自动解决了"下载线程还没来得及 advance"的时序问题。
+            // 外部主动终止或下载失败：立即退出，绝不死锁
+            if s.stopped || s.failed {
+                return (0, true, true);
+            }
+
+            // 以实际文件大小为准
             if let Ok(meta) = std::fs::metadata(&s.path) {
                 let real = meta.len();
                 if real > s.available {
@@ -131,9 +145,6 @@ impl SharedBuffer {
                 }
             }
 
-            if s.failed {
-                return (0, true, true);
-            }
             if s.available >= need {
                 return (s.available, false, false);
             }
@@ -141,15 +152,19 @@ impl SharedBuffer {
                 // 下完了但不够 —— 这是真正的 EOF
                 return (s.available, true, false);
             }
-            // 数据还没到，等下载线程推一把。
-            // 用 wait_timeout 而不是 wait：防止下载线程意外死掉时永久挂起。
+
+            // 超时防护：最多等待 1.5 秒，弱网或卡顿不能永久死锁底层 C 库读取
+            if start_wait.elapsed() >= MAX_WAIT {
+                return (s.available, false, false);
+            }
+
+            // 数据还没到，等下载线程推一把
             let (guard, timeout) = match self.cv.wait_timeout(s, std::time::Duration::from_millis(200)) {
                 Ok(v) => v,
                 Err(e) => e.into_inner(),
             };
             s = guard;
-            if timeout.timed_out() && s.available < need && !s.finished {
-                // 超时一次不算失败，继续循环等 —— 弱网下大块读取可能很慢
+            if timeout.timed_out() && s.available < need && !s.finished && !s.stopped {
                 continue;
             }
         }

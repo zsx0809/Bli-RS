@@ -87,7 +87,9 @@ impl AudioDecoder {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            std::thread::spawn(move || {
+                let _ = h.join();
+            });
         }
     }
 }
