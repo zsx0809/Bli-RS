@@ -71,13 +71,18 @@ def api(path, token, method="GET", raw=False):
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = r.read()
-            return data if raw else json.loads(data)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:500]
-        sys.exit(f"[!] GitHub API {path} -> {e.code}\n{body}")
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+                return data if raw else json.loads(data)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:500]
+            sys.exit(f"[!] GitHub API {path} -> {e.code}\n{body}")
+        except Exception as e:
+            if attempt == 4:
+                sys.exit(f"[!] GitHub API {path} 失败: {e}")
+            time.sleep(3)
 
 
 def latest_run(owner, repo, token):

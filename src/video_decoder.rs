@@ -544,6 +544,30 @@ fn decode_loop(
                         ));
                     }
 
+                    // 【首帧绝对保护】
+                    // 无论此时音频跑了多久，首帧必须立即强制送显渲染（render=true），
+                    // 绝对不可被任何 AVSync 追帧判定或 drop 丢弃！
+                    // 这是破除封面遮挡与黑屏、让视频第一帧秒级上屏的核心保证！
+                    if !first_frame_sent {
+                        first_frame_sent = true;
+                        codec.release_output_buffer(buf, true).ok();
+                        if pts_us >= 0 {
+                            controls.last_pts_us.store(pts_us, Ordering::Relaxed);
+                        }
+                        if let Some(cb) = on_first_frame.take() {
+                            cb();
+                        }
+                        crate::mxprobe::log_public(&format!(
+                            "[Decoder] 首帧成功强制送显并通知 UI, pts={}ms",
+                            pts_us / 1000
+                        ));
+                        if eos {
+                            output_done = true;
+                            controls.mark_ended();
+                        }
+                        continue;
+                    }
+
                     // ==================================================
                     // 音画同步：以音频时钟为基准
                     // ==================================================

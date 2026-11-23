@@ -870,10 +870,7 @@ fn start_playback(
     //
     // 「听视频」开着时不显示画面。解码器照常起（音频要靠它），
     // 只是视频层保持透明。
-    let audio_only = w_clone
-        .upgrade()
-        .map(|w| w.get_set_audio_only())
-        .unwrap_or(false);
+    let audio_only = crate::settings::get_bool("audio_only", false);
     if audio_only {
         crate::mxprobe::log_public("[AudioOnly] 听视频模式：不显示画面");
     } else {
@@ -895,14 +892,6 @@ fn start_playback(
         }
 
         // ---- 按音轨真实格式打开 AAudio ----
-        //
-        // 这一步曾经写死成 48k/2ch，注释还写着"AAudio 会自动重采样"——
-        // 那是错的。AAudio 不做隐式重采样：按什么速率打开，就按什么速率
-        // 把字节播出去。B 站 DASH 的 AAC 有 44100 和 48000 两种，
-        // 喂 44.1k 的数据给 48k 的流 → 快 8.8%、音调偏高、周期性欠载爆音。
-        //
-        // 症状正好就是用户报的"时不时有杂音" + "有的视频音画极度不同步"：
-        // 取决于那个视频的音轨恰好是哪种采样率。
         let (sr, ch) = crate::audio_decoder::probe_format(abuf.clone());
         crate::mxprobe::log_public(&format!("[Audio] 按真实格式打开输出: {sr}Hz {ch}ch"));
 
@@ -911,10 +900,13 @@ fn start_playback(
                 let ao = std::sync::Arc::new(ao);
                 let clock = ao.clock.clone();
 
+                // 初始让音频处于对齐等待状态，等视频第一帧上屏时解除暂停，音画绝对同步齐发
+                if !audio_only {
+                    clock.set_paused(true);
+                }
+
                 let a_err = move |e: String| {
                     crate::mxprobe::log_public(&format!("[Audio] 解码失败: {e}"));
-                    // 音频失败不打断视频播放，只记日志。
-                    // 宁可静音也不能因为音频问题让整个视频崩掉。
                 };
 
                 let adec = crate::audio_decoder::AudioDecoder::start(abuf, ao.clone(), a_err);
@@ -945,18 +937,20 @@ fn start_playback(
     }
 
     crate::mxprobe::log_public(&format!("[Player] 启动解码器: session={my_session}, path={path_str}"));
+    let clock_for_first_frame = shared_clock.clone();
     let dec = crate::video_decoder::VideoDecoder::start(
         buffer,
-        shared_clock,
+        shared_clock.clone(),
         surface,
         move || {
-            crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图");
+            crate::mxprobe::log_public("[Player] 首帧成功送显，通知 UI 淡出封面占位图，音频同步开跑");
+            if let Some(ref clk) = clock_for_first_frame {
+                clk.set_paused(false);
+            }
             let _ = w_ready.upgrade_in_event_loop(|w| {
                 let mut d = w.get_current_detail();
                 d.is_ready = true;
                 w.set_current_detail(d);
-                // 通知 UI：首帧到了，控制条该开始 4 秒倒数了。
-                // 单靠 is_ready 不可靠 —— 见 playback_started 的注释。
                 w.set_playback_started(true);
             });
         },
@@ -965,6 +959,15 @@ fn start_playback(
             report_fail(&w_err, format!("视频解码失败: {e}"));
         },
     );
+
+    // 音频超时兜底：最多等视频首帧 1.5 秒，若视频首帧仍未解出，自动恢复音频播放
+    if let Some(ref clk) = shared_clock {
+        let clk_timeout = clk.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            clk_timeout.set_paused(false);
+        });
+    }
 
     if let Ok(mut cur) = CURRENT.lock() {
         *cur = Some(dec);
@@ -1656,6 +1659,7 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
 
     std::thread::spawn(move || {
         let mut handled_end = false;
+        let mut poller_notified_ready = false;
         loop {
             if PLAY_SESSION.load(Ordering::SeqCst) != session {
                 return;
@@ -1684,14 +1688,6 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
                     pts / 1000,
                     duration_us / 1000
                 ));
-                // 另起线程处理"播完之后去哪"。
-                //
-                // 为什么不在这里直接调：on_playback_ended 内部可能走 play()，
-                // 而 play() 第一步就是 stop_current() —— 它要 join 视频/音频
-                // 解码线程。虽然当前线程是进度轮询线程、不是被 join 的那个，
-                // 但 stop_current 本身是阻塞的（等解码器退出可能要几百毫秒），
-                // 放在轮询线程里会拖慢它，而且后续 play 里的网络请求更久。
-                // 让轮询线程继续干它该干的事（刷进度），结束动作交给新线程。
                 let w_end = window.clone();
                 std::thread::spawn(move || {
                     on_playback_ended(w_end);
@@ -1699,12 +1695,25 @@ fn spawn_progress_poller(window: slint::Weak<AppWindow>, session: u64, duration_
             }
 
             // 注意：pts == 0 是**合法值**（首帧就从 0 开始），
-            // 不能像之前那样 `pts <= 0` 直接跳过 —— 那会让进度条在
-            // 开播后的前若干帧一直停在 0，看起来像没在走。
             // 只有负数才是"还没有数据"，那才跳过。
             if pts < 0 {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
+            }
+
+            // 【UI 封面淡出兜底保障】
+            // 只要已经产生非负有效 PTS（解码器正在出帧），若 UI 侧封面还没淡出，主动补位触发
+            if !poller_notified_ready {
+                poller_notified_ready = true;
+                let w_ready = window.clone();
+                let _ = w_ready.upgrade_in_event_loop(|ui| {
+                    let mut d = ui.get_current_detail();
+                    if !d.is_ready {
+                        d.is_ready = true;
+                        ui.set_current_detail(d);
+                    }
+                    ui.set_playback_started(true);
+                });
             }
 
             let frac = (pts as f64 / duration_us as f64).clamp(0.0, 1.0) as f32;

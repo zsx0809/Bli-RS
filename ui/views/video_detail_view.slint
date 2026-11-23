@@ -530,7 +530,7 @@ export component VideoDetailView inherits Rectangle {
             width: 100%;
             height: 100%;
             image-fit: cover;
-            opacity: root.detail.is_ready ? 0 : 1;
+            opacity: (root.detail.is_ready || root.playback_started) ? 0 : 1;
             animate opacity { duration: 240ms; }
         }
 
