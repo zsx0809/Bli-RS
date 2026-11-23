@@ -218,6 +218,7 @@ export component VideoDetailView inherits Rectangle {
     // 全部是纯 UI 状态，先让交互跑通、可看、可测；
     // 真正的 seek / 调亮度 / 调音量由 Rust 侧接回调实现（见文件底部 callback）。
     // ----------------------------------------------------------------------
+    in property <bool> auto_play: true;
     in-out property <bool> controls_visible: !root.auto_play;
 
     /// 已加载好但还没起播（自动播放关闭时的状态）。

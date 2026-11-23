@@ -523,6 +523,7 @@ export component AppWindow inherits Window {
         // 播放交互 → Rust。0.0~1.0 归一化值，具体落地在 player 模块。
         awaiting_play: root.awaiting_play;
         playback_started: root.playback_started;
+        auto_play: root.auto_play;
         paused: root.play_paused;
         is_fullscreen <=> root.is_fullscreen;
         toggle_fullscreen => {
