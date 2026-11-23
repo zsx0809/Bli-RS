@@ -195,11 +195,15 @@ pub fn restore(client: bli_protocol::BiliClient) {
                     persist_and_apply(a, client_for_check);
                 }
                 Err(e) => {
-                    crate::mxprobe::log_public(&format!("[Login] 登录态已失效（{e}），清除"));
-                    crate::settings::remove(KEY_COOKIE);
-                    // 校验失败要把刚装进去的坏 cookie 摘掉，
-                    // 否则后续请求会一直被风控额外关注
-                    client_for_check.set_auth(None);
+                    let err_str = e.to_string();
+                    if err_str.contains("未登录") || err_str.contains("-101") {
+                        crate::mxprobe::log_public(&format!("[Login] 登录态已确认失效（{e}），清除"));
+                        crate::settings::remove(KEY_COOKIE);
+                        client_for_check.set_auth(None);
+                    } else {
+                        crate::mxprobe::log_public(&format!("[Login] 校验网络抖动（{e}），保留本地凭据继续使用"));
+                        persist_and_apply(a, client_for_check);
+                    }
                 }
             }
         });
