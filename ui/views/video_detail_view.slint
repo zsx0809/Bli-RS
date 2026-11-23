@@ -304,6 +304,14 @@ export component VideoDetailView inherits Rectangle {
         }
     }
 
+    changed auto_play => {
+        root.controls_visible = !root.auto_play;
+    }
+
+    changed detail => {
+        root.controls_visible = !root.auto_play;
+    }
+
     // 首帧送达时：开启自动播放直接保持控件隐藏，不遮挡画面
     changed playback_started => {
         if (root.playback_started && root.auto_play) {

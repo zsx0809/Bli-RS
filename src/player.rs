@@ -288,6 +288,17 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
     // 新会话先把时长清零：seek 在时长未知时会安全忽略，
     // 总比拿上一个视频的时长算出一个荒谬的跳转点强。
     DURATION_US.store(0, Ordering::SeqCst);
+    if let Ok(mut g) = CURRENT_BVID.lock() {
+        *g = Some(bvid.clone());
+    }
+    if let Ok(mut h) = PLAYED_HISTORY.lock() {
+        if !h.contains(&bvid) {
+            if h.len() > 50 {
+                h.remove(0);
+            }
+            h.push(bvid.clone());
+        }
+    }
 
     // 清理上一个视频的流缓存 —— 必须在 stop_current() **之后**：
     // 解码器持有文件，不关掉删不掉（Linux 下 unlink 虽然能成功，
@@ -479,109 +490,108 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
 
         // 3.3 拉取相关视频推荐
         let rel_res = rt.block_on(client.related_videos(&bvid));
-        if let Ok(related_list) = rel_res {
-            let raw_rel: Vec<RawRelated> = related_list
-                .into_iter()
-                .map(|r| RawRelated {
-                    bvid: r.bvid,
-                    title: r.title,
-                    author: r.author,
-                    views: r.views,
-                    danmaku: r.danmaku,
-                    duration: r.duration,
-                    cover_url: r.cover_url,
-                })
-                .collect();
-
-            // 存一份全局纯数据，供后台轮询线程自动连播时安全访问
-            if let Ok(mut g) = CURRENT_RELATED.lock() {
-                *g = raw_rel.clone();
-            }
-
-            // 相关推荐的封面：**全部**都要下。
-            //
-            // 之前是 .take(12) —— 那是「详情页推荐流只有十来个封面、
-            // 剩下的全是灰块」的直接原因。当时大概是想着「先下够首屏」，
-            // 但推荐列表本来就只有二三十条，省这点请求毫无意义，
-            // 反而让人以为列表坏了。
-            //
-            // 现在改成全部交给 cover 模块的并发加载器（6 路并发 + 磁盘缓存），
-            // 首屏那次进详情页会把整列都填满；第二次进同一个视频时
-            // 全部命中本地缓存，一个网络请求都不发。
-            // 封面清单必须在 raw_rel 被 move 进下面那个闭包**之前**取出来
-            let cover_items: Vec<(String, String)> = raw_rel
-                .iter()
-                .filter(|r| !r.cover_url.is_empty())
-                .map(|r| (r.bvid.clone(), r.cover_url.clone()))
-                .collect();
-
-            let w_rel = w_clone.clone();
-            let _ = w_rel.upgrade_in_event_loop(move |w| {
-                let ui_list: Vec<RelatedVideoData> = raw_rel
+        match rel_res {
+            Ok(related_list) => {
+                crate::mxprobe::log_public(&format!(
+                    "[Player] 成功获取相关推荐，共 {} 条",
+                    related_list.len()
+                ));
+                let raw_rel: Vec<RawRelated> = related_list
                     .into_iter()
-                    .map(|r| RelatedVideoData {
-                        bvid: r.bvid.as_str().into(),
-                        title: r.title.as_str().into(),
-                        author: r.author.as_str().into(),
-                        views: r.views.as_str().into(),
-                        danmaku: r.danmaku.as_str().into(),
-                        duration: r.duration.as_str().into(),
-                        cover: Image::default(),
-                        cover_url: r.cover_url.as_str().into(),
+                    .map(|r| RawRelated {
+                        bvid: r.bvid,
+                        title: r.title,
+                        author: r.author,
+                        views: r.views,
+                        danmaku: r.danmaku,
+                        duration: r.duration,
+                        cover_url: r.cover_url,
                     })
                     .collect();
 
-                let model = Rc::new(VecModel::from(ui_list));
-                w.set_related_videos(ModelRc::new(model.clone()));
-                RELATED_MODEL.with(|m| *m.borrow_mut() = Some(model));
-            });
+                // 存一份全局纯数据，供后台轮询线程自动连播时安全访问
+                if let Ok(mut g) = CURRENT_RELATED.lock() {
+                    *g = raw_rel.clone();
+                }
 
-            // 下载 + 回填。
-            //
-            // 走 cover 模块的统一加载器，而不是自己串行循环：
-            //   · 6 路并发，二三十张图从「一张一张慢慢出」变成整屏齐出
-            //   · 自带磁盘缓存，重复进同一个视频零请求
-            //   · 解码出来的 RGBA 通过 channel 回到 UI 线程再建 Image
-            //     （Image 非 Send，绝不能在下载线程里构造）
-            //
-            // 回填按 bvid 找行号，而不是假定「下载完成顺序 == 列表顺序」——
-            // 并发下载的完成顺序是乱的，按下标写会串图。
-            if !cover_items.is_empty() {
-                let (tx, rx) = std::sync::mpsc::channel::<crate::cover::DecodedCover>();
-                crate::cover::spawn_cover_loader(cover_items, tx);
+                // 相关推荐的封面：**全部**都要下。
+                //
+                // 之前是 .take(12) —— 那是「详情页推荐流只有十来个封面、
+                // 剩下的全是灰块」的直接原因。当时大概是想着「先下够首屏」，
+                // 但推荐列表本来就只有二三十条，省这点请求毫无意义，
+                // 反而让人以为列表坏了。
+                //
+                // 现在改成全部交给 cover 模块的并发加载器（6 路并发 + 磁盘缓存），
+                // 首屏那次进详情页会把整列都填满；第二次进同一个视频时
+                // 全部命中本地缓存，一个网络请求都不发。
+                // 封面清单必须在 raw_rel 被 move 进下面那个闭包**之前**取出来
+                let cover_items: Vec<(String, String)> = raw_rel
+                    .iter()
+                    .filter(|r| !r.cover_url.is_empty())
+                    .map(|r| (r.bvid.clone(), r.cover_url.clone()))
+                    .collect();
 
-                let w_cov_ui = w_clone.clone();
-                std::thread::spawn(move || {
-                    for d in rx {
-                        if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
-                            return;
-                        }
-                        let w_ui = w_cov_ui.clone();
-                        let bvid = d.bvid.clone();
+                let w_rel = w_clone.clone();
+                let _ = w_rel.upgrade_in_event_loop(move |w| {
+                    let ui_list: Vec<RelatedVideoData> = raw_rel
+                        .into_iter()
+                        .map(|r| RelatedVideoData {
+                            bvid: r.bvid.as_str().into(),
+                            title: r.title.as_str().into(),
+                            author: r.author.as_str().into(),
+                            views: r.views.as_str().into(),
+                            danmaku: r.danmaku.as_str().into(),
+                            duration: r.duration.as_str().into(),
+                            cover: Image::default(),
+                            cover_url: r.cover_url.as_str().into(),
+                        })
+                        .collect();
 
-                        let _ = w_ui.upgrade_in_event_loop(move |_| {
-                            RELATED_MODEL.with(|cell| {
-                                let Some(ref m) = *cell.borrow() else {
-                                    return;
-                                };
-                                for i in 0..m.row_count() {
-                                    let Some(mut row) = m.row_data(i) else {
-                                        continue;
-                                    };
-                                    if row.bvid.as_str() != bvid {
-                                        continue;
-                                    }
-                                    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                                        &d.rgba, d.width, d.height,
-                                    );
-                                    row.cover = Image::from_rgba8(buf);
-                                    m.set_row_data(i, row);
-                                    break;
-                                }
-                            });
-                        });
-                    }
+                    let model = Rc::new(VecModel::from(ui_list));
+                    w.set_related_videos(ModelRc::new(model.clone()));
+                    RELATED_MODEL.with(|m| *m.borrow_mut() = Some(model));
                 });
+
+                if !cover_items.is_empty() {
+                    let (tx, rx) = std::sync::mpsc::channel::<crate::cover::DecodedCover>();
+                    crate::cover::spawn_cover_loader(cover_items, tx);
+
+                    let w_cov_ui = w_clone.clone();
+                    std::thread::spawn(move || {
+                        for d in rx {
+                            if PLAY_SESSION.load(Ordering::SeqCst) != my_session {
+                                return;
+                            }
+                            let w_ui = w_cov_ui.clone();
+                            let bvid = d.bvid.clone();
+
+                            let _ = w_ui.upgrade_in_event_loop(move |_| {
+                                RELATED_MODEL.with(|cell| {
+                                    let Some(ref m) = *cell.borrow() else {
+                                        return;
+                                    };
+                                    for i in 0..m.row_count() {
+                                        let Some(mut row) = m.row_data(i) else {
+                                            continue;
+                                        };
+                                        if row.bvid.as_str() != bvid {
+                                            continue;
+                                        }
+                                        let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                                            &d.rgba, d.width, d.height,
+                                        );
+                                        row.cover = Image::from_rgba8(buf);
+                                        m.set_row_data(i, row);
+                                        break;
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                crate::mxprobe::log_public(&format!("[Player] 获取相关推荐失败: {e}"));
             }
         }
 
@@ -1540,15 +1550,10 @@ fn spawn_stream_download(
 ///   用户开了循环就是想反复看这一个，这时还跳下一个明显违背意图。
 ///   UI 侧已经让 loop_single / loop_list 互斥，这里只处理优先级。
 fn on_playback_ended(window: slint::Weak<AppWindow>) {
-    let (loop_single, loop_list, pause_at_end, auto_next) = match window.upgrade() {
-        Some(w) => (
-            w.get_set_loop_single(),
-            w.get_set_loop_list(),
-            w.get_set_pause_at_end(),
-            w.get_set_auto_next(),
-        ),
-        None => return,
-    };
+    let loop_single = crate::settings::get_bool("loop_single", false);
+    let loop_list = crate::settings::get_bool("loop_list", false);
+    let pause_at_end = crate::settings::get_bool("pause_at_end", false);
+    let auto_next = crate::settings::get_bool("auto_next", true);
 
     crate::mxprobe::log_public(&format!(
         "[End] 播放结束 loop_single={loop_single} loop_list={loop_list} pause={pause_at_end} auto_next={auto_next}"
@@ -1566,26 +1571,30 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
             Some(bvid) => {
                 crate::mxprobe::log_public("[End] 单个循环：重播当前视频");
                 // 循环**必须**真的起播，不能尊重 auto_play。
-                //
-                // auto_play=false 的语义是"进详情页时先停在封面，等用户点播放"，
-                // 那是针对**用户主动打开新视频**的场景。
-                // 而循环是"这条播完了，再放一遍"——用户开了循环就是要它自己转，
-                // 这里如果沿用 auto_play=false，play() 只会把流暂存起来、
-                // 界面停在封面不动，用户看到的就是"循环了但没播"。
                 play(window, bvid, true);
             }
             None => crate::mxprobe::log_public("[End] 单个循环：但不知道当前 bvid，停在末尾"),
         }
     } else if pause_at_end {
         crate::mxprobe::log_public("[End] 播完暂停");
-        if let Some(w) = window.upgrade() {
+        let _ = window.upgrade_in_event_loop(|w| {
             w.set_play_paused(true);
-        }
+        });
     } else if auto_next || loop_list {
         let kind = if loop_list { "列表循环" } else { "自动连播" };
 
         let candidate_bvid = {
-            let list = CURRENT_RELATED.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            let mut list = CURRENT_RELATED.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            // 如果相关推荐列表还没准备好，最多等待 1.5 秒
+            if list.is_empty() {
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    list = CURRENT_RELATED.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    if !list.is_empty() {
+                        break;
+                    }
+                }
+            }
             let history = PLAYED_HISTORY.lock().ok().map(|g| g.clone()).unwrap_or_default();
 
             // 优先找：非当前视频，且不在已播历史里的第一个
