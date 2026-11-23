@@ -391,7 +391,15 @@ fn decode_loop(
                     }
                 }
                 Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
-                    crate::mxprobe::log_public("[Audio] 输出格式变化");
+                    let mut new_fmt = codec.output_format();
+                    let new_sr = new_fmt.i32("sample-rate").unwrap_or(0);
+                    let new_ch = new_fmt.i32("channel-count").unwrap_or(0);
+                    crate::mxprobe::log_public(&format!(
+                        "[Audio] 输出格式变化: sample-rate={new_sr} channels={new_ch}"
+                    ));
+                    if new_sr > 0 && new_ch > 0 {
+                        output.clock.set_format(new_sr as u32, new_ch as u32, 2);
+                    }
                 }
                 Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
                 Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}

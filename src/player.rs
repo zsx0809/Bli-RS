@@ -86,6 +86,11 @@ thread_local! {
     static RELATED_MODEL: RefCell<Option<Rc<VecModel<RelatedVideoData>>>> = const { RefCell::new(None) };
 }
 
+/// 全局纯数据相关推荐列表（跨线程安全，自动连播用它避免 thread_local 无法访问）
+static CURRENT_RELATED: Mutex<Vec<RawRelated>> = Mutex::new(Vec::new());
+/// 已连播历史（防止两视频相互推荐陷入死循环）
+static PLAYED_HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// 纯数据详情包装，满足跨线程 Send 契约
 struct RawDetail {
     bvid: String,
@@ -105,6 +110,7 @@ struct RawDetail {
 }
 
 /// 纯数据相关视频包装
+#[derive(Clone)]
 struct RawRelated {
     bvid: String,
     title: String,
@@ -486,6 +492,11 @@ pub fn play(window: slint::Weak<AppWindow>, bvid: String, auto_play: bool) {
                     cover_url: r.cover_url,
                 })
                 .collect();
+
+            // 存一份全局纯数据，供后台轮询线程自动连播时安全访问
+            if let Ok(mut g) = CURRENT_RELATED.lock() {
+                *g = raw_rel.clone();
+            }
 
             // 相关推荐的封面：**全部**都要下。
             //
@@ -1571,31 +1582,39 @@ fn on_playback_ended(window: slint::Weak<AppWindow>) {
             w.set_play_paused(true);
         }
     } else if auto_next || loop_list {
-        // 自动连播与列表循环行为一致（都播相关推荐第一条）；
-        // 区别只在列表循环到末尾后回头 —— 目前相关推荐是有限列表，
-        // 真到头了就停在末尾，日志会写清楚。
         let kind = if loop_list { "列表循环" } else { "自动连播" };
 
-        // 相关推荐里第一条不是当前视频的
-        let next = RELATED_MODEL.with(|cell| {
-            let m = cell.borrow();
-            let m = m.as_ref()?;
-            for i in 0..m.row_count() {
-                let row = m.row_data(i)?;
-                let bvid = row.bvid.to_string();
-                if Some(&bvid) != cur_bvid.as_ref() && !bvid.is_empty() {
-                    return Some(bvid);
-                }
-            }
-            None
-        });
+        let candidate_bvid = {
+            let list = CURRENT_RELATED.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            let history = PLAYED_HISTORY.lock().ok().map(|g| g.clone()).unwrap_or_default();
 
-        match next {
-            Some(bvid) => {
-                crate::mxprobe::log_public(&format!("[End] {kind} -> {bvid}"));
-                // 同「单个循环」：自动连播/列表循环是自己往下走，
-                // 不该被 auto_play 拦住（理由见上面那段注释）。
-                play(window, bvid, true);
+            // 优先找：非当前视频，且不在已播历史里的第一个
+            let unplayed = list.iter().find(|r| {
+                Some(&r.bvid) != cur_bvid.as_ref() && !r.bvid.is_empty() && !history.contains(&r.bvid)
+            });
+
+            if let Some(r) = unplayed {
+                Some(r.bvid.clone())
+            } else if loop_list || auto_next {
+                // 如果全都播过了，或者开启了列表循环：找非当前视频的第一个
+                list.iter()
+                    .find(|r| Some(&r.bvid) != cur_bvid.as_ref() && !r.bvid.is_empty())
+                    .map(|r| r.bvid.clone())
+            } else {
+                None
+            }
+        };
+
+        match candidate_bvid {
+            Some(next_bvid) => {
+                crate::mxprobe::log_public(&format!("[End] {kind} -> {next_bvid}"));
+                if let Ok(mut h) = PLAYED_HISTORY.lock() {
+                    if h.len() > 50 {
+                        h.remove(0);
+                    }
+                    h.push(next_bvid.clone());
+                }
+                play(window, next_bvid, true);
             }
             None => {
                 crate::mxprobe::log_public(&format!("[End] {kind}：相关推荐为空，停在末尾"));

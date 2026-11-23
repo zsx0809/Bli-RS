@@ -101,6 +101,8 @@ pub struct PlayClock {
     /// AAudioStream_getTimestamp 返回的是**硬件侧已播放帧数**，
     /// 这才是唯一准确的播放位置。
     hw_frames: AtomicI64,
+    /// 硬件时间戳对应的纳秒基准 (CLOCK_MONOTONIC)
+    hw_time_ns: AtomicI64,
     /// 硬件帧数的**基线**：seek 那一刻已经播到的帧数。
     ///
     /// 为什么必须有它：AAudioStream_getTimestamp 返回的 frame_position
@@ -147,12 +149,32 @@ pub struct PlayClock {
     base_pts_us: AtomicI64,
 }
 
+fn monotonic_nanos() -> i64 {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+    }
+    const CLOCK_MONOTONIC: i32 = 1;
+
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec)
+}
+
 impl PlayClock {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             written_bytes: AtomicU64::new(0),
             played_bytes: AtomicU64::new(0),
             hw_frames: AtomicI64::new(-1),
+            hw_time_ns: AtomicI64::new(0),
             hw_base: AtomicI64::new(0),
             silence_frames: AtomicI64::new(0),
             silence_base: AtomicI64::new(0),
@@ -197,15 +219,31 @@ impl PlayClock {
             let hw_base = self.hw_base.load(Ordering::Relaxed);
             let silence = self.silence_frames.load(Ordering::Relaxed);
             let silence_base = self.silence_base.load(Ordering::Relaxed);
-            // 真实音频已播放帧数 = 硬件增量 - 静音增量
-            let real = ((hw - hw_base) - (silence - silence_base)).max(0);
+            let hw_ts_ns = self.hw_time_ns.load(Ordering::Relaxed);
+
+            // 若正在播放且有时间戳基准，用系统单调时间做线性外插，消除回调周期间隔（20~50ms）造成的阶梯停顿
+            let extra_frames = if !self.paused.load(Ordering::Relaxed) && hw_ts_ns > 0 {
+                let now_ns = monotonic_nanos();
+                let elapsed_ns = (now_ns - hw_ts_ns).max(0);
+                // 限制外推上限为 100ms，防止回调停顿/欠载时无限制向前漂移
+                let capped_ns = elapsed_ns.min(100_000_000);
+                (capped_ns as f64 * sr as f64 / 1_000_000_000.0) as i64
+            } else {
+                0
+            };
+
+            // 真实音频已播放帧数 = (硬件帧数 + 实时插值) - 基线 - 静音增量
+            let real = (((hw + extra_frames) - hw_base) - (silence - silence_base)).max(0);
             return base + (real as f64 / sr as f64 * 1_000_000.0) as i64;
         }
 
         // ---- 兜底：按已消费字节估算 ----
+        // 扣除一个 AAudio 硬件缓冲预估延迟（约 30ms），防止将刚写入 buffer 尚未出声的数据误算为已播
         let played = self.played_bytes.load(Ordering::Relaxed);
         let frames = played / fb;
-        base + (frames as f64 / sr as f64 * 1_000_000.0) as i64
+        let raw_us = (frames as f64 / sr as f64 * 1_000_000.0) as i64;
+        let safe_us = (raw_us - 30_000).max(0);
+        base + safe_us
     }
 
     /// 由回调线程周期性刷新：用 AAudio 的硬件时间戳记录真实播放帧数。
@@ -215,8 +253,9 @@ impl PlayClock {
     /// （AudioStream 的 inner 是私有字段，ndk crate 没暴露 as_ptr）。
     ///
     /// 回调频率通常 10~50Hz，开销可以忽略。
-    fn refresh_hw_frames(&self, frames: i64) {
+    fn refresh_hw_frames(&self, frames: i64, time_ns: i64) {
         self.hw_frames.store(frames, Ordering::Relaxed);
+        self.hw_time_ns.store(time_ns, Ordering::Relaxed);
     }
 
     /// 回调填入静音时调用，累加被"浪费"掉的帧数
@@ -275,6 +314,7 @@ impl PlayClock {
         if hw >= 0 {
             self.hw_base.store(hw, Ordering::Relaxed);
         }
+        self.hw_time_ns.store(0, Ordering::Relaxed);
         self.silence_base.store(silence, Ordering::Relaxed);
 
         self.played_bytes.store(0, Ordering::Relaxed);
@@ -363,7 +403,7 @@ impl AudioOutput {
                     // 画面才不会比声音超前一个缓冲周期。
                     if let Ok(ts) = stream.timestamp(ndk::audio::Clockid::Monotonic) {
                         if ts.frame_position >= 0 {
-                            clock_ts.refresh_hw_frames(ts.frame_position);
+                            clock_ts.refresh_hw_frames(ts.frame_position, ts.time_nanoseconds);
                         }
                     }
 

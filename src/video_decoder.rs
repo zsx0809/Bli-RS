@@ -599,28 +599,12 @@ fn decode_loop(
                                 ));
                             }
 
-                            if diff_us > 5_000 {
-                                // 视频超前：等到该显示的时刻。
-                                // 上限 100ms，避免异常大间隔把线程睡死。
-                                let wait = diff_us.min(100_000) as u64;
+                            if diff_us > 10_000 {
+                                // 视频超前 > 10ms：精准等到该显示的时刻
+                                let wait = diff_us.min(80_000) as u64;
                                 std::thread::sleep(Duration::from_micros(wait));
-                            } else if diff_us < -3_000_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
-                                // 视频落后超过 3 秒：做一次**受控**的重同步。
-                                //
-                                // ★ 这里曾经写成"只要落后就 request_seek"，
-                                //   结果是一个能把 App 打死活锁：
-                                //     seek → codec.flush()（丢掉刚解出的帧）
-                                //       → 再解一点 → 仍然落后（音频实时在走）
-                                //       → 又 seek → 又 flush …
-                                //   每轮都把刚解出的帧扔掉，于是一帧都渲染不出来
-                                //   （只剩声音），同时这个循环以极高频率空转，
-                                //   把 CPU 吃满 —— 表现就是"视频不动 + 整个 App 卡死"。
-                                //
-                                //   修法是三条：
-                                //     1. 冷却时间：两次重同步至少隔 3 秒
-                                //     2. 门槛提到 3 秒（普通丢帧能追的差距不去打扰 extractor）
-                                //     3. 重同步后把内部时钟基准也清掉，
-                                //        让新落点成为新的起算点
+                            } else if diff_us < -2_500_000 && resync_ok(std::time::Instant::now(), &mut last_resync) {
+                                // 视频落后超过 2.5 秒：执行一次受控重同步
                                 crate::mxprobe::log_public(&format!(
                                     "[AVSync] 落后 {}ms，执行一次重同步",
                                     -diff_us / 1000
@@ -637,25 +621,11 @@ fn decode_loop(
                                     break;
                                 }
                                 continue;
-                            } else if diff_us < -300_000 {
-                                // 视频落后 300ms ~ 2s：跳过这一帧，快速追赶。
-                                //
-                                // ★ 这里绝不能 `continue` 跳过 EOS 处理。
-                                //
-                                //   踩过的坑：本帧带 BUFFER_FLAG_END_OF_STREAM 时，
-                                //   如果也走"丢帧 + continue"，下面那段
-                                //   `if eos { controls.mark_ended() }` 永远不会执行。
-                                //   于是解码线程自己结束了，播放器却不知道"播完了"——
-                                //   自动连播 / 循环 / 播完暂停 全部失效。
-                                //
-                                //   实际症状：音频先播完（比如 47 秒），视频还在
-                                //   慢慢追帧，进度条卡在 46 秒不动，也不循环。
-                                //
-                                //   所以丢帧要"丢完接着往下走"，让 EOS 分支照常执行。
+                            } else if diff_us < -120_000 {
+                                // 视频落后超过 120ms（约 3~4 帧）：跳过这一帧快速追平，杜绝持续落后 150ms 播完的死区
                                 codec.release_output_buffer(buf, false).ok();
 
-                                // 这一点很关键：丢帧之后若已到流尾，直接标结束并退出，
-                                // 不要再去渲染一帧过时的画面。
+                                // 丢帧之后若已到流尾，直接标结束并退出
                                 if eos {
                                     output_done = true;
                                     controls.mark_ended();
